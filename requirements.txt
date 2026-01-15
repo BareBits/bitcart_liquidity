@@ -1,0 +1,7 @@
+httpx
+requests
+python-dateutil
+peewee
+pytest
+beautifulsoup4
+selenium
