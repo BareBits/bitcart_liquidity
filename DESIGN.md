@@ -32,6 +32,7 @@ and one for the lightning node database for tracking the behavior of lighting no
 MIN_INBOUND_LIQUIDITY # minimum amount of sats we want to have at any given time in live channels. Per wallet.
 MIN_INBOUND_LIQUIDITY_PER_CHANNEL # don't create channels smaller than this size
 MIN_CHANNEL_COUNT # minimum number of live channels we want for each wallet
+MIN_ONCHAIN_SAT_RESERVE # keep this many sats on-chain for the purposes of opening channels, this is dynamically calculated based on expected liquidity cost
 
 ## Logic
 ```
@@ -41,6 +42,8 @@ for each store:
             move on-chain funds into LN channels
     if we are due for top-ups (INBOUND_LIQUIDITY<MIN_INBOUND_LIQUIDITY or CHANNELS<MIN_CHANNELS):
         calculate funds needed for top-up and display to the user
+    if any swaps are due:
+        make swaps, end loop
     if any cashouts are due:
         make cashouts via LN to cashout address
     if any fees are due:
@@ -64,7 +67,6 @@ If we are at or over our liquidity goal, we need to know how many sats are safe 
 - Given output from safe_to_spend, what is the biggest channel we can make? (common_functions.sats_to_max_channel_size)
 
 
-
 ## Code
 All of the above functions are called from def main() and each function handles its own store looping. The main reason
 for this is that some stores have multiple wallets and some wallets connect to multiple stores. How we treat those depends on the function, so a loop in main() would get complex quickly.
@@ -81,3 +83,6 @@ Logging notes:
 - WARNING: This is a potential problem, but also sometimes normally happens and it's fine
 - ERROR: Some function has failed, but generally won't break the main functionality of the script
 - CRITICAL: Some very important function has failed, and the script can't accomplish it's main duties as a result
+
+### Logging
+The script can notify you upon specific events like when liquidity needs to be topped up. The default notification provider is e-mail, but additional notification providers could be added, the code is written to be provider agnostic.

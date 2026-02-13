@@ -107,14 +107,15 @@ class BoltzClient:
         response = self._make_request("GET", "swap/reverse")
 
         pairs = {}
-        for pair_name, pair_data in response.get("pairs", {}).items():
-            pairs[pair_name] = SwapPair(
-                rate=pair_data.get("rate", 0),
-                min_amount=pair_data.get("limits", {}).get("minimal", 0),
-                max_amount=pair_data.get("limits", {}).get("maximal", 0),
-                percentage_fee=pair_data.get("fees", {}).get("percentage", 0),
-                miner_fees=pair_data.get("fees", {}).get("minerFees", {})
-            )
+        for pair_coin,pair_parent in response.items():
+            for pair_name, pair_data in pair_parent.items():
+                pairs[pair_coin] = SwapPair(
+                    rate=pair_data.get("rate", 0),
+                    min_amount=pair_data.get("limits", {}).get("minimal", 0),
+                    max_amount=pair_data.get("limits", {}).get("maximal", 0),
+                    percentage_fee=pair_data.get("fees", {}).get("percentage", 0),
+                    miner_fees=pair_data.get("fees", {}).get("minerFees", {})
+                )
 
         return pairs
 

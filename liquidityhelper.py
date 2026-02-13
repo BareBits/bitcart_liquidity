@@ -5,7 +5,14 @@ import asyncio, database, node_db_update, inspect
 from peewee import DoesNotExist
 import requests
 import time
+import time
+
+import notifications
+from notifications import EmailNotificationProvider,NotificationProvider
 from typing import Dict, Any, Optional
+
+from selenium.webdriver.common.devtools.v141.fetch import continue_response
+
 import common_functions
 import config
 from config import AUTH_TOKEN
@@ -18,6 +25,7 @@ from database import (
     LOrder,
     LastRunTracker,
     SimpleVariable,
+    Notification,
 )
 
 from classes import (
@@ -81,7 +89,7 @@ from node_database import LightningNode, LightningChannel,is_node_blacklisted
 
 LAST_FEE_CHECK = datetime.datetime.now()
 START_TIME = datetime.datetime.now()
-
+NOTIFICATION_PROVIDERS:List[NotificationProvider]=[]
 def hash_string(mystring: str) -> str:
     # Encode the string to bytes
     encoded_string = mystring.encode("utf-8")
@@ -1395,25 +1403,30 @@ async def find_channel_closings(xpub: str) -> Dict[str, int]:
             else:
                 channel_closings[pubkey] = 1
     return channel_closings
-async def store_needs_liquidity(store_id:str,api:BitcartAPI,min_sats_liquidity:int=MIN_INBOUND_LIQUIDITY,min_channel_count:int=MIN_CHANNEL_COUNT,)->Optional[Tuple[int,int]]:
+async def store_needs_liquidity(store_id:str,api:BitcartAPI,min_sats_liquidity:int=MIN_INBOUND_LIQUIDITY,min_channel_count:int=MIN_CHANNEL_COUNT,assume_zero:bool=False)->Optional[Tuple[int,int]]:
     """
     Checks wallet for a store, returns None if store does not need liquidity, otherwise returns amount needed in sats, followed by the # of channels that need to be created
     Assumes any balance in LN is "inbound" since it will be converted to inbound next time cashout is run
+
     min_channel_count: minimum number of channels this store should have
     min_sats_liquidity: minimum amount of liquidity we want this store to have
+    assume_zero: if true, assume we have ZERO onchain funds, ZERO inbound liquidity, and ZERO channels. this is used to caculate topup amount/reserve amount
     """
     full_store=await api.get_store_by_id(store_id)
     found_inbound_liquidity=0
     found_channels=0
-    best_wallet=await api.get_best_ln_wallet_for_store(full_store)
-    wallet_id=best_wallet['id']
-    open_channels=await api.get_wallet_ln_channels(wallet_id,active_only=True,online_only=True)
-    if open_channels:
-        found_channels+=len(open_channels)
-    for channel in open_channels:
-        found_inbound_liquidity+=float(channel['remote_balance'])
-        found_inbound_liquidity += float(channel['local_balance'])
-    if found_inbound_liquidity>min_sats_liquidity and found_channels>min_channel_count:
+    if assume_zero:
+        found_channels=0
+    else:
+        best_wallet = await api.get_best_ln_wallet_for_store(full_store)
+        wallet_id = best_wallet['id']
+        open_channels=await api.get_wallet_ln_channels(wallet_id,active_only=True,online_only=True)
+        if open_channels:
+            found_channels+=len(open_channels)
+        for channel in open_channels:
+            found_inbound_liquidity+=float(channel['remote_balance'])
+            found_inbound_liquidity += float(channel['local_balance'])
+    if found_inbound_liquidity>min_sats_liquidity and found_channels>min_channel_count and not assume_zero:
         return None
     liquidity_needed=max(min_sats_liquidity-found_inbound_liquidity,0)
     channels_needed=max(min_channel_count-found_channels,0)
@@ -1761,23 +1774,34 @@ async def do_cashouts(api: BitcartAPI) -> Optional[bool]:
             return False
     return True
 
+async def topup_goal_amount(api:BitcartAPI,store_id:str)->Optional[int]:
+    """
+        Calculate how much a store should reserve on-chain to buy liquidity. Retuns None if failure.
+    """
+    liquidity_result = await store_needs_liquidity(store_id, api, MIN_INBOUND_LIQUIDITY, MIN_CHANNEL_COUNT,assume_zero=True)
+    if not liquidity_result:
+        logger.error(f'Topup_goal_amount reports zero goal, this should not happen: {store_id}')
+        return None
+    liquidity_needed = liquidity_result[0]
+    channels_needed = liquidity_result[1]
+    needed_channel_liquidity_sizes = common_functions.distribute_sats_over_channels(liquidity_needed, channels_needed)
+    channel_sizes = [common_functions.liquidity_to_channel_size(item) for item in needed_channel_liquidity_sizes]
+    addl_onchain_reserves_needed = sum(
+        [common_functions.onchain_reserves_to_keep_for_channel(item) for item in channel_sizes])
+    final_amount = addl_onchain_reserves_needed + sum(channel_sizes)
+    if final_amount <= 0:
+        logger.error(f'2Topup_goal_amount reports zero goal, this should not happen: {store_id}')
+        return None
+    return final_amount
 async def store_needs_topup(api: BitcartAPI, store_id: str) -> Optional[int]:
     """
     If store needs top-up, returns amount needed (int, sats) for the top-up, None otherwise.
     """
+    topup_goal=await topup_goal_amount(api,store_id)
     store_full = await api.get_store_by_id(store_id)
     wallet_full = await api.get_best_ln_wallet_for_store(store_full)
     current_onchain_balance=btc_to_sats(float(wallet_full['balance']))
-    liquidity_result = await store_needs_liquidity(store_id, api, MIN_INBOUND_LIQUIDITY, MIN_CHANNEL_COUNT)
-    if not liquidity_result:
-        logger.debug(f'Store has enough liquidity, no need to top up: {store_id}')
-        return None
-    liquidity_needed = liquidity_result[0]
-    channels_needed = liquidity_result[1]
-    needed_channel_liquidity_sizes=common_functions.distribute_sats_over_channels(liquidity_needed,channels_needed)
-    channel_sizes=[common_functions.liquidity_to_channel_size(item) for item in needed_channel_liquidity_sizes]
-    addl_onchain_reserves_needed=sum([common_functions.onchain_reserves_to_keep_for_channel(item) for item in channel_sizes])
-    final_amount=addl_onchain_reserves_needed+sum(channel_sizes)-current_onchain_balance
+    final_amount=topup_goal-current_onchain_balance
     if final_amount<=0:
         return None
     return final_amount
@@ -1831,6 +1855,9 @@ async def calculate_topups(
             logger.info(
                 "Warning: on-chain funds are low, you must top-up your wallet or wait for incoming on-chain payments. To send funds, see invoices"
             )
+
+
+
             own_invoice = btc_address_from_invoice(found_own_invoice)
             bb_invoice = btc_address_from_invoice(found_barebits_invoice)
             logger.info("Payment information:")
@@ -1839,9 +1866,26 @@ async def calculate_topups(
             )
             logger.info(f"If Bitcart Admin is paying: {own_invoice}")
             logger.info(f"If BareBits is paying: {bb_invoice}")
+            for notifier in NOTIFICATION_PROVIDERS:
+                body = f"""
+                Warning: your wallet on store {store['name']} (wallet id {fetched_wallet['id']}) does not have sufficient inbound liquidity. This does not need to be immediately remedied, but we suggest doing so for the best performance from your Bitcart installation.
+                
+                Insufficient inbound liquidity can result in your customers not being able to make payments with Bitcoin lightning (higher fees, slower payments). On-chain payments will continue to work. Additionally, while liquidity is too low, your Bitcart installation will hold onto on-chain payments until additional liquidity can be created, which delays the time between when you receive payments and when they are delivered to you.
+
+                To remedy this, send {sats_to_btc(amount_remaining)} BTC to this address {own_invoice}
+
+                Once your funds have been received by your Bitcart installation, they will be sent right back to you at {CASHOUT_LIGHTNING_ADDRESS} minus some minor transaction fees for channel creation.
+
+                If you do not deposit more funds for liquidity, on-chain payments from customers will accumulate until sufficient liquidity is re-established. Once that has happened, those on-chain payments will be delivered to {CASHOUT_LIGHTNING_ADDRESS} minus fees.
+                """
+                subject=f"Warning: low liquidity on your Bitcart store {store['name']}"
+                await run_every_x_days(my_func=notifier.notify,days=30,body=body,subject=subject)
             return own_invoice, bb_invoice
         except Exception as e:
             logger.error(f"Error calculating topups: {e} {store}")
+    return None
+
+
 async def safe_to_spend(api:BitcartAPI,store_id:str)->int:
     """
     Given store id, return amount of sats that are safe to spend. Assumes we have already met liquidity goals and a topup is not pending
@@ -1910,16 +1954,53 @@ async def decide_onchain_to_ln(api:BitcartAPI):
         logger.debug(f'Moving leftover onchain funds to ln... {max_channel_size} sats {sats_to_btc(max_channel_size)} BTC, store {store_id}')
         onchain_move_result=await move_onchain_to_ln(wallet_id=best_wallet['id'],amount_in_btc=sats_to_btc(max_channel_size),api=api)
 
+async def recover_reserves_from_ln(api:BitcartAPI):
+    """
+    Returns True if successful, false otherwise
+    """
+    store_list=api.get_stores()
+    for store in store_list:
+        store_id=store['id']
+        best_wallet=await api.get_best_ln_wallet_for_store(store)
+        onchain_funds_in_sats=btc_to_sats(float(best_wallet['balance']))
+        topup_goal=await topup_goal_amount(api,store_id)
+        if onchain_funds_in_sats>=topup_goal:
+            return True
+        addl_needed_onchain=topup_goal-onchain_funds_in_sats
+
+
+def setup_notifiers()->List[NotificationProvider]:
+    return_list=[]
+    if SMTP_USERNAME and SMTP_TO_EMAIL and SMTP_PASSWORD and SMTP_FROM_EMAIL and SMTP_FROM_NAME and SMTP_PORT and SMTP_SERVER:
+        my_notifier=notifications.EmailNotificationProvider(name='mymail',from_email=SMTP_FROM_EMAIL,from_name=SMTP_FROM_NAME,password=SMTP_PASSWORD,username=SMTP_USERNAME,smtp_server=SMTP_SERVER,smtp_port=SMTP_PORT,tls_enabled=SMTP_TLS,ssl_enabled=SMTP_SSL,to_email=SMTP_TO_EMAIL)
+        try:
+            my_notifier.test_connection()
+        except Exception as e:
+            logger.error(f'Error connecting to SMTP server: {e}')
+        else:
+            return_list.append(my_notifier)
+    else:
+        logger.warning('No SMTP notification provider config found')
+    return return_list
+
 async def main():
     global LAST_FEE_CHECK
     global START_TIME
     global AUTH_TOKEN
+    global NOTIFICATION_PROVIDERS
     BITCART_URL = "http://127.0.0.1/api"
     # delete old cache entries
     try:
         SimpleCacheField.delete_expired()
     except Exception as e:
         logger.error(f'Error deleting expired cache entries {e} {traceback.print_exc()}')
+    # init notifications
+    try:
+        if len(NOTIFICATION_PROVIDERS)==0:
+            NOTIFICATION_PROVIDERS=setup_notifiers()
+    except Exception as e:
+        logger.error(f'Not able to setup notifications, please see logs! {e}')
+    # init Bitcart API
     try:
         logger.info("Initializing bitcart API...")
         api = BitcartAPI(BITCART_URL, AUTH_TOKEN)
@@ -2040,6 +2121,16 @@ async def main():
         logger.error(f"Error in calculating fees: {e} {traceback.print_exc()}")
     if not fee_response:
         logger.error(f"Error in calculating fees2")
+    # run any needed swaps
+    swap_response = None
+    try:
+        if DEBUG_STEPS:
+            breakpoint()
+        swap_response = await recover_reserves_from_ln(api)
+    except Exception as e:
+        logger.error(f"Error in doing swaps: {e} {traceback.print_exc()}")
+    if not swap_response:
+        logger.error(f"2Error in in doing swaps: no swap_response")
 
     # Calculate and send cashouts, should basically be the same code as calculating fees
     cashout_response = None

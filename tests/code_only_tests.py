@@ -1,5 +1,5 @@
-import pytest,dataclasses
-import liquidityhelper
+import pytest,dataclasses,peewee
+import liquidityhelper,database
 from liquidityhelper import should_close_channel
 import datetime
 from classes import BitcartInvoice
@@ -159,3 +159,40 @@ def test_distribute_sats_over_channels():
     answer = common_functions.distribute_sats_over_channels(sats=sats, channels=3)
     assert answer == [101, 101,102]
     assert sum(answer) == sats
+
+
+@pytest.fixture(scope='function')
+def test_db():
+    # 1. Create an in-memory SQLite database
+    test_db = peewee.SqliteDatabase(':memory:')
+
+    # 3. Connect and create tables
+    test_db.bind(database.USED_TABLES, bind_refs=False, bind_backrefs=False)
+    test_db.connect()
+    test_db.create_tables(database.USED_TABLES)
+
+    # 4. Yield control to the test function
+    yield test_db
+
+    # 5. Teardown: close the connection and drop tables
+    test_db.close()
+
+def test_notifications(test_db):
+    from database import Notification,LastRunTracker
+    # This test starts with a clean database due to the fixture's scope
+    temp = Notification.create(type='LOWLIQ', body='')
+    temp2 = Notification.create(type='LOWLIQ', body='',date_sent=datetime.datetime.now())
+    temp3 = Notification.create(type='LOWLIQ', body='', date_sent=datetime.datetime.now())
+    one_year_ago = datetime.datetime.now() - datetime.timedelta(days=(1 * 365))
+    five_years_ago=datetime.datetime.now() - datetime.timedelta(days=(5 * 365))
+    temp4 = Notification.create(type='LOWLIQ', body='', date_sent=one_year_ago)
+    temp5 = Notification.create(type='LOWLIQ', body='', date_sent=five_years_ago)
+    temp6 = Notification.create(type='INVALIDTYPE', body='', date_sent=one_year_ago)
+
+    count_total_notifications=database.count_notifications_sent(notification_type='LOWLIQ')
+    count_total_recent_typed_notications=database.count_notifications_sent(notification_type='LOWLIQ', since_date=one_year_ago)
+    count_total_recent_untyped_notications = database.count_notifications_sent(since_date=one_year_ago)
+
+    assert count_total_notifications==4
+    assert count_total_recent_typed_notications==3
+    assert count_total_recent_untyped_notications==4

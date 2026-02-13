@@ -21,6 +21,17 @@ MIN_FEE_OUT:int=150 # send fees when amount due > X
 CHANNEL_ONCHAIN_BUFFER:int=500 # how many sats to keep per channel so we can close a channel if need be
 AUTH_TOKEN:Optional[str] = None  # Replace with your API token
 
+# Notification settings
+SMTP_SERVER:Optional[str]=None
+SMTP_PORT:Optional[int]=None
+SMTP_TLS:bool=False
+SMTP_SSL:bool=False
+SMTP_FROM_EMAIL:Optional[str]=None
+SMTP_FROM_NAME:Optional[str]='LiquidityHelper'
+SMTP_TO_EMAIL:Optional[str]=None
+SMTP_USERNAME:Optional[str]=None
+SMTP_PASSWORD:Optional[str]=None
+
 # Only used at first run if you are starting with a fresh bitcart install
 STORE_NAME='mystore'
 ADMIN_EMAIL:Optional[str]=None
