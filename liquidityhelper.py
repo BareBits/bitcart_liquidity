@@ -462,6 +462,12 @@ async def new_calc_invoice_stats(api: BitcartAPI) -> Dict[str, StoreStats]:
                                 amount_in_sats
                             )
                             ineligible = True
+                    elif FEE_START_REVENUE:
+                        if store_stats.calc_total_revenue()<FEE_START_REVENUE:
+                            store_stats.ineligible_revenue_because_of_promo_in_sats += (
+                                amount_in_sats
+                            )
+                            ineligible = True
                     if not ineligible:
                         store_stats.revenue_eligible_for_fee += amount_in_sats
             except Exception as e:

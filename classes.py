@@ -104,6 +104,13 @@ class StoreStats:
         return base_fee
     def calc_total_eligible_revenue_in_sats(self)->int:
         return self.revenue_eligible_for_fee
+    def calc_total_revenue(self)->int:
+        """"
+        Returns total revenue (excluding topups)
+        """
+        total_revenue=self.ln_total_revenue_in_sats+self.onchain_total_revenue_in_sats
+        total_revenue=total_revenue-self.ineligible_revenue_because_of_bb_topups_in_sats-self.ineligible_revenue_because_of_topups_in_sats
+        return total_revenue
 
 @dataclass
 class PayoutInfo:

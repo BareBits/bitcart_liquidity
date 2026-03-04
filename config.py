@@ -96,6 +96,7 @@ RUN_FREQUENCY_PULL_DEV_NODES:int=86400 # every day (pull list of LN nodes from d
 RUN_FREQUENCY_FEE_PAYMENT:int=46400 # every half day
 LN_FEE_DEST:str= 'fees@getbarebits.com' # where to send fees
 FEE_START_DATE:Optional[str]='1999/11/30' # date in format '2020/11/30'
+FEE_START_REVENUE:int=0 # dont charge a fee for first x sats in revenue
 FEES_PAID_INCLUDES_ONCHAIN_NETWORK_FEES:bool=True # count BTC network fees in total amount of fees paid
 FEES_PAID_INCLUDES_LN_NETWORK_FEES:bool=True # count BTC LN network fees in total amount of fees paid
 ONCHAIN_FEE_DEST:str= 'bc1q586um24k7zr6swxqny5qqgqn8xt43pk4xeeg9g' # where to send fees on chain
