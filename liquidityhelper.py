@@ -1963,7 +1963,7 @@ async def recover_reserves_from_ln(api:BitcartAPI):
     """
     Returns True if successful, false otherwise
     """
-    store_list=api.get_stores()
+    store_list=await api.get_stores()
     for store in store_list:
         store_id=store['id']
         best_wallet=await api.get_best_ln_wallet_for_store(store)
@@ -2126,16 +2126,17 @@ async def main():
         logger.error(f"Error in calculating fees: {e} {traceback.print_exc()}")
     if not fee_response:
         logger.error(f"Error in calculating fees2")
-    # run any needed swaps
-    swap_response = None
-    try:
-        if DEBUG_STEPS:
-            breakpoint()
-        swap_response = await recover_reserves_from_ln(api)
-    except Exception as e:
-        logger.error(f"Error in doing swaps: {e} {traceback.print_exc()}")
-    if not swap_response:
-        logger.error(f"2Error in in doing swaps: no swap_response")
+
+    # run any needed swaps, disabled for now
+    #swap_response = None
+    #try:
+    #    if DEBUG_STEPS:
+    #        breakpoint()
+    #    swap_response = await recover_reserves_from_ln(api)
+    #except Exception as e:
+    #    logger.error(f"Error in doing swaps: {e} {traceback.print_exc()}")
+    #if not swap_response:
+    #    logger.error(f"2Error in in doing swaps: no swap_response")
 
     # Calculate and send cashouts, should basically be the same code as calculating fees
     cashout_response = None
