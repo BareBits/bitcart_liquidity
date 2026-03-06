@@ -11,7 +11,6 @@ import notifications
 from notifications import EmailNotificationProvider,NotificationProvider
 from typing import Dict, Any, Optional
 
-from selenium.webdriver.common.devtools.v141.fetch import continue_response
 
 import common_functions
 import config
