@@ -2124,8 +2124,6 @@ async def main():
             fee_response= await run_every_x_days(my_func=calculate_fees,days=1, api=api)
     except Exception as e:
         logger.error(f"Error in calculating fees: {e} {traceback.print_exc()}")
-    if not fee_response:
-        logger.error(f"Error in calculating fees2")
 
     # run any needed swaps, disabled for now
     #swap_response = None
