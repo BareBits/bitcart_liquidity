@@ -48,7 +48,16 @@ import hashlib
 
 # Setup logging
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+if LOG_LEVEL=='DEBUG':
+    logger.setLevel(logging.DEBUG)
+elif LOG_LEVEL=='WARNING':
+    logger.setLevel(logging.WARNING)
+elif LOG_LEVEL=='ERROR':
+    logger.setLevel(logging.ERROR)
+elif LOG_LEVEL=='INFO':
+    logger.setLevel(logging.INFO)
+else:
+    logger.setLevel(logging.WARNING)
 main_formatter = logging.Formatter(
     "%(asctime)s - %(name)s - %(levelname)s - %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
 )
