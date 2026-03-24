@@ -20,7 +20,7 @@ MIN_RESERVE_ONCHAIN:int=10000 # keep this amount of sats on-chain in reserve to 
 MIN_FEE_OUT:int=150 # send fees when amount due > X
 CHANNEL_ONCHAIN_BUFFER:int=500 # how many sats to keep per channel so we can close a channel if need be
 AUTH_TOKEN:Optional[str] = None  # Replace with your API token
-
+LOG_LEVEL:str='WARNING' # DEBUG|WARNING|ERROR|INFO
 # Notification settings
 SMTP_SERVER:Optional[str]=None
 SMTP_PORT:Optional[int]=None

@@ -48,7 +48,16 @@ import hashlib
 
 # Setup logging
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+if LOG_LEVEL=='DEBUG':
+    logger.setLevel(logging.DEBUG)
+elif LOG_LEVEL=='WARNING':
+    logger.setLevel(logging.WARNING)
+elif LOG_LEVEL=='ERROR':
+    logger.setLevel(logging.ERROR)
+elif LOG_LEVEL=='INFO':
+    logger.setLevel(logging.INFO)
+else:
+    logger.setLevel(logging.WARNING)
 main_formatter = logging.Formatter(
     "%(asctime)s - %(name)s - %(levelname)s - %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
 )
@@ -2036,9 +2045,7 @@ async def main():
         # Check authentication
         api = BitcartAPI(BITCART_URL, AUTH_TOKEN)
         auth_result = await api.is_authenticated()
-        if auth_result:
-            logger.info("✅ API client initialized with authentication token!")
-        else:
+        if not auth_result:
             logger.error(
                 "⚠️ Bitcart Authentication failed..."
             )
