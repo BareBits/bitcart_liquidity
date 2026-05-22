@@ -1,4 +1,14 @@
-// Registers /plugins/liquidityhelper with bitcart's Nuxt router.
+// Registers /liquidityhelper with bitcart's Nuxt router.
+//
+// Single-segment path: Nuxt 2.15's `getLocation` helper does
+// `base.slice(0, -1)` on the configured router base, which corrupts a
+// no-trailing-slash base like "/admin" → "/admi" and then trims that
+// off the incoming path. With a single-segment route (e.g. `/admin/
+// liquidityhelper`) the matcher still finds the route in the eventual
+// re-resolve pass, but with a deeper path like `/admin/plugins/
+// liquidityhelper` it doesn't — first paint 404s on a fresh load.
+// Keep this path one segment deep to sidestep that whole class of bug
+// without patching bitcart-admin.
 //
 // CRITICAL: the dynamic `import()` must be unwrapped via `.then(m =>
 // m.default || m)`. ES dynamic imports resolve to the entire module
@@ -21,7 +31,7 @@
 export default [
   {
     name: "liquidityhelper-plugin",
-    path: "/plugins/liquidityhelper",
+    path: "/liquidityhelper",
     component: () =>
       import("@LiquidityHelper/pages/index.vue").then((m) => m.default || m),
   },

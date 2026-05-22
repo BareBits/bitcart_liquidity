@@ -47,7 +47,7 @@ You can run this either as a **standalone script** (existing path — talks to B
 
 **Settings precedence** (highest wins): plugin UI > environment variables > `user_config.py` > `config.py` defaults. Edits in the plugin UI are applied live to the running engine — no Bitcart restart needed.
 
-**Logs viewer** — after install, visit `/plugins/liquidityhelper` in the Bitcart admin to get a tabbed view with **Settings** and **Logs**. The Logs tab lets you switch between:
+**Logs viewer** — after install, visit `/liquidityhelper` in the Bitcart admin to get a tabbed view with **Settings** and **Logs**. The Logs tab lets you switch between:
 - **Operational** — the full firehose (`liquidityhelper.log`)
 - **Decisions** — the audit log of what the script actually decided to do (`decisions.log`)
 …with an adjustable tail size (100–5000 lines) and an optional 3-second auto-refresh. Logs are also still written to the engine's working directory in standalone mode.

@@ -26,7 +26,7 @@
 const NAV_ITEM = Object.freeze({
   icon: "mdi-water-pump",
   text: "Liquidity Helper",
-  to: "/plugins/liquidityhelper",
+  to: "/liquidityhelper",
   order: 13,
 })
 
