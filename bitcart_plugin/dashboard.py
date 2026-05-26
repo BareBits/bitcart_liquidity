@@ -163,6 +163,44 @@ class ChannelClosureRow(BaseModel):
     force_close_initiated: bool      # True if force_close_initiated_at is set
 
 
+class LspOrderRow(BaseModel):
+    """One row in the Recent LSP Orders table.
+
+    Surfaces the full LSP-order lifecycle: provider, state, what we
+    paid, what (if anything) we got refunded, the resulting channel
+    if the order opened one, and the refund tx if the order failed.
+
+    The Vue UI renders mempool.space links wherever a *_txid value
+    is non-empty:
+      - channel_funding_txid → https://mempool.space/tx/<txid>
+      - refund_txid → https://mempool.space/tx/<txid>
+    All txids are exposed in full (66-char hex); the UI does any
+    truncation it wants for display while linking the full value."""
+    timestamp: int                              # unix seconds (LspChannelOrder.created)
+    iso_date: str
+    provider: str                               # "zeus" / "megalithic" / ...
+    order_id: str                               # full LSP-side order id
+    short_order_id: str                         # 8-char head for display
+    state: str                                  # ORDERED|PAID|COMPLETED|FAILED|EXPIRED
+    lsps1_state: Optional[str]                  # last observed remote state
+    paid_sats: int                              # gross we sent to the LSP
+    paid_usd: Optional[float]
+    refund_sats: int                            # observed on-chain (0 until verified)
+    refund_usd: Optional[float]
+    refund_observed_onchain: bool               # has the refund tx confirmed?
+    # Net cost = paid - refund. Equals the gross when no refund (e.g.
+    # COMPLETED orders); equals paid-refund_actual once the refund
+    # lands and is reconciled. For an LSP that fails and only retains
+    # the refund-tx miner fee, net_cost_sats will be tiny.
+    net_cost_sats: int
+    net_cost_usd: Optional[float]
+    channel_funding_txid: Optional[str]         # from channel_point's "txid:vout"
+    channel_point: Optional[str]                # full "txid:vout" for copy
+    refund_txid: Optional[str]
+    refund_onchain_address: Optional[str]
+    age_hours: int
+
+
 class HealthWarning(BaseModel):
     """One config-sanity or runtime-health warning shown on the
     dashboard. Each warning has a stable `id` that doubles as the
@@ -193,6 +231,7 @@ class DashboardResponse(BaseModel):
     recent_fee_payments: List[PaymentRow]
     recent_cashouts: List[PaymentRow]
     recent_channel_closures: List[ChannelClosureRow]
+    recent_lsp_orders: List[LspOrderRow]
 
 
 # ---------------------------------------------------------------------------
@@ -586,6 +625,86 @@ def list_recent_channel_closures() -> List[ChannelClosureRow]:
     return rows[:_RECENT_ROW_CAP]
 
 
+def list_recent_lsp_orders(usd_rate: Optional[float]) -> List[LspOrderRow]:
+    """Recent LSP channel orders the engine has created.
+
+    Reads every LspChannelOrder row, projects to LspOrderRow with
+    USD conversions and convenience fields (short_order_id, age,
+    channel_funding_txid extracted from channel_point). Sorted
+    newest-first, capped at _RECENT_ROW_CAP.
+
+    Net cost semantics:
+      - COMPLETED orders: the channel opened. paid = service fee +
+        miner fee; refund = 0; net_cost == paid.
+      - FAILED with on-chain-observed refund: paid - actual_refund.
+        Typically tiny (just the LSP's miner-fee on the refund tx).
+      - FAILED without observed refund (LSP didn't refund, or refund
+        not yet confirmed): net_cost == paid. The dashboard shows
+        these clearly via refund_observed_onchain=False.
+      - ORDERED / PAID: not yet terminal; net_cost reflects gross
+        paid so the operator sees the in-flight exposure.
+    """
+    from node_database import LspChannelOrder
+    rows: List[LspOrderRow] = []
+    now_ts = int(datetime.datetime.now().timestamp())
+    try:
+        for r in LspChannelOrder.select():
+            created_ts = (
+                int(r.created.timestamp()) if r.created is not None else 0
+            )
+            # Gross paid: service fee + miner fee from our side. The
+            # service fee is the LSP's stated `fee_total_sat` (which
+            # we paid at order time); we don't have the original
+            # outgoing-payment miner fee directly on the order row,
+            # so the "paid" column reflects the LSP-quoted service
+            # amount only. (Operators wanting the on-chain miner fee
+            # too can look at the Recent Fee Payments / wallet history
+            # — the lsp_channel_order tx label is unambiguous.)
+            paid_sats = int(r.fee_total_sat or 0)
+            refund_sats = int(r.refund_amount_sat or 0) if r.refund_observed_onchain else 0
+            net_cost_sats = max(0, paid_sats - refund_sats)
+
+            channel_point = r.channel_point
+            funding_txid: Optional[str] = None
+            if channel_point and ":" in channel_point:
+                funding_txid = channel_point.split(":")[0]
+
+            age_hours = max(0, (now_ts - created_ts) // 3600) if created_ts else 0
+
+            paid_usd = (paid_sats / _SATS_PER_BTC * usd_rate) if usd_rate else None
+            refund_usd = (refund_sats / _SATS_PER_BTC * usd_rate) if usd_rate else None
+            net_usd = (net_cost_sats / _SATS_PER_BTC * usd_rate) if usd_rate else None
+
+            short_order_id = (r.order_id or "")[:8]
+
+            rows.append(LspOrderRow(
+                timestamp=created_ts,
+                iso_date=_iso(created_ts),
+                provider=r.provider or "",
+                order_id=r.order_id or "",
+                short_order_id=short_order_id,
+                state=r.state or "",
+                lsps1_state=r.lsps1_state,
+                paid_sats=paid_sats,
+                paid_usd=paid_usd,
+                refund_sats=refund_sats,
+                refund_usd=refund_usd,
+                refund_observed_onchain=bool(r.refund_observed_onchain),
+                net_cost_sats=net_cost_sats,
+                net_cost_usd=net_usd,
+                channel_funding_txid=funding_txid,
+                channel_point=channel_point,
+                refund_txid=r.refund_txid,
+                refund_onchain_address=r.refund_onchain_address,
+                age_hours=int(age_hours),
+            ))
+    except Exception as e:
+        logger.warning(f"list_recent_lsp_orders query failed: {e}")
+        return []
+    rows.sort(key=lambda r: r.timestamp, reverse=True)
+    return rows[:_RECENT_ROW_CAP]
+
+
 # ---------------------------------------------------------------------------
 # Compose per-store payload
 # ---------------------------------------------------------------------------
@@ -864,6 +983,7 @@ async def compute_dashboard(api: Any, range_key: str) -> DashboardResponse:
     recent_fee_payments = await list_recent_fee_payments(api, btc_usd_rate)
     recent_cashouts = await list_recent_cashouts(api, btc_usd_rate)
     recent_channel_closures = list_recent_channel_closures()
+    recent_lsp_orders = list_recent_lsp_orders(btc_usd_rate)
 
     # Health audit: pure-config checks (cashout/channel/reserve/loop
     # config sanity) + one dynamic check (LN cashouts stale while LN
@@ -888,6 +1008,7 @@ async def compute_dashboard(api: Any, range_key: str) -> DashboardResponse:
         recent_fee_payments=recent_fee_payments,
         recent_cashouts=recent_cashouts,
         recent_channel_closures=recent_channel_closures,
+        recent_lsp_orders=recent_lsp_orders,
     )
 
 

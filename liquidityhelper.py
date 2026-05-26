@@ -1499,6 +1499,58 @@ async def get_fresh_onchain_address(
     return addr if isinstance(addr, str) and addr else None
 
 
+async def label_onchain_tx(
+    *,
+    wallet: Dict[str, Any],
+    api: Optional["BitcartAPI"] = None,
+    txid: str,
+    label: str,
+) -> bool:
+    """Write a label onto an existing on-chain transaction.
+
+    Used to annotate refund txs (lsp_refund:<order_id>) so they're
+    distinguishable in the wallet UI and in our own list_onchain_
+    history (otherwise they appear as unlabeled incoming txs and
+    operators have no way to know they're LSP refunds).
+
+    Dispatch:
+      - LND: WalletKit.LabelTransaction with overwrite=True
+      - Electrum: electrum_rpc("setlabel", xpub, params={"key": txid,
+                   "label": ...})
+
+    Returns True on success, False on any failure (best-effort —
+    labeling is decoration, not correctness; we never block downstream
+    logic on this)."""
+    if not txid or not label:
+        return False
+    if wallet.get("currency") == "btclnd":
+        if api is None and wallet["id"] not in _LND_CONNECTIONS:
+            return False
+        try:
+            await lnd_rpc(api, wallet["id"], "LabelTransaction", {
+                "txid": txid, "label": label, "overwrite": True,
+            }, "WalletKit")
+            return True
+        except Exception as e:
+            logger.warning(
+                f"label_onchain_tx: LabelTransaction failed for "
+                f"wallet {wallet.get('id')} txid {txid}: {e}"
+            )
+            return False
+    xpub = wallet.get("xpub")
+    try:
+        await electrum_rpc(
+            "setlabel", xpub, params={"key": txid, "label": label},
+        )
+        return True
+    except Exception as e:
+        logger.warning(
+            f"label_onchain_tx: setlabel failed for "
+            f"wallet {wallet.get('id')} txid {txid}: {e}"
+        )
+        return False
+
+
 async def _lnd_pay_onchain(
     api: "BitcartAPI", wallet_id: str, dest_addr: str, amount_btc: float, label: str,
 ) -> bool:
@@ -6279,19 +6331,28 @@ async def request_inbound_liquidity_from_lsp(
 
 
 def _lsp_refund_for_tx_label(tx_label: Optional[str]) -> int:
-    """Look up the refund_amount_sat (if any) recorded on the
-    LspChannelOrder row whose order_id matches this tx's label.
+    """Look up the refund_amount_sat (if any) actually observed
+    on-chain for the LspChannelOrder whose order_id matches this
+    tx's label.
 
     Used by `new_calc_invoice_stats` to net the LSP service-fee
     bucket against refunds the LSP issued for orders that failed.
     Returns 0 when:
       - the label doesn't match the `lsp_channel_order:<id>` format
       - no LspChannelOrder row exists for that order_id
-      - the row exists but its state isn't FAILED (refunds only
-        apply to FAILED orders per the LSPS1 spec; on a COMPLETED
-        order we should NOT subtract anything even if some legacy
-        row had a stale refund_amount_sat)
-      - the row's refund_amount_sat is 0 / None
+      - the row's state isn't FAILED (refunds only apply to FAILED
+        orders per the LSPS1 spec; on a COMPLETED order we never
+        subtract anything even if some legacy row had a stale
+        refund_amount_sat)
+      - the LSP CLAIMED a refund (poll_lsp_orders set refund_amount_
+        sat from the get_order response) but the refund hasn't been
+        VERIFIED on-chain yet (refund_observed_onchain=False). Without
+        this gate, an LSP that lies about issuing a refund — or one
+        that's broadcast a refund tx that hasn't confirmed yet — would
+        let us silently under-count cost in our favor. The on-chain
+        verification is done by `reconcile_lsp_refunds`, which sets
+        refund_observed_onchain=True once it finds the refund tx in
+        the wallet's on-chain history.
 
     Called once per LSP-order on-chain tx in the accounting loop, so
     it issues one DB query per such row per stats recompute. Tiny
@@ -6318,7 +6379,118 @@ def _lsp_refund_for_tx_label(tx_label: Optional[str]) -> int:
         return 0
     if order.state != "FAILED":
         return 0
+    if not order.refund_observed_onchain:
+        return 0
     return int(order.refund_amount_sat or 0)
+
+
+async def reconcile_lsp_refunds(api: "BitcartAPI") -> None:
+    """For each FAILED LspChannelOrder whose refund hasn't been
+    observed on-chain yet, look for the claimed refund_txid in the
+    wallet's on-chain history. When found:
+
+      - Set refund_observed_onchain=True so fee accounting starts
+        subtracting the refund from the service-fee bucket.
+      - Update refund_amount_sat to the ACTUAL on-chain amount (the
+        LSP's claimed value is replaced by what we actually
+        received — protects against an LSP that under-reports its
+        refund-miner-fee deduction).
+      - Label the refund tx as "lsp_refund:<order_id>" via LND's
+        LabelTransaction / Electrum's setlabel so it's
+        distinguishable from unlabeled incoming txs in the wallet
+        UI and downstream history walks.
+
+    Why this is separate from poll_lsp_orders: poll_lsp_orders reads
+    the LSPS1 spec's `payment.state == REFUNDED` + claimed refund_txid
+    from the LSP, but the LSP's claim isn't proof — the tx could be
+    in their mempool but not yet broadcast, never broadcast, or be
+    fraudulent. Trust-but-verify: trust the LSP enough to record
+    what they say happened; verify by waiting for the tx to actually
+    appear in OUR on-chain history before crediting it to
+    fee-accounting.
+
+    Idempotent — re-running this finds the same rows but the
+    observed_onchain check short-circuits already-credited refunds.
+    """
+    rows = list(
+        LspChannelOrder.select().where(
+            LspChannelOrder.state == "FAILED",
+            LspChannelOrder.refund_txid.is_null(False),
+            LspChannelOrder.refund_observed_onchain == False,  # noqa: E712
+        )
+    )
+    if not rows:
+        return
+    # Group by wallet so we list_onchain_history once per wallet
+    # rather than once per row — for an operator with many failed
+    # LSP attempts on one wallet this avoids N redundant fetches.
+    by_wallet: Dict[str, List[Any]] = {}
+    for row in rows:
+        by_wallet.setdefault(row.wallet_id, []).append(row)
+    for wallet_id, orders in by_wallet.items():
+        try:
+            wallet = await api.get_wallet(wallet_id)
+        except Exception as e:
+            logger.warning(
+                f"reconcile_lsp_refunds: api.get_wallet({wallet_id}) "
+                f"failed: {e}"
+            )
+            continue
+        if not wallet:
+            continue
+        try:
+            history = await list_onchain_history(wallet=wallet, api=api)
+        except Exception as e:
+            logger.warning(
+                f"reconcile_lsp_refunds: list_onchain_history({wallet_id}) "
+                f"failed: {e} {traceback.format_exc()}"
+            )
+            continue
+        txid_to_row = {
+            (row.refund_txid or "").lower(): row for row in orders
+        }
+        for tx in history:
+            txid = (tx.get("txid") or "").lower()
+            if not txid or txid not in txid_to_row:
+                continue
+            if not tx.get("incoming"):
+                # The LSP gave us a txid that's outgoing on our side —
+                # nonsensical (the refund is supposed to come INTO our
+                # wallet). Don't credit; log for forensics.
+                logger.warning(
+                    f"reconcile_lsp_refunds: claimed refund tx {txid} for "
+                    f"order {txid_to_row[txid].order_id} is OUTGOING in our "
+                    f"history — refusing to credit as refund."
+                )
+                continue
+            row = txid_to_row[txid]
+            actual_amount = abs(int(tx.get("amount_sat") or 0))
+            if actual_amount <= 0:
+                continue
+            row.refund_amount_sat = actual_amount
+            row.refund_observed_onchain = True
+            row.save()
+            log_event(
+                "LSP refund observed on-chain: order=%s provider=%s "
+                "amount=%s tx=%s wallet=%s",
+                row.order_id, row.provider,
+                fmt_btc_sats(actual_amount), txid, wallet_id,
+            )
+            # Best-effort label so the wallet UI and any future
+            # list_onchain_history caller can link this incoming tx
+            # back to its origin. Failure is non-fatal; the
+            # refund_observed_onchain bit drives fee accounting,
+            # not the label.
+            try:
+                await label_onchain_tx(
+                    wallet=wallet, api=api, txid=txid,
+                    label=f"lsp_refund:{row.order_id}",
+                )
+            except Exception as e:
+                logger.warning(
+                    f"reconcile_lsp_refunds: labeling refund tx {txid} "
+                    f"for order {row.order_id} failed: {e}"
+                )
 
 
 # LSPS1 order_state values per the spec. Some LSP vendors expose
@@ -8248,6 +8420,18 @@ async def main():
     except Exception as e:
         logger.error(
             f"Error polling LSP orders: {e}:{traceback.format_exc()}"
+        )
+    # Reconcile LSP refunds against on-chain history: for orders the
+    # LSP marked FAILED with a claimed refund_txid, verify the refund
+    # tx actually landed in our wallet before crediting it in fee
+    # accounting. Also labels the refund tx (lsp_refund:<order_id>)
+    # so the wallet UI / history can identify it. Hourly: refunds
+    # take blocks to confirm; no need to check more often.
+    try:
+        await run_every_x_hours(my_func=reconcile_lsp_refunds, hours=1, api=api)
+    except Exception as e:
+        logger.error(
+            f"Error reconciling LSP refunds: {e}:{traceback.format_exc()}"
         )
     # calculate onchain -> LN moves
     # this is only done if liquidity/reserves are sufficient

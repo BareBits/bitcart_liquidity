@@ -2659,14 +2659,17 @@ def test_lsp_refund_for_tx_label_returns_zero_for_non_failed_order():
 
 
 def test_lsp_refund_for_tx_label_returns_refund_amount_for_failed_order():
-    """Happy path: a FAILED order with a recorded refund → the
-    helper returns the refund_amount_sat int."""
+    """Happy path: a FAILED order with a recorded refund THAT HAS BEEN
+    OBSERVED ON-CHAIN → the helper returns the refund_amount_sat int.
+    Unverified claims return 0 (see
+    test_lsp_refund_for_tx_label_requires_observed_onchain)."""
     LspChannelOrder.create(
         provider="zeus", network="mainnet", wallet_id="w1",
         order_id="o-failed-1", lsp_peer_pubkey="aa" * 33,
         lsp_balance_sat=150_000, fee_total_sat=1000,
         state="FAILED",
         refund_amount_sat=950,
+        refund_observed_onchain=True,
     )
     assert liquidityhelper._lsp_refund_for_tx_label(
         "lsp_channel_order:o-failed-1"
@@ -2689,6 +2692,7 @@ def test_new_calc_invoice_stats_subtracts_refunded_amount():
         lsp_balance_sat=150_000, fee_total_sat=1000,
         state="FAILED",
         refund_amount_sat=950,
+        refund_observed_onchain=True,
     )
 
     # Reuse the helper from lsp_fee_accounting_tests.
@@ -2713,6 +2717,404 @@ def test_new_calc_invoice_stats_subtracts_refunded_amount():
         f"expected 50 (gross 1000 - refund 950), got "
         f"{stats.onchain_lsp_service_fees_paid_in_sats}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Fix A — reconcile_lsp_refunds: trust-but-verify against on-chain history
+# ---------------------------------------------------------------------------
+
+def _async_list_onchain_history_returning(rows):
+    """Build an async fn that mimics list_onchain_history's signature
+    and yields canned rows. Used to monkeypatch the dispatcher for
+    reconcile tests."""
+    async def _fake(*, wallet, api=None):
+        return rows
+    return _fake
+
+
+def test_lsp_refund_for_tx_label_requires_observed_onchain(monkeypatch):
+    """An LSP that claims a refund but the refund tx hasn't been
+    seen on-chain yet → fee accounting must NOT subtract (don't trust
+    LSP-claimed-but-unverified amounts in our favor)."""
+    LspChannelOrder.create(
+        provider="zeus", network="mainnet", wallet_id="w1",
+        order_id="o-claimed-unverified", lsp_peer_pubkey="aa" * 33,
+        lsp_balance_sat=150_000, fee_total_sat=1000,
+        state="FAILED",
+        refund_amount_sat=950,
+        refund_txid="ab" * 32,
+        refund_observed_onchain=False,
+    )
+    assert liquidityhelper._lsp_refund_for_tx_label(
+        "lsp_channel_order:o-claimed-unverified"
+    ) == 0, "unverified refunds must not be subtracted from fee bucket"
+
+
+def test_lsp_refund_for_tx_label_credits_observed_refunds():
+    """Once reconcile_lsp_refunds flips refund_observed_onchain=True,
+    fee accounting starts subtracting."""
+    LspChannelOrder.create(
+        provider="zeus", network="mainnet", wallet_id="w1",
+        order_id="o-observed", lsp_peer_pubkey="aa" * 33,
+        lsp_balance_sat=150_000, fee_total_sat=1000,
+        state="FAILED",
+        refund_amount_sat=950,
+        refund_txid="ab" * 32,
+        refund_observed_onchain=True,
+    )
+    assert liquidityhelper._lsp_refund_for_tx_label(
+        "lsp_channel_order:o-observed"
+    ) == 950
+
+
+def test_reconcile_lsp_refunds_observes_refund_when_tx_seen(monkeypatch, event_loop):
+    """A FAILED LspChannelOrder with refund_txid claimed → reconcile_
+    lsp_refunds finds it in on-chain history → sets refund_observed_
+    onchain=True, updates refund_amount_sat to the actual on-chain
+    amount (NOT the LSP's claim — protect against LSP under-reporting
+    its miner-fee deduction), and labels the tx."""
+    LspChannelOrder.create(
+        provider="zeus", network="mainnet", wallet_id="w1",
+        order_id="o-to-reconcile", lsp_peer_pubkey="aa" * 33,
+        lsp_balance_sat=150_000, fee_total_sat=1000,
+        refund_onchain_address="bc1qrefund_addr_known",
+        state="FAILED",
+        refund_amount_sat=950,             # LSP's claim
+        refund_txid="ab" * 32,             # LSP's claimed txid
+        refund_observed_onchain=False,
+    )
+    api = FakeBitcartAPI()
+    api.add_wallet("w1", currency="btclnd", balance=0.02)
+    fake_history = [{
+        "txid": "ab" * 32,                 # matches claimed
+        "incoming": True,
+        "amount_sat": 920,                 # ACTUAL refund (LSP under-reported)
+        "fee_sat": 0,
+        "label": "",
+        "block_height": 100,
+        "num_confirmations": 6,
+        "timestamp": 1700000000,
+        "dest_address": "bc1qrefund_addr_known",
+    }]
+    monkeypatch.setattr(
+        liquidityhelper, "list_onchain_history",
+        _async_list_onchain_history_returning(fake_history),
+    )
+    label_calls = []
+    async def fake_label(*, wallet, api=None, txid, label):
+        label_calls.append({"wallet_id": wallet["id"], "txid": txid, "label": label})
+        return True
+    monkeypatch.setattr(liquidityhelper, "label_onchain_tx", fake_label)
+
+    event_loop.run_until_complete(liquidityhelper.reconcile_lsp_refunds(api))
+
+    row = LspChannelOrder.get(LspChannelOrder.order_id == "o-to-reconcile")
+    assert row.refund_observed_onchain is True
+    # The ACTUAL on-chain amount (920), not the LSP-claimed (950).
+    assert row.refund_amount_sat == 920
+    # The refund tx got labeled.
+    assert len(label_calls) == 1
+    assert label_calls[0]["txid"] == "ab" * 32
+    assert label_calls[0]["label"] == "lsp_refund:o-to-reconcile"
+
+
+def test_reconcile_lsp_refunds_skips_when_tx_not_yet_in_history(monkeypatch, event_loop):
+    """LSP claimed a refund but the tx hasn't appeared in our on-chain
+    history yet (e.g., the LSP hasn't actually broadcast, or the
+    broadcast hasn't reached our node). Stay unverified — fee
+    accounting won't credit until the tx is actually observed."""
+    LspChannelOrder.create(
+        provider="zeus", network="mainnet", wallet_id="w1",
+        order_id="o-pending", lsp_peer_pubkey="aa" * 33,
+        lsp_balance_sat=150_000, fee_total_sat=1000,
+        state="FAILED",
+        refund_amount_sat=950,
+        refund_txid="ab" * 32,
+        refund_observed_onchain=False,
+    )
+    api = FakeBitcartAPI()
+    api.add_wallet("w1", currency="btclnd", balance=0.02)
+    # On-chain history doesn't contain the claimed refund_txid.
+    monkeypatch.setattr(
+        liquidityhelper, "list_onchain_history",
+        _async_list_onchain_history_returning([{
+            "txid": "cd" * 32, "incoming": True, "amount_sat": 50_000,
+            "fee_sat": 0, "label": "", "block_height": 100,
+            "num_confirmations": 6, "timestamp": 1700000000,
+            "dest_address": "bc1qother",
+        }]),
+    )
+
+    event_loop.run_until_complete(liquidityhelper.reconcile_lsp_refunds(api))
+
+    row = LspChannelOrder.get(LspChannelOrder.order_id == "o-pending")
+    assert row.refund_observed_onchain is False
+
+
+def test_reconcile_lsp_refunds_refuses_outgoing_match(monkeypatch, event_loop):
+    """If the claimed refund_txid matches an OUTGOING tx in our
+    history (nonsensical for a refund), refuse to credit. Defense
+    against LSP-reported txids that happen to match unrelated outflows."""
+    LspChannelOrder.create(
+        provider="zeus", network="mainnet", wallet_id="w1",
+        order_id="o-bad-direction", lsp_peer_pubkey="aa" * 33,
+        lsp_balance_sat=150_000, fee_total_sat=1000,
+        state="FAILED",
+        refund_txid="ab" * 32,
+        refund_observed_onchain=False,
+    )
+    api = FakeBitcartAPI()
+    api.add_wallet("w1", currency="btclnd", balance=0.02)
+    monkeypatch.setattr(
+        liquidityhelper, "list_onchain_history",
+        _async_list_onchain_history_returning([{
+            "txid": "ab" * 32, "incoming": False,   # OUTGOING — wrong
+            "amount_sat": -1000, "fee_sat": 175, "label": "",
+            "block_height": 100, "num_confirmations": 6,
+            "timestamp": 1700000000, "dest_address": "",
+        }]),
+    )
+
+    event_loop.run_until_complete(liquidityhelper.reconcile_lsp_refunds(api))
+
+    row = LspChannelOrder.get(LspChannelOrder.order_id == "o-bad-direction")
+    assert row.refund_observed_onchain is False
+
+
+def test_reconcile_lsp_refunds_idempotent(monkeypatch, event_loop):
+    """Running twice doesn't re-process or double-credit. Already-
+    observed rows are filtered out of the query."""
+    LspChannelOrder.create(
+        provider="zeus", network="mainnet", wallet_id="w1",
+        order_id="o-already-observed", lsp_peer_pubkey="aa" * 33,
+        lsp_balance_sat=150_000, fee_total_sat=1000,
+        state="FAILED",
+        refund_amount_sat=920,
+        refund_txid="ab" * 32,
+        refund_observed_onchain=True,    # already done
+    )
+    api = FakeBitcartAPI()
+    api.add_wallet("w1", currency="btclnd", balance=0.02)
+    # Even if we provide a matching tx, it shouldn't be reprocessed.
+    monkeypatch.setattr(
+        liquidityhelper, "list_onchain_history",
+        _async_list_onchain_history_returning([{
+            "txid": "ab" * 32, "incoming": True, "amount_sat": 1234567,
+            "fee_sat": 0, "label": "", "block_height": 100,
+            "num_confirmations": 6, "timestamp": 1700000000,
+            "dest_address": "bc1qrefund_addr_known",
+        }]),
+    )
+
+    event_loop.run_until_complete(liquidityhelper.reconcile_lsp_refunds(api))
+
+    row = LspChannelOrder.get(LspChannelOrder.order_id == "o-already-observed")
+    # Amount stayed at 920, NOT 1234567.
+    assert row.refund_amount_sat == 920
+
+
+# ---------------------------------------------------------------------------
+# Fix B — label_onchain_tx dispatch
+# ---------------------------------------------------------------------------
+
+def test_label_onchain_tx_lnd_calls_label_transaction(monkeypatch, event_loop):
+    """LND wallet → label_onchain_tx dispatches to WalletKit.
+    LabelTransaction with overwrite=True."""
+    calls = []
+    async def fake_lnd_rpc(api, wallet_id, method, params, service):
+        calls.append({
+            "wallet_id": wallet_id, "method": method,
+            "params": params, "service": service,
+        })
+        return {}
+    monkeypatch.setattr(liquidityhelper, "lnd_rpc", fake_lnd_rpc)
+    # _LND_CONNECTIONS guard: pre-seed so the dispatcher doesn't
+    # short-circuit on the api/None safety check.
+    monkeypatch.setitem(liquidityhelper._LND_CONNECTIONS, "w-lnd", {"stubs": {}})
+
+    api = FakeBitcartAPI()
+    ok = event_loop.run_until_complete(liquidityhelper.label_onchain_tx(
+        wallet={"id": "w-lnd", "currency": "btclnd"},
+        api=api,
+        txid="ab" * 32,
+        label="lsp_refund:o-xyz",
+    ))
+    assert ok is True
+    assert len(calls) == 1
+    assert calls[0]["method"] == "LabelTransaction"
+    assert calls[0]["service"] == "WalletKit"
+    assert calls[0]["params"] == {
+        "txid": "ab" * 32,
+        "label": "lsp_refund:o-xyz",
+        "overwrite": True,
+    }
+
+
+def test_label_onchain_tx_electrum_calls_setlabel(monkeypatch, event_loop):
+    """Electrum wallet → label_onchain_tx dispatches to electrum_rpc
+    'setlabel' with key=txid."""
+    calls = []
+    async def fake_electrum_rpc(method, xpub, params=None):
+        calls.append({"method": method, "xpub": xpub, "params": params})
+        return {"result": True}
+    monkeypatch.setattr(liquidityhelper, "electrum_rpc", fake_electrum_rpc)
+
+    ok = event_loop.run_until_complete(liquidityhelper.label_onchain_tx(
+        wallet={"id": "w-elec", "currency": "btc", "xpub": "xpub-fake"},
+        api=None,
+        txid="cd" * 32,
+        label="lsp_refund:o-abc",
+    ))
+    assert ok is True
+    assert len(calls) == 1
+    assert calls[0]["method"] == "setlabel"
+    assert calls[0]["xpub"] == "xpub-fake"
+    assert calls[0]["params"] == {"key": "cd" * 32, "label": "lsp_refund:o-abc"}
+
+
+def test_label_onchain_tx_handles_rpc_error(monkeypatch, event_loop):
+    """Either dispatcher raising returns False, doesn't propagate.
+    Labeling is decoration — never block downstream logic on it."""
+    async def fake_electrum_rpc(method, xpub, params=None):
+        raise RuntimeError("daemon offline")
+    monkeypatch.setattr(liquidityhelper, "electrum_rpc", fake_electrum_rpc)
+
+    ok = event_loop.run_until_complete(liquidityhelper.label_onchain_tx(
+        wallet={"id": "w-elec", "currency": "btc", "xpub": "xpub"},
+        api=None, txid="ab" * 32, label="lsp_refund:o-1",
+    ))
+    assert ok is False
+
+
+def test_label_onchain_tx_empty_inputs_short_circuit(event_loop):
+    """No txid or no label → return False without dispatching."""
+    for txid, label in (("", "lbl"), ("abc", ""), ("", "")):
+        ok = event_loop.run_until_complete(liquidityhelper.label_onchain_tx(
+            wallet={"id": "w", "currency": "btc"},
+            api=None, txid=txid, label=label,
+        ))
+        assert ok is False
+
+
+# ---------------------------------------------------------------------------
+# Replacement C/D — Recent LSP Orders dashboard endpoint
+# ---------------------------------------------------------------------------
+
+def test_dashboard_recent_lsp_orders_projects_completed_order():
+    """COMPLETED order surfaces in the dashboard table with
+    channel_funding_txid extracted from channel_point."""
+    from bitcart_plugin import dashboard as dashboard_mod
+
+    LspChannelOrder.create(
+        provider="zeus", network="mainnet", wallet_id="w1",
+        order_id="o-completed-dashboard", lsp_peer_pubkey="aa" * 33,
+        lsp_balance_sat=150_000, fee_total_sat=1000,
+        state="COMPLETED",
+        channel_point="deadbeef" * 8 + ":0",
+        lsps1_state="COMPLETED",
+    )
+    rows = dashboard_mod.list_recent_lsp_orders(usd_rate=None)
+    matching = [r for r in rows if r.order_id == "o-completed-dashboard"]
+    assert matching, "completed order didn't appear in the dashboard table"
+    r = matching[0]
+    assert r.state == "COMPLETED"
+    assert r.provider == "zeus"
+    assert r.short_order_id == "o-comple"
+    assert r.paid_sats == 1000
+    assert r.refund_sats == 0
+    assert r.net_cost_sats == 1000
+    assert r.channel_funding_txid == "deadbeef" * 8
+    assert r.channel_point == "deadbeef" * 8 + ":0"
+    assert r.refund_txid is None
+    assert r.refund_observed_onchain is False
+
+
+def test_dashboard_recent_lsp_orders_projects_failed_with_observed_refund():
+    """FAILED order with an observed refund: dashboard shows refund_sats
+    > 0 (= actual on-chain amount) and net_cost_sats = paid - refund.
+    refund_observed_onchain is True so the UI doesn't show the
+    pending-warning icon."""
+    from bitcart_plugin import dashboard as dashboard_mod
+
+    LspChannelOrder.create(
+        provider="megalithic", network="mainnet", wallet_id="w1",
+        order_id="o-failed-observed", lsp_peer_pubkey="bb" * 33,
+        lsp_balance_sat=150_000, fee_total_sat=1000,
+        state="FAILED",
+        refund_amount_sat=920,
+        refund_txid="ab" * 32,
+        refund_observed_onchain=True,
+        lsps1_state="FAILED",
+    )
+    rows = dashboard_mod.list_recent_lsp_orders(usd_rate=100_000.0)
+    matching = [r for r in rows if r.order_id == "o-failed-observed"]
+    assert matching
+    r = matching[0]
+    assert r.state == "FAILED"
+    assert r.paid_sats == 1000
+    assert r.refund_sats == 920
+    assert r.net_cost_sats == 80    # 1000 - 920 = LSP's miner-fee retention
+    assert r.refund_observed_onchain is True
+    assert r.refund_txid == "ab" * 32
+    # USD math: 100_000 USD/BTC → 80 sat = 80e-8 BTC * 100_000 = $0.00008
+    assert r.net_cost_usd is not None
+    assert r.net_cost_usd == pytest.approx(80 / 100_000_000 * 100_000)
+
+
+def test_dashboard_recent_lsp_orders_failed_without_observed_refund_shows_full_cost():
+    """FAILED but the refund hasn't been confirmed on-chain yet →
+    refund_sats reported as 0 (we haven't received the money yet) and
+    net_cost_sats reflects the full paid amount. The Vue UI uses
+    refund_observed_onchain=False to render the warning icon."""
+    from bitcart_plugin import dashboard as dashboard_mod
+
+    LspChannelOrder.create(
+        provider="zeus", network="mainnet", wallet_id="w1",
+        order_id="o-failed-pending", lsp_peer_pubkey="cc" * 33,
+        lsp_balance_sat=150_000, fee_total_sat=1000,
+        state="FAILED",
+        refund_amount_sat=950,                # LSP's claim
+        refund_txid="ef" * 32,
+        refund_observed_onchain=False,         # not yet on-chain
+        lsps1_state="FAILED",
+    )
+    rows = dashboard_mod.list_recent_lsp_orders(usd_rate=None)
+    matching = [r for r in rows if r.order_id == "o-failed-pending"]
+    assert matching
+    r = matching[0]
+    # Even though refund_amount_sat=950 is on the row (LSP's claim),
+    # the dashboard reports 0 here until on-chain verification.
+    assert r.refund_sats == 0
+    assert r.net_cost_sats == 1000
+    assert r.refund_observed_onchain is False
+    # The refund_txid is still surfaced so operators can manually
+    # look up its status on mempool.space.
+    assert r.refund_txid == "ef" * 32
+
+
+def test_dashboard_recent_lsp_orders_sorted_newest_first():
+    """Orders are returned newest-first by `created` timestamp."""
+    from bitcart_plugin import dashboard as dashboard_mod
+
+    older = LspChannelOrder.create(
+        provider="zeus", network="mainnet", wallet_id="w1",
+        order_id="o-older", lsp_peer_pubkey="aa" * 33,
+        lsp_balance_sat=150_000, fee_total_sat=500,
+        state="COMPLETED",
+        created=datetime.datetime(2025, 1, 1, 0, 0, 0),
+    )
+    newer = LspChannelOrder.create(
+        provider="megalithic", network="mainnet", wallet_id="w1",
+        order_id="o-newer", lsp_peer_pubkey="bb" * 33,
+        lsp_balance_sat=150_000, fee_total_sat=600,
+        state="COMPLETED",
+        created=datetime.datetime(2026, 1, 1, 0, 0, 0),
+    )
+
+    rows = dashboard_mod.list_recent_lsp_orders(usd_rate=None)
+    # Map order_id → index in result; lower index = newer.
+    positions = {r.order_id: i for i, r in enumerate(rows)}
+    assert positions["o-newer"] < positions["o-older"]
 
 
 # ---------------------------------------------------------------------------

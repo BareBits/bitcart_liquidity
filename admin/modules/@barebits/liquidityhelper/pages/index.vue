@@ -367,6 +367,98 @@
                   </v-data-table>
                 </v-card-text>
               </v-card>
+
+              <v-card outlined class="mb-4">
+                <v-card-title>Recent LSP orders</v-card-title>
+                <v-card-text>
+                  <p class="text-caption mb-2">
+                    LSP channel-order lifecycle, newest first.
+                    <strong>State</strong>:
+                    <code>ORDERED</code> → row created;
+                    <code>PAID</code> → on-chain payment broadcast,
+                    waiting for the LSP;
+                    <code>COMPLETED</code> → LSP opened the channel
+                    (see the Funding tx);
+                    <code>FAILED</code> → LSP couldn't deliver and
+                    (per LSPS1) refunded the payment.
+                    <strong>Net cost</strong> = Paid − Refund; only
+                    counts toward fee accounting once the refund tx
+                    is confirmed on-chain.
+                  </p>
+                  <v-data-table
+                    :headers="lspOrderHeaders"
+                    :items="dashboard.recent_lsp_orders"
+                    :items-per-page="10"
+                    :no-data-text="'No LSP orders yet.'"
+                    dense
+                    class="elevation-0"
+                  >
+                    <template #item.iso_date="{ item }">
+                      <span class="text-caption">{{ item.iso_date }}</span>
+                    </template>
+                    <template #item.state="{ item }">
+                      <v-chip
+                        v-if="item.state === 'COMPLETED'"
+                        x-small color="success" outlined
+                      >COMPLETED</v-chip>
+                      <v-chip
+                        v-else-if="item.state === 'FAILED'"
+                        x-small color="error" outlined
+                      >FAILED</v-chip>
+                      <v-chip
+                        v-else-if="item.state === 'PAID'"
+                        x-small color="warning" outlined
+                      >PAID</v-chip>
+                      <v-chip
+                        v-else x-small color="grey" outlined
+                      >{{ item.state }}</v-chip>
+                    </template>
+                    <template #item.short_order_id="{ item }">
+                      <span class="text-caption" :title="item.order_id">
+                        {{ item.short_order_id }}…
+                      </span>
+                    </template>
+                    <template #item.paid_sats="{ item }">
+                      <span class="text-caption">
+                        {{ item.paid_sats.toLocaleString() }}
+                      </span>
+                    </template>
+                    <template #item.refund_sats="{ item }">
+                      <span class="text-caption">
+                        {{ item.refund_sats.toLocaleString() }}
+                        <v-icon
+                          v-if="item.state === 'FAILED' && !item.refund_observed_onchain"
+                          x-small color="warning" class="ml-1"
+                          :title="'LSP claimed a refund but it has not been confirmed on-chain yet — not yet credited in fee accounting.'"
+                        >mdi-alert-circle-outline</v-icon>
+                      </span>
+                    </template>
+                    <template #item.net_cost_sats="{ item }">
+                      <span class="text-caption">
+                        {{ item.net_cost_sats.toLocaleString() }}
+                      </span>
+                    </template>
+                    <template #item.channel_funding_txid="{ item }">
+                      <a
+                        v-if="item.channel_funding_txid"
+                        :href="'https://mempool.space/tx/' + item.channel_funding_txid"
+                        target="_blank" rel="noopener"
+                        class="text-caption"
+                      >{{ shortTxid(item.channel_funding_txid) }}</a>
+                      <span v-else class="text-caption text--disabled">—</span>
+                    </template>
+                    <template #item.refund_txid="{ item }">
+                      <a
+                        v-if="item.refund_txid"
+                        :href="'https://mempool.space/tx/' + item.refund_txid"
+                        target="_blank" rel="noopener"
+                        class="text-caption"
+                      >{{ shortTxid(item.refund_txid) }}</a>
+                      <span v-else class="text-caption text--disabled">—</span>
+                    </template>
+                  </v-data-table>
+                </v-card-text>
+              </v-card>
             </div>
           </v-card-text>
         </v-card>
@@ -665,6 +757,17 @@ export default {
         { text: "Outcome", value: "force_close_initiated", width: 130 },
         { text: "Attempts", value: "cooperative_close_attempts", width: 90 },
         { text: "Reason", value: "close_reason" },
+      ],
+      lspOrderHeaders: [
+        { text: "Date", value: "iso_date", width: 160 },
+        { text: "Provider", value: "provider", width: 110 },
+        { text: "State", value: "state", width: 110 },
+        { text: "Order ID", value: "short_order_id", width: 120 },
+        { text: "Paid", value: "paid_sats", width: 110 },
+        { text: "Refund", value: "refund_sats", width: 110 },
+        { text: "Net cost", value: "net_cost_sats", width: 110 },
+        { text: "Funding tx", value: "channel_funding_txid" },
+        { text: "Refund tx", value: "refund_txid" },
       ],
 
       // Settings tab state.

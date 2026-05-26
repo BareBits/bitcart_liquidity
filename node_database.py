@@ -385,6 +385,14 @@ class LspChannelOrder(BaseModel):
     refund_amount_sat: int = BigIntegerField(default=0)
     refund_txid: Optional[str] = CharField(null=True, default=None)
     lsps1_state: Optional[str] = CharField(null=True, default=None)
+    # Whether the claimed refund tx has been verified to exist on-chain
+    # as an incoming credit to this wallet. Fee accounting only
+    # subtracts refunds we've actually observed; an LSP that claims a
+    # refund in its get_order response but never broadcasts the tx
+    # would otherwise let us under-count cost in our favor. Set by
+    # `reconcile_lsp_refunds` once the refund_txid appears in the
+    # wallet's on-chain history.
+    refund_observed_onchain: bool = BooleanField(default=False)
 
 
 class LndPaymentLabel(BaseModel):
@@ -754,6 +762,11 @@ def _migrate_lsp_channel_order_refund_columns(_db=node_db) -> None:
     if "lsps1_state" not in existing:
         _db.execute_sql(
             "ALTER TABLE lspchannelorder ADD COLUMN lsps1_state VARCHAR(64) NULL"
+        )
+    if "refund_observed_onchain" not in existing:
+        _db.execute_sql(
+            "ALTER TABLE lspchannelorder ADD COLUMN refund_observed_onchain "
+            "INTEGER NOT NULL DEFAULT 0"
         )
 
 
