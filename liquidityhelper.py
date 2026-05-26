@@ -8063,8 +8063,17 @@ async def run_tick_loop(stop_event: Optional[asyncio.Event] = None) -> None:
                         {trigger_task, stop_task},
                         return_when=asyncio.FIRST_COMPLETED,
                     )
+                    # Cancel the loser, then AWAIT the cancellation so
+                    # the task doesn't get GC'd while still pending
+                    # (which would emit "Task was destroyed but it is
+                    # pending" warnings on debug-mode shutdown).
                     for t in pending:
                         t.cancel()
+                    for t in pending:
+                        try:
+                            await t
+                        except asyncio.CancelledError:
+                            pass
                     if stop_event.is_set():
                         return
                 else:
