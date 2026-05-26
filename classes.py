@@ -616,19 +616,10 @@ class BitcartAPI:
                 if not isinstance(retrieved_wallet,dict):
                     logger.error('Err 7774353')
                     continue
-                if not retrieved_wallet.get('lightning_enabled', False):
-                    continue
                 if retrieved_wallet['name']!='liquidityhelper':
                     continue
-                existing_balance = float(best_wallet['balance'])
-                found_balance = float(retrieved_wallet.get('balance', 0))
-                if found_balance >= existing_balance:
-                    best_wallet = retrieved_wallet
-                    best_wallet_found = True
-                if best_wallet_found:
-                    return best_wallet
-                else:
-                    return None
+                return retrieved_wallet
+            return None
         except Exception as e:
             logger.error(f"xError retrieving wallets: {e}")
             return None

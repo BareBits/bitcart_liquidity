@@ -5595,7 +5595,33 @@ import lsp_providers as _lsp_providers
 from node_database import LspPriceQuote, LspChannelOrder
 
 
-_NON_TERMINAL_LSP_STATES = ("ORDERED", "PAID", "OPENED")
+# LspChannelOrder states that should prevent a wallet from creating
+# another LSP order. "OPENED" was historically intended as the
+# post-channel-open lifecycle state, but no production code path ever
+# transitions PAID → OPENED (there is no LSP-side channel-open
+# poller). Listing OPENED here was dead text; removed for accuracy.
+#
+# "ORDERED" is meant to be transient (the row is INSERTed at the top of
+# request_inbound_liquidity_from_lsp and transitions to PAID/FAILED
+# within the same async function). A row that stays ORDERED across
+# ticks is a crash-orphan — the process was killed between the INSERT
+# and the on-chain payment. Without aging, that row would block all
+# future LSP orders for the wallet forever.
+#
+# "PAID" likewise: the LSP is supposed to open a channel within
+# minutes, after which there's no engine state to advance to (the
+# channel itself becomes the source of truth — visible via
+# get_wallet_ln_channels and audited as part of the normal channel
+# list). Without aging, a wallet would be blocked from creating any
+# future LSP order even after the previous LSP channel closed.
+_NON_TERMINAL_LSP_STATES = ("ORDERED", "PAID")
+
+# After this many hours, an ORDERED or PAID row no longer blocks new
+# orders. Generous enough that an LSP that's slow to open the channel
+# in the happy path still gets to finish without us creating a
+# duplicate order; short enough that a crash-orphan or a never-opened
+# channel doesn't permanently brick the wallet's LSP access.
+_LSP_ORDER_NON_TERMINAL_TTL_HOURS = 24
 
 
 async def lsp_network_for_wallet(
@@ -5669,11 +5695,27 @@ async def lsp_network_for_wallet(
 
 
 def _wallet_has_open_lsp_order(wallet_id: str) -> bool:
-    """True if the wallet has at least one LspChannelOrder in a
-    non-terminal state. Enforces the 1-LSP-channel-per-wallet rule."""
+    """True if the wallet has at least one RECENT LspChannelOrder in a
+    non-terminal state. Enforces the 1-LSP-channel-per-wallet rule
+    while bounding the lifetime of the block.
+
+    Rows are considered "recent" if their `created` timestamp is within
+    the last `_LSP_ORDER_NON_TERMINAL_TTL_HOURS`. Older non-terminal
+    rows are crash-orphans (ORDERED that never transitioned) or
+    LSP-side hangs (PAID that never produced an open channel) and
+    must not permanently block the wallet from retrying.
+
+    Without the TTL, a single successful LSP order would block all
+    future LSP orders for the wallet forever, because no engine code
+    path advances PAID → any terminal state (no LSP-channel-open
+    poller exists)."""
+    ttl_cutoff = utcnow_naive() - datetime.timedelta(
+        hours=_LSP_ORDER_NON_TERMINAL_TTL_HOURS
+    )
     return LspChannelOrder.select().where(
         LspChannelOrder.wallet_id == wallet_id,
         LspChannelOrder.state.in_(list(_NON_TERMINAL_LSP_STATES)),
+        LspChannelOrder.created >= ttl_cutoff,
     ).exists()
 
 

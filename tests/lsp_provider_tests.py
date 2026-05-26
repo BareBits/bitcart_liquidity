@@ -238,12 +238,17 @@ def test_terminal_state_does_not_block_new_request():
 
 
 def test_invariant_is_per_wallet():
-    """Wallet A's existing channel doesn't block Wallet B."""
+    """Wallet A's existing channel doesn't block Wallet B.
+
+    Uses state='PAID' — production only writes ORDERED, PAID, FAILED
+    (no transition to 'OPENED' was ever implemented; the dead state
+    used to live in _NON_TERMINAL_LSP_STATES and silently blocked
+    wallets forever, which is the bug this rename pins against)."""
     LspChannelOrder.create(
         provider="zeus", network="mainnet", wallet_id="w-A",
         order_id="o-A", lsp_peer_pubkey="aa" * 33,
         lsp_balance_sat=150_000, fee_total_sat=1000,
-        state="OPENED",
+        state="PAID",
     )
     assert liquidityhelper._wallet_has_open_lsp_order("w-A") is True
     assert liquidityhelper._wallet_has_open_lsp_order("w-B") is False
