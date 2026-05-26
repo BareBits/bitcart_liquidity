@@ -2338,6 +2338,384 @@ def test_lsp_compatibility_audit_no_lnd_wallets_skips_quietly(
 
 
 # ---------------------------------------------------------------------------
+# Fix A — refund_onchain_address wiring
+# ---------------------------------------------------------------------------
+
+def test_create_order_includes_refund_onchain_address_when_provided(lsp_mocks, monkeypatch, event_loop):
+    """When pick_best_lsp_for_inbound has a wallet's fresh refund
+    address, it passes that to provider.create_order, and the address
+    lands in the JSON body the LSP receives. Pins against a regression
+    where the parameter is silently dropped (e.g., the conditional
+    `if refund_onchain_address: payload[...] = ...` gate gets
+    refactored without preserving the include-when-truthy behavior)."""
+    zeus_mock, meg_mock = lsp_mocks
+    _set(monkeypatch)
+    _install_mock_providers(monkeypatch, zeus_mock, meg_mock)
+    # Stub get_fresh_onchain_address to return a known address so we
+    # can assert the LSP actually saw it.
+    async def fake_addr(*, wallet, api=None):
+        return "bc1qrefund_test_address_known_value"
+    monkeypatch.setattr(liquidityhelper, "get_fresh_onchain_address", fake_addr)
+
+    api = FakeBitcartAPI()
+    api.add_wallet("w1", currency="btclnd", balance=0.01)
+    api.get_lnd_info = lambda wid: _async_return({"network": "mainnet"})
+    api.get_wallet_ln_node_id = lambda wid: _async_return(
+        "cc" * 33 + "@client.test:9735"
+    )
+
+    event_loop.run_until_complete(
+        liquidityhelper.pick_best_lsp_for_inbound(
+            wallet=api.wallets["w1"], api=api, network="mainnet",
+        )
+    )
+    # Both mocks should have received a create_order with our refund addr.
+    for mock in (zeus_mock, meg_mock):
+        create_calls = [
+            r for r in mock.requests
+            if r["method"] == "POST" and r["path"].endswith("/create_order")
+        ]
+        assert create_calls, f"no create_order received by {mock.base_url}"
+        assert create_calls[0]["json"].get("refund_onchain_address") == (
+            "bc1qrefund_test_address_known_value"
+        ), f"refund addr missing from create_order body: {create_calls[0]['json']!r}"
+
+
+def test_request_inbound_liquidity_persists_refund_address(lsp_mocks, monkeypatch, event_loop):
+    """End-to-end: after request_inbound_liquidity_from_lsp completes,
+    the persisted LspChannelOrder row has refund_onchain_address
+    populated. The poll loop relies on this to know which address to
+    expect an LSP refund at."""
+    zeus_mock, meg_mock = lsp_mocks
+    _set(monkeypatch)
+    _install_mock_providers(monkeypatch, zeus_mock, meg_mock)
+
+    async def fake_addr(*, wallet, api=None):
+        return "bc1qpersist_refund_addr"
+    monkeypatch.setattr(liquidityhelper, "get_fresh_onchain_address", fake_addr)
+    _record_onchain_payment(monkeypatch)
+
+    api = FakeBitcartAPI()
+    api.add_wallet("w1", currency="btclnd", balance=0.01)
+    api.get_lnd_info = lambda wid: _async_return({"network": "mainnet"})
+    api.get_wallet_ln_node_id = lambda wid: _async_return(
+        "cc" * 33 + "@client.test:9735"
+    )
+
+    order = event_loop.run_until_complete(
+        liquidityhelper.request_inbound_liquidity_from_lsp(
+            wallet=api.wallets["w1"], api=api,
+        )
+    )
+    assert order is not None
+    assert order.refund_onchain_address == "bc1qpersist_refund_addr"
+
+
+def test_pick_best_lsp_proceeds_when_refund_address_unavailable(lsp_mocks, monkeypatch, event_loop):
+    """If get_fresh_onchain_address returns None (e.g., wallet
+    daemon unreachable), the LSP request still proceeds — degrades
+    gracefully to passing an empty refund_onchain_address. The
+    operator-visible warning is logged but the flow doesn't abort."""
+    zeus_mock, meg_mock = lsp_mocks
+    _set(monkeypatch)
+    _install_mock_providers(monkeypatch, zeus_mock, meg_mock)
+
+    async def fake_addr(*, wallet, api=None):
+        return None
+    monkeypatch.setattr(liquidityhelper, "get_fresh_onchain_address", fake_addr)
+
+    api = FakeBitcartAPI()
+    api.add_wallet("w1", currency="btclnd", balance=0.01)
+    api.get_lnd_info = lambda wid: _async_return({"network": "mainnet"})
+    api.get_wallet_ln_node_id = lambda wid: _async_return(
+        "cc" * 33 + "@client.test:9735"
+    )
+
+    picked = event_loop.run_until_complete(
+        liquidityhelper.pick_best_lsp_for_inbound(
+            wallet=api.wallets["w1"], api=api, network="mainnet",
+        )
+    )
+    assert picked is not None  # quote returned; the request didn't abort
+    # The create_order payload should NOT have refund_onchain_address
+    # (provider only includes it when non-empty).
+    for mock in (zeus_mock, meg_mock):
+        create_calls = [
+            r for r in mock.requests
+            if r["method"] == "POST" and r["path"].endswith("/create_order")
+        ]
+        assert create_calls
+        assert "refund_onchain_address" not in create_calls[0]["json"]
+
+
+# ---------------------------------------------------------------------------
+# Fix B — poll_lsp_orders state transitions
+# ---------------------------------------------------------------------------
+
+def test_poll_lsp_orders_transitions_paid_to_completed(lsp_mocks, monkeypatch, event_loop):
+    """LSPS1 COMPLETED + channel funding_outpoint in get_order →
+    local LspChannelOrder advances PAID → COMPLETED and captures
+    the channel_point."""
+    zeus_mock, _ = lsp_mocks
+    _set(monkeypatch)
+    _install_mock_providers(monkeypatch, zeus_mock, zeus_mock)
+
+    LspChannelOrder.create(
+        provider="zeus", network="mainnet", wallet_id="w1",
+        order_id="o-completed", lsp_peer_pubkey="aa" * 33,
+        lsp_balance_sat=150_000, fee_total_sat=1000,
+        state="PAID",
+    )
+    zeus_mock.set_get_order_response({
+        "order_id": "o-completed",
+        "order_state": "COMPLETED",
+        "channel": {"funding_outpoint": "deadbeef" * 8 + ":0"},
+    })
+
+    api = FakeBitcartAPI()
+    event_loop.run_until_complete(liquidityhelper.poll_lsp_orders(api))
+
+    row = LspChannelOrder.get(LspChannelOrder.order_id == "o-completed")
+    assert row.state == "COMPLETED"
+    assert row.channel_point == "deadbeef" * 8 + ":0"
+    assert row.lsps1_state == "COMPLETED"
+
+
+def test_poll_lsp_orders_transitions_paid_to_failed_with_refund(lsp_mocks, monkeypatch, event_loop):
+    """LSPS1 FAILED in get_order → local state transitions to FAILED,
+    and refund_amount_sat / refund_txid are captured from whichever
+    location the LSP surfaces them in its response."""
+    zeus_mock, _ = lsp_mocks
+    _set(monkeypatch)
+    _install_mock_providers(monkeypatch, zeus_mock, zeus_mock)
+
+    LspChannelOrder.create(
+        provider="zeus", network="mainnet", wallet_id="w1",
+        order_id="o-failed", lsp_peer_pubkey="aa" * 33,
+        lsp_balance_sat=150_000, fee_total_sat=1000,
+        refund_onchain_address="bc1qrefund_addr_known",
+        state="PAID",
+    )
+    zeus_mock.set_get_order_response({
+        "order_id": "o-failed",
+        "order_state": "FAILED",
+        # Refund info — try top-level first; the parser also looks at
+        # payment.onchain.* per spec ambiguity but top-level is what
+        # we'll typically see.
+        "refund_amount_sat": 950,
+        "refund_txid": "ab" * 32,
+    })
+
+    api = FakeBitcartAPI()
+    event_loop.run_until_complete(liquidityhelper.poll_lsp_orders(api))
+
+    row = LspChannelOrder.get(LspChannelOrder.order_id == "o-failed")
+    assert row.state == "FAILED"
+    assert row.refund_amount_sat == 950
+    assert row.refund_txid == "ab" * 32
+    assert row.lsps1_state == "FAILED"
+
+
+def test_poll_lsp_orders_keeps_non_terminal_state_at_paid(lsp_mocks, monkeypatch, event_loop):
+    """LSP returns a non-terminal remote state (e.g., CREATED while
+    they're still working on it) → local state stays PAID but
+    last_polled is bumped."""
+    zeus_mock, _ = lsp_mocks
+    _set(monkeypatch)
+    _install_mock_providers(monkeypatch, zeus_mock, zeus_mock)
+
+    LspChannelOrder.create(
+        provider="zeus", network="mainnet", wallet_id="w1",
+        order_id="o-inflight", lsp_peer_pubkey="aa" * 33,
+        lsp_balance_sat=150_000, fee_total_sat=1000,
+        state="PAID",
+    )
+    zeus_mock.set_get_order_response({
+        "order_id": "o-inflight",
+        "order_state": "CREATED",
+    })
+
+    api = FakeBitcartAPI()
+    event_loop.run_until_complete(liquidityhelper.poll_lsp_orders(api))
+
+    row = LspChannelOrder.get(LspChannelOrder.order_id == "o-inflight")
+    assert row.state == "PAID"            # still in flight locally
+    assert row.lsps1_state == "CREATED"   # but we now know the LSP's view
+
+
+def test_poll_lsp_orders_handles_provider_error(lsp_mocks, monkeypatch, event_loop):
+    """get_order raises (network error, 5xx) → row stays PAID,
+    last_polled bumped, no crash. The 24h non-terminal TTL elsewhere
+    in the system is the final safety net."""
+    zeus_mock, _ = lsp_mocks
+    _set(monkeypatch)
+    _install_mock_providers(monkeypatch, zeus_mock, zeus_mock)
+
+    LspChannelOrder.create(
+        provider="zeus", network="mainnet", wallet_id="w1",
+        order_id="o-error", lsp_peer_pubkey="aa" * 33,
+        lsp_balance_sat=150_000, fee_total_sat=1000,
+        state="PAID",
+    )
+    zeus_mock._get_order_status = 503   # force 5xx
+
+    api = FakeBitcartAPI()
+    # Should NOT raise.
+    event_loop.run_until_complete(liquidityhelper.poll_lsp_orders(api))
+
+    row = LspChannelOrder.get(LspChannelOrder.order_id == "o-error")
+    assert row.state == "PAID"   # unchanged
+
+
+def test_poll_lsp_orders_skips_unknown_provider(monkeypatch, event_loop):
+    """A row references a provider name that isn't in the current
+    registry (e.g., operator removed the LSP from config). Skip
+    silently rather than KeyError-ing — the TTL eventually unblocks
+    the wallet."""
+    _set(monkeypatch)
+    lsp_providers.set_lsp_providers([])   # empty registry
+
+    LspChannelOrder.create(
+        provider="extinct_lsp", network="mainnet", wallet_id="w1",
+        order_id="o-unknown", lsp_peer_pubkey="aa" * 33,
+        lsp_balance_sat=150_000, fee_total_sat=1000,
+        state="PAID",
+    )
+
+    api = FakeBitcartAPI()
+    event_loop.run_until_complete(liquidityhelper.poll_lsp_orders(api))
+
+    row = LspChannelOrder.get(LspChannelOrder.order_id == "o-unknown")
+    assert row.state == "PAID"
+
+
+def test_poll_lsp_orders_ignores_non_paid_rows(lsp_mocks, monkeypatch, event_loop):
+    """ORDERED rows are still in flight inside request_inbound_
+    liquidity_from_lsp (they shouldn't survive across ticks under
+    normal operation). COMPLETED / FAILED / EXPIRED are terminal.
+    Only PAID rows are polled."""
+    zeus_mock, _ = lsp_mocks
+    _set(monkeypatch)
+    _install_mock_providers(monkeypatch, zeus_mock, zeus_mock)
+
+    for state in ("ORDERED", "COMPLETED", "FAILED", "EXPIRED"):
+        LspChannelOrder.create(
+            provider="zeus", network="mainnet",
+            wallet_id=f"w-{state}", order_id=f"o-{state}",
+            lsp_peer_pubkey="aa" * 33,
+            lsp_balance_sat=150_000, fee_total_sat=1000,
+            state=state,
+        )
+
+    api = FakeBitcartAPI()
+    event_loop.run_until_complete(liquidityhelper.poll_lsp_orders(api))
+
+    # No get_order requests should have been made.
+    get_calls = [
+        r for r in zeus_mock.requests
+        if r["method"] == "GET" and r["path"].split("?")[0].endswith("/get_order")
+    ]
+    assert get_calls == []
+
+
+# ---------------------------------------------------------------------------
+# Fix C — refund-aware fee accounting
+# ---------------------------------------------------------------------------
+
+def test_lsp_refund_for_tx_label_returns_zero_for_unmatched_label():
+    """No LspChannelOrder row matching the order_id → no subtraction.
+    Also: malformed labels (missing prefix) return 0."""
+    assert liquidityhelper._lsp_refund_for_tx_label(None) == 0
+    assert liquidityhelper._lsp_refund_for_tx_label("") == 0
+    assert liquidityhelper._lsp_refund_for_tx_label("some_other_label") == 0
+    assert liquidityhelper._lsp_refund_for_tx_label("lsp_channel_order:") == 0
+    assert liquidityhelper._lsp_refund_for_tx_label("lsp_channel_order:no_such_id") == 0
+
+
+def test_lsp_refund_for_tx_label_returns_zero_for_non_failed_order():
+    """Only FAILED orders' refund_amount_sat is consulted. PAID /
+    ORDERED / COMPLETED rows are not subtracted, even if they
+    happen to have a stale refund_amount_sat field set."""
+    LspChannelOrder.create(
+        provider="zeus", network="mainnet", wallet_id="w1",
+        order_id="o-paid-with-stale-refund", lsp_peer_pubkey="aa" * 33,
+        lsp_balance_sat=150_000, fee_total_sat=1000,
+        state="PAID",
+        refund_amount_sat=500,   # shouldn't be consulted
+    )
+    LspChannelOrder.create(
+        provider="zeus", network="mainnet", wallet_id="w1",
+        order_id="o-completed", lsp_peer_pubkey="aa" * 33,
+        lsp_balance_sat=150_000, fee_total_sat=1000,
+        state="COMPLETED",
+        refund_amount_sat=750,   # also shouldn't be consulted
+    )
+    assert liquidityhelper._lsp_refund_for_tx_label(
+        "lsp_channel_order:o-paid-with-stale-refund"
+    ) == 0
+    assert liquidityhelper._lsp_refund_for_tx_label(
+        "lsp_channel_order:o-completed"
+    ) == 0
+
+
+def test_lsp_refund_for_tx_label_returns_refund_amount_for_failed_order():
+    """Happy path: a FAILED order with a recorded refund → the
+    helper returns the refund_amount_sat int."""
+    LspChannelOrder.create(
+        provider="zeus", network="mainnet", wallet_id="w1",
+        order_id="o-failed-1", lsp_peer_pubkey="aa" * 33,
+        lsp_balance_sat=150_000, fee_total_sat=1000,
+        state="FAILED",
+        refund_amount_sat=950,
+    )
+    assert liquidityhelper._lsp_refund_for_tx_label(
+        "lsp_channel_order:o-failed-1"
+    ) == 950
+
+
+def test_new_calc_invoice_stats_subtracts_refunded_amount():
+    """End-to-end fee accounting: an on-chain LSP-order tx with
+    label="lsp_channel_order:<id>" whose corresponding LspChannelOrder
+    is FAILED with refund_amount_sat=950 → the service-fee bucket
+    accumulates (gross - refund), not gross. Miner fee (fee_sat)
+    is still counted in full because we still paid it.
+
+    Replays through _replay_onchain_fee_loop (which mirrors the
+    production logic) so this catches drift between the test
+    simulator and production."""
+    LspChannelOrder.create(
+        provider="zeus", network="mainnet", wallet_id="w1",
+        order_id="o-refunded", lsp_peer_pubkey="aa" * 33,
+        lsp_balance_sat=150_000, fee_total_sat=1000,
+        state="FAILED",
+        refund_amount_sat=950,
+    )
+
+    # Reuse the helper from lsp_fee_accounting_tests.
+    import dataclasses
+    import importlib
+    import sys
+    if "tests.lsp_fee_accounting_tests" in sys.modules:
+        del sys.modules["tests.lsp_fee_accounting_tests"]
+    lsp_acc = importlib.import_module("lsp_fee_accounting_tests")
+    tx = {
+        "label": "lsp_channel_order:o-refunded",
+        "incoming": False,
+        "fee_sat": 175,       # miner fee, always counted
+        "amount_sat": -1000,  # gross service fee
+        "txid": "ab" * 32,
+    }
+    stats = lsp_acc._replay_onchain_fee_loop([tx])
+    # Miner fee always counted in full
+    assert stats.onchain_network_fees_paid_for_lsp_orders_in_sats == 175
+    # Service fee = gross 1000 - refund 950 = 50
+    assert stats.onchain_lsp_service_fees_paid_in_sats == 50, (
+        f"expected 50 (gross 1000 - refund 950), got "
+        f"{stats.onchain_lsp_service_fees_paid_in_sats}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # small async helper
 # ---------------------------------------------------------------------------
 

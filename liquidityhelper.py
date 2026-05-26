@@ -1438,6 +1438,67 @@ async def electrum_pay_onchain(
     return True
 
 
+async def get_fresh_onchain_address(
+    *,
+    wallet: Dict[str, Any],
+    api: Optional["BitcartAPI"] = None,
+) -> Optional[str]:
+    """Get a freshly-derived on-chain address from the wallet.
+
+    Used to supply `refund_onchain_address` when creating an LSP order
+    (so the LSP can refund the payment if it ends up unable to open
+    the channel — per LSPS1 spec, refunds go to this address). Could
+    also serve future flows that need a one-shot receive address.
+
+    Dispatch is keyed off `wallet["currency"]`:
+      - "btclnd" → Lightning.NewAddress gRPC (WITNESS_PUBKEY_HASH /
+                   p2wpkh, the LND default for fresh receives)
+      - anything → Electrum's getunusedaddress JSON-RPC (returns the
+                   wallet's next-free address; does NOT advance the
+                   address pointer for re-derivation, but works for
+                   our one-shot refund use case)
+
+    Returns the address string on success, None on failure (caller
+    should log + decide whether to proceed without a refund address).
+    """
+    if wallet.get("currency") == "btclnd":
+        if api is None and wallet["id"] not in _LND_CONNECTIONS:
+            logger.warning(
+                "get_fresh_onchain_address: LND path needs either api or "
+                "pre-populated _LND_CONNECTIONS; cannot derive address"
+            )
+            return None
+        try:
+            resp = await lnd_rpc(
+                api, wallet["id"], "NewAddress",
+                {"type": "WITNESS_PUBKEY_HASH"}, "Lightning",
+            )
+        except Exception as e:
+            logger.warning(
+                f"get_fresh_onchain_address: LND.NewAddress raised for "
+                f"wallet {wallet.get('id')}: {e}"
+            )
+            return None
+        if not isinstance(resp, dict):
+            return None
+        addr = resp.get("address")
+        return addr if isinstance(addr, str) and addr else None
+
+    xpub = wallet.get("xpub")
+    try:
+        resp = await electrum_rpc("getunusedaddress", xpub)
+    except Exception as e:
+        logger.warning(
+            f"get_fresh_onchain_address: electrum_rpc raised for "
+            f"wallet {wallet.get('id')}: {e}"
+        )
+        return None
+    if not isinstance(resp, dict):
+        return None
+    addr = resp.get("result")
+    return addr if isinstance(addr, str) and addr else None
+
+
 async def _lnd_pay_onchain(
     api: "BitcartAPI", wallet_id: str, dest_addr: str, amount_btc: float, label: str,
 ) -> bool:
@@ -1957,16 +2018,31 @@ async def new_calc_invoice_stats(
             if is_lsp_channel_order_transaction(transaction):
                 if transaction.get("incoming"):
                     continue
-                # Miner fee: the chain cost of paying the LSP.
+                # Miner fee: the chain cost of paying the LSP. Always
+                # counts toward the operator's costs — even if the LSP
+                # later refunds the service fee, the miner fee was
+                # spent on broadcasting our outgoing payment and
+                # doesn't come back.
                 store_stats.onchain_network_fees_paid_for_lsp_orders_in_sats += (
                     abs(float(transaction.get("fee_sat") or 0))
                 )
                 # Service fee: the principal we sent to the LSP.
                 # With client_balance_sat=0 (our standard request), the
                 # entire amount we sent IS the LSP's service fee.
-                store_stats.onchain_lsp_service_fees_paid_in_sats += (
-                    abs(float(transaction.get("amount_sat") or 0))
-                )
+                #
+                # Refund reconciliation: per LSPS1 spec, if the LSP
+                # fails to open the channel after we paid, it issues a
+                # refund to refund_onchain_address (minus a miner fee
+                # on the refund tx itself). poll_lsp_orders writes the
+                # refund_amount_sat onto the LspChannelOrder row when
+                # it observes order_state=FAILED. Net our service-fee
+                # bucket against any recorded refund so the
+                # operator's accumulated "LSP cost" reflects what
+                # actually stayed gone.
+                gross_service_fee = abs(float(transaction.get("amount_sat") or 0))
+                refund_sat = _lsp_refund_for_tx_label(transaction.get("label"))
+                net_service_fee = max(0, gross_service_fee - refund_sat)
+                store_stats.onchain_lsp_service_fees_paid_in_sats += net_service_fee
             elif is_swap_transaction(transaction):
                 if transaction.get("incoming"):
                     continue
@@ -5929,6 +6005,30 @@ async def pick_best_lsp_for_inbound(
         )
         return None
 
+    # Derive a fresh on-chain refund address ONCE per wallet, before
+    # the provider loop. Passed to every create_order so that whichever
+    # LSP we ultimately pay has our refund address on file — per LSPS1
+    # spec, if the LSP can't open the channel after we paid, it
+    # refunds to this address. Without it, the LSP either refuses to
+    # issue a refund or defaults to an LSP-implementation-specific
+    # behavior (typically the input address of the payment tx, which
+    # is unreliable for HD wallets). LSPs we don't end up paying just
+    # store the address with their record of an unpaid order — no
+    # cost, no operational effect.
+    #
+    # Failure to derive an address is non-fatal: we proceed without a
+    # refund address. The LSP may still issue a refund to a default,
+    # or it may keep the funds; either way the operator-visible
+    # behavior is no worse than what shipped before this fix.
+    refund_addr = await get_fresh_onchain_address(wallet=wallet, api=api)
+    if not refund_addr:
+        log_decision(
+            ("lsp_refund_addr_unavailable", wallet_id), True,
+            "pick_best_lsp_for_inbound: could not derive a refund "
+            "on-chain address for wallet %s; LSP orders will go out "
+            "without one. Refund behavior is LSP-implementation-"
+            "specific in that case.", wallet_id,
+        )
     # Track WHY each provider was skipped so we can emit a single
     # actionable summary when no quotes come back. Without this, the
     # operator sees "no LSP returned a quote" and has to grep the
@@ -5961,7 +6061,14 @@ async def pick_best_lsp_for_inbound(
                 public_key=pubkey_uri,
                 lsp_balance_sat=int(LSP_CHANNEL_SIZE_SAT),
                 channel_expiry_blocks=int(LSP_CHANNEL_EXPIRY_BLOCKS),
+                refund_onchain_address=refund_addr or "",
             )
+            # Echo the refund address onto the quote for downstream
+            # persistence (LspChannelOrder.refund_onchain_address). The
+            # LspQuote dataclass exposes a `raw` field for ad-hoc data;
+            # set the attribute directly so it survives across the
+            # function boundary.
+            setattr(quote, "_refund_onchain_address", refund_addr or None)
         except Exception as e:
             logger.warning(
                 f"LSP {provider.name} create_order failed for wallet "
@@ -6110,6 +6217,12 @@ async def request_inbound_liquidity_from_lsp(
         return None
     provider, quote = picked
 
+    # The refund address was set on the quote object by pick_best_lsp_
+    # for_inbound (one fresh address per wallet, sent to every
+    # create_order in the picker loop). Persist it onto the order row
+    # so poll_lsp_orders can recognise an LSP refund when it later
+    # observes one in get_order's response.
+    refund_addr = getattr(quote, "_refund_onchain_address", None)
     order = LspChannelOrder.create(
         provider=provider.name,
         network=network,
@@ -6118,6 +6231,7 @@ async def request_inbound_liquidity_from_lsp(
         lsp_peer_pubkey=quote.lsp_peer_pubkey,
         lsp_balance_sat=int(quote.lsp_balance_sat),
         fee_total_sat=int(quote.fee_total_sat),
+        refund_onchain_address=refund_addr,
         state="ORDERED",
     )
     log_event(
@@ -6162,6 +6276,178 @@ async def request_inbound_liquidity_from_lsp(
         quote.lsp_peer_uri,
     )
     return order
+
+
+def _lsp_refund_for_tx_label(tx_label: Optional[str]) -> int:
+    """Look up the refund_amount_sat (if any) recorded on the
+    LspChannelOrder row whose order_id matches this tx's label.
+
+    Used by `new_calc_invoice_stats` to net the LSP service-fee
+    bucket against refunds the LSP issued for orders that failed.
+    Returns 0 when:
+      - the label doesn't match the `lsp_channel_order:<id>` format
+      - no LspChannelOrder row exists for that order_id
+      - the row exists but its state isn't FAILED (refunds only
+        apply to FAILED orders per the LSPS1 spec; on a COMPLETED
+        order we should NOT subtract anything even if some legacy
+        row had a stale refund_amount_sat)
+      - the row's refund_amount_sat is 0 / None
+
+    Called once per LSP-order on-chain tx in the accounting loop, so
+    it issues one DB query per such row per stats recompute. Tiny
+    relative to the rest of the stats build."""
+    if not tx_label or not isinstance(tx_label, str):
+        return 0
+    prefix = "lsp_channel_order:"
+    if not tx_label.startswith(prefix):
+        return 0
+    order_id = tx_label[len(prefix):].strip()
+    if not order_id:
+        return 0
+    try:
+        order = LspChannelOrder.get_or_none(
+            LspChannelOrder.order_id == order_id,
+        )
+    except Exception as e:
+        logger.warning(
+            f"_lsp_refund_for_tx_label: DB lookup failed for "
+            f"order_id={order_id}: {e}"
+        )
+        return 0
+    if order is None:
+        return 0
+    if order.state != "FAILED":
+        return 0
+    return int(order.refund_amount_sat or 0)
+
+
+# LSPS1 order_state values per the spec. Some LSP vendors expose
+# intermediate states (EXPECT_PAYMENT, PAID, OPENING) too — those are
+# treated as "still in flight, keep polling" by the polling loop.
+_LSPS1_TERMINAL_COMPLETED = "COMPLETED"
+_LSPS1_TERMINAL_FAILED = "FAILED"
+
+
+async def poll_lsp_orders(api: "BitcartAPI") -> None:
+    """Poll every still-in-flight LspChannelOrder against the LSP and
+    advance the local state machine when the LSP reports a terminal
+    outcome.
+
+    Why this exists: until this loop landed, `LspChannelOrder.state`
+    only advanced ORDERED → PAID inside `request_inbound_liquidity_
+    from_lsp`. The LSPS1 spec defines two terminal remote states
+    (`COMPLETED` and `FAILED`) that may follow our on-chain payment,
+    but no engine code read them. Operators were blind to whether the
+    LSP actually opened the channel, and refunds (per spec, the LSP
+    auto-refunds to `refund_onchain_address` when channel-open fails)
+    showed up in the wallet's on-chain history but weren't reconciled
+    against our LSP-fee accounting.
+
+    What this loop does each tick:
+      - Selects LspChannelOrder rows with local state == PAID
+        (ORDERED rows are still in `request_inbound_liquidity_from_lsp`
+        in the same call; nothing to poll yet).
+      - Calls `provider.get_order(order_id)` on each one's LSP.
+      - On LSPS1 `COMPLETED`: transition local state to "COMPLETED",
+        capture `channel_point` if surfaced. The channel itself is
+        the source of truth from here on; the LspChannelOrder row
+        is bookkeeping.
+      - On LSPS1 `FAILED`: transition local state to "FAILED",
+        capture refund_amount_sat and refund_txid if surfaced.
+        Fee accounting in `new_calc_invoice_stats` will subtract
+        the refunded amount from the LSP service-fee bucket so the
+        dev-fee math reflects the actual operator cost.
+      - On any other state (CREATED, EXPECT_PAYMENT, OPENING, etc.):
+        leave the local row at PAID, bump last_polled, try again
+        on the next poll cycle.
+
+    Errors per row:
+      - Provider unknown (config drift): log + skip; row stays PAID.
+        Will eventually time out via _wallet_has_open_lsp_order's
+        24h TTL.
+      - Network error / 4xx / 5xx from get_order: log + skip; retry
+        on the next poll. Same TTL fallback applies.
+
+    Idempotent — safe to call multiple times per tick.
+    """
+    rows = list(
+        LspChannelOrder.select().where(
+            LspChannelOrder.state == "PAID",
+        )
+    )
+    if not rows:
+        return
+    providers_by_name = {
+        p.name: p for p in _lsp_providers.get_lsp_providers()
+    }
+    now = utcnow_naive()
+    for order in rows:
+        provider = providers_by_name.get(order.provider)
+        if provider is None:
+            log_decision(
+                ("lsp_poll_unknown_provider", order.order_id), True,
+                "poll_lsp_orders: order %s references provider %s which "
+                "isn't configured; skipping (the 24h TTL on PAID rows "
+                "will eventually unblock the wallet).",
+                order.order_id, order.provider,
+            )
+            continue
+        try:
+            status = await provider.get_order(
+                network=order.network, order_id=order.order_id,
+            )
+        except Exception as e:
+            logger.warning(
+                f"poll_lsp_orders: get_order failed for "
+                f"provider={order.provider} order_id={order.order_id}: "
+                f"{e} {traceback.format_exc()}"
+            )
+            # Stamp last_polled even on error so frequency limits (if
+            # any) and operator observability are correct; state stays
+            # PAID and we retry next tick.
+            order.last_polled = now
+            order.save()
+            continue
+
+        order.lsps1_state = status.state
+        order.last_polled = now
+
+        if status.state == _LSPS1_TERMINAL_COMPLETED:
+            if status.channel_point and not order.channel_point:
+                order.channel_point = status.channel_point
+            order.state = "COMPLETED"
+            order.save()
+            log_event(
+                "LSP order %s COMPLETED: channel opened by %s "
+                "(channel_point=%s, wallet …%s)",
+                order.order_id, order.provider,
+                order.channel_point or "(not surfaced)",
+                wallet_short(order.wallet_id),
+            )
+            continue
+
+        if status.state == _LSPS1_TERMINAL_FAILED:
+            if status.refund_amount_sat > 0:
+                order.refund_amount_sat = int(status.refund_amount_sat)
+            if status.refund_txid:
+                order.refund_txid = status.refund_txid
+            order.state = "FAILED"
+            order.save()
+            log_event(
+                "LSP order %s FAILED: provider=%s did NOT open the "
+                "channel after we paid; refund_amount=%s refund_txid=%s "
+                "(wallet …%s, refund address %s — verify the refund "
+                "tx arrives there)",
+                order.order_id, order.provider,
+                fmt_btc_sats(order.refund_amount_sat or 0),
+                order.refund_txid or "(not surfaced)",
+                wallet_short(order.wallet_id),
+                order.refund_onchain_address or "(not set at create time)",
+            )
+            continue
+
+        # Non-terminal remote state — just bookkeep and try again later.
+        order.save()
 
 
 # gRPC / LND startup phrases that indicate the daemon isn't ready to
@@ -7951,6 +8237,17 @@ async def main():
     except Exception as e:
         logger.error(
             f"Error in checking available inbound liquidity: {e}:{traceback.format_exc()}"
+        )
+    # Poll any LSP orders that are still in flight (state=PAID locally
+    # but the LSP hasn't told us yet whether the channel opened or
+    # failed). Hourly cadence: LSPs typically open within minutes, so
+    # an hour is plenty of granularity for visibility and refund
+    # reconciliation without hammering provider APIs.
+    try:
+        await run_every_x_hours(my_func=poll_lsp_orders, hours=1, api=api)
+    except Exception as e:
+        logger.error(
+            f"Error polling LSP orders: {e}:{traceback.format_exc()}"
         )
     # calculate onchain -> LN moves
     # this is only done if liquidity/reserves are sufficient

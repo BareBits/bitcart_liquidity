@@ -93,10 +93,23 @@ class LspQuote:
 
 @dataclass
 class LspOrderStatus:
-    """LSPS1 get_order response — used to poll after payment."""
+    """LSPS1 get_order response — used to poll after payment.
+
+    Per LSPS1 spec the canonical `order_state` values are CREATED,
+    COMPLETED, FAILED. Some LSP vendors expose intermediate states
+    (EXPECT_PAYMENT, PAID, OPENING). Engine consumers should treat
+    everything except COMPLETED/FAILED as "still in flight, poll
+    again later".
+
+    Refund fields are populated only when the LSP surfaces them in
+    its get_order response (typically only after order_state=FAILED).
+    For COMPLETED orders, channel_point should be populated.
+    """
     order_id: str
     state: str                  # CREATED|EXPECT_PAYMENT|PAID|OPENING|COMPLETED|FAILED
     channel_point: Optional[str] = None
+    refund_amount_sat: int = 0
+    refund_txid: Optional[str] = None
     raw: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -362,10 +375,36 @@ class _RestLSPProvider(LSPProvider):
             network, "get_order", params={"order_id": order_id}
         )
         channel = body.get("channel") or {}
+        # Refund info location isn't fully standardized across LSP
+        # vendors. Per LSPS1, refunds happen via the
+        # `refund_onchain_address` we provided at create_order time
+        # and the LSP MAY surface refund tx details either at the
+        # top level or inside the `payment` block. Probe both shapes
+        # so we don't miss the data if it's reported.
+        payment = body.get("payment") or {}
+        onchain = payment.get("onchain") or {}
+        refund_amount_raw = (
+            body.get("refund_amount_sat")
+            or payment.get("refund_amount_sat")
+            or onchain.get("refund_amount_sat")
+            or 0
+        )
+        try:
+            refund_amount_sat = int(refund_amount_raw)
+        except (TypeError, ValueError):
+            refund_amount_sat = 0
+        refund_txid = (
+            body.get("refund_txid")
+            or payment.get("refund_txid")
+            or onchain.get("refund_txid")
+            or None
+        )
         return LspOrderStatus(
             order_id=body.get("order_id", order_id),
             state=str(body.get("order_state") or "UNKNOWN"),
             channel_point=channel.get("funding_outpoint"),
+            refund_amount_sat=refund_amount_sat,
+            refund_txid=refund_txid if isinstance(refund_txid, str) else None,
             raw=body,
         )
 

@@ -84,9 +84,15 @@ def _replay_onchain_fee_loop(transactions: List[Dict[str, Any]]) -> StoreStats:
             stats.onchain_network_fees_paid_for_lsp_orders_in_sats += (
                 abs(float(transaction.get("fee_sat") or 0))
             )
-            stats.onchain_lsp_service_fees_paid_in_sats += (
-                abs(float(transaction.get("amount_sat") or 0))
+            # Mirror production: net the service-fee bucket against
+            # any refund the LSP issued for this order (when state ==
+            # FAILED in LspChannelOrder). See liquidityhelper.
+            # _lsp_refund_for_tx_label for the lookup logic.
+            gross = abs(float(transaction.get("amount_sat") or 0))
+            refund = liquidityhelper._lsp_refund_for_tx_label(
+                transaction.get("label")
             )
+            stats.onchain_lsp_service_fees_paid_in_sats += max(0, gross - refund)
         elif liquidityhelper.is_swap_transaction(transaction):
             if transaction.get("incoming"):
                 continue

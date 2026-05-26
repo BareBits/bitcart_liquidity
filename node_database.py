@@ -341,9 +341,33 @@ class LspChannelOrder(BaseModel):
       (match `lsp_peer_pubkey` against channel peers).
     - Resume polling order state across script restarts.
 
-    State machine: ORDERED -> PAID -> OPENED, or -> FAILED / EXPIRED at
-    any point. Terminal states are FAILED, EXPIRED, and (eventually)
-    CLOSED once the lease ends and the channel is gone.
+    Local state machine (this column is `state`):
+      ORDERED   — row created, on-chain payment not yet broadcast
+      PAID      — on-chain payment broadcast; awaiting LSP fulfilment
+      COMPLETED — poll_lsp_orders observed LSPS1 `COMPLETED`; channel open
+      FAILED    — poll_lsp_orders observed LSPS1 `FAILED`; LSP issued (or
+                  should have issued) a refund to refund_onchain_address
+      EXPIRED   — order TTL'd out locally before reaching any terminal
+                  remote state (e.g., we never managed to poll, or the
+                  LSP became unreachable)
+    Terminal states are COMPLETED, FAILED, EXPIRED. Non-terminal states
+    are tracked in liquidityhelper._NON_TERMINAL_LSP_STATES — that set
+    plus a TTL gates whether new orders are allowed for the wallet.
+
+    Refund tracking fields (added later, after we realised the LSPS1
+    spec allows the LSP to refund a paid order when channel-open fails;
+    without these we silently lost the visibility on those events):
+      refund_onchain_address — what we asked the LSP to refund to,
+        passed in the create_order request. Pulled fresh from the
+        wallet at order time.
+      refund_amount_sat      — amount refunded per the LSP's
+        get_order response (if reported); 0 if no refund.
+      refund_txid            — refund tx id per the LSP's get_order
+        response (if reported); empty string if not surfaced.
+      lsps1_state            — last observed remote order_state
+        ("CREATED", "COMPLETED", "FAILED", etc.). Distinct from
+        local `state` because the local machine has more granularity
+        (e.g., distinct ORDERED vs PAID before LSP knows it yet).
     """
     provider: str = CharField(index=True)
     network: str = CharField()
@@ -353,10 +377,14 @@ class LspChannelOrder(BaseModel):
     lsp_balance_sat: int = BigIntegerField()
     fee_total_sat: int = BigIntegerField()
     onchain_payment_txid: Optional[str] = CharField(null=True)
-    channel_point: Optional[str] = CharField(null=True)   # set on OPENED
-    state: str = CharField(default="ORDERED", index=True)  # ORDERED|PAID|OPENED|FAILED|EXPIRED|CLOSED
+    channel_point: Optional[str] = CharField(null=True)   # set on COMPLETED
+    state: str = CharField(default="ORDERED", index=True)  # see docstring
     created: datetime = DateTimeField(default=datetime.now)
     last_polled: datetime = DateTimeField(default=datetime.now)
+    refund_onchain_address: Optional[str] = CharField(null=True, default=None)
+    refund_amount_sat: int = BigIntegerField(default=0)
+    refund_txid: Optional[str] = CharField(null=True, default=None)
+    lsps1_state: Optional[str] = CharField(null=True, default=None)
 
 
 class LndPaymentLabel(BaseModel):
@@ -695,6 +723,41 @@ def _migrate_lightning_channel_close_columns(_db=node_db) -> None:
 
 
 _migrate_lightning_channel_close_columns()
+
+
+def _migrate_lsp_channel_order_refund_columns(_db=node_db) -> None:
+    """Add refund-tracking columns to LspChannelOrder for existing DBs.
+
+    Refund tracking was added after we realised the LSPS1 spec allows
+    the LSP to refund a paid order when channel-open fails — until
+    then we silently lost visibility on FAILED orders and didn't
+    reconcile refund txs in fee accounting. New deployments get the
+    columns via create_tables; existing deployments need ALTER TABLE.
+
+    Same pattern as _migrate_lightning_channel_close_columns:
+    introspect PRAGMA, only ADD COLUMN when missing, idempotent.
+    """
+    cursor = _db.execute_sql("PRAGMA table_info('lspchannelorder')")
+    existing = {row[1] for row in cursor.fetchall()}
+    if "refund_onchain_address" not in existing:
+        _db.execute_sql(
+            "ALTER TABLE lspchannelorder ADD COLUMN refund_onchain_address VARCHAR(255) NULL"
+        )
+    if "refund_amount_sat" not in existing:
+        _db.execute_sql(
+            "ALTER TABLE lspchannelorder ADD COLUMN refund_amount_sat BIGINT NOT NULL DEFAULT 0"
+        )
+    if "refund_txid" not in existing:
+        _db.execute_sql(
+            "ALTER TABLE lspchannelorder ADD COLUMN refund_txid VARCHAR(64) NULL"
+        )
+    if "lsps1_state" not in existing:
+        _db.execute_sql(
+            "ALTER TABLE lspchannelorder ADD COLUMN lsps1_state VARCHAR(64) NULL"
+        )
+
+
+_migrate_lsp_channel_order_refund_columns()
 
 
 print("LN Node database initialized successfully")
