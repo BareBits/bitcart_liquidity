@@ -228,14 +228,15 @@ def test_descriptions_are_within_sensible_length():
             continue
         if len(doc.description) < 25:
             too_short.append(f"{name}: {len(doc.description)} chars")
-        # Threshold raised to 3000 to accommodate two legitimately long
+        # Threshold raised to 3500 to accommodate two legitimately long
         # descriptions: PREFER_LN_CASHOUT (trade-off prose covering
         # interactions with PREFER_CASHOUT_ONCHAIN, MIN_CHANNEL_SIZE,
         # and manual-vs-LSP node selection) and OWN_LIGHTNING_NODES
-        # (operational guide to a multi-purpose knob — keysend cashouts,
-        # rebalance peers, audit-blacklist exemptions). Both carry context
-        # operators genuinely need; trimming for UX would lose info.
-        if len(doc.description) > 3000:
+        # (operational guide covering keysend cashouts, the AMP
+        # fallback path, rebalance peers, audit-blacklist exemptions,
+        # and channel-announce policy). Both carry context operators
+        # genuinely need; trimming for UX would lose info.
+        if len(doc.description) > 3500:
             too_long.append(f"{name}: {len(doc.description)} chars")
     assert not too_short, "Stub-like descriptions:\n  " + "\n  ".join(too_short)
     assert not too_long, "Excessively long descriptions:\n  " + "\n  ".join(too_long)

@@ -609,15 +609,35 @@ async def _lnd_list_onchain_history(api: "BitcartAPI", wallet_id: str) -> List[D
     funding, closing = await _lnd_channel_tx_hashes(api, wallet_id)
     resp = await lnd_rpc(api, wallet_id, "GetTransactions", {}, "Lightning") or {}
     out: List[Dict[str, Any]] = []
+    # Prefixes for purpose-tagged labels (cashout, fee, referral) that
+    # the engine writes via WalletKit.LabelTransaction. When such a
+    # label is present on a funding/closing tx (e.g. a direct-channel
+    # cashout funding tx tagged "lnhelper_cashout_direct:<pubkey>"),
+    # we preserve the operator-meaningful label rather than overwriting
+    # it with the structural "OPEN CHANNEL" / "CLOSE CHANNEL" tag.
+    # Otherwise direct-channel cashouts disappear from the dashboard's
+    # Recent Cashouts table AND get bucketed as plain channel-opens
+    # rather than as cashout miner fees.
+    _PRESERVE_LABEL_PREFIXES = (
+        CASHOUT_REASON,                  # "lnhelper_cashout"
+        CASHOUT_DIRECT_CHANNEL_REASON,   # "lnhelper_cashout_direct"
+        FEE_PAYOUT_REASON,               # "lnhelper_fee"
+        REFERRAL_PAYOUT_REASON,          # "lnhelper_referral"
+    )
     for t in resp.get("transactions") or []:
         tx_hash = (t.get("tx_hash") or "").lower()
         amount_sat = int(t.get("amount") or 0)
-        if tx_hash in funding:
+        existing_label = (t.get("label") or "").strip()
+        if existing_label and any(
+            existing_label.startswith(p) for p in _PRESERVE_LABEL_PREFIXES
+        ):
+            label = existing_label
+        elif tx_hash in funding:
             label = "OPEN CHANNEL"
         elif tx_hash in closing:
             label = "CLOSE CHANNEL"
         else:
-            label = t.get("label") or ""
+            label = existing_label
         # `time_stamp` is LND's unix-seconds (string or int depending
         # on version). Used by the dashboard's "Recent fee payments" /
         # "Recent cashouts" tables to sort and display dates.
@@ -1731,6 +1751,27 @@ async def new_calc_invoice_stats(
                     abs(float(transaction.get("amount_sat") or 0))
                 )
                 continue
+            # On-chain cashouts. Two label flavors:
+            #   - CASHOUT_REASON ("lnhelper_cashout"): operator cashed
+            #     out funds on-chain via do_onchain_cashouts.
+            #   - CASHOUT_DIRECT_CHANNEL_REASON ("lnhelper_cashout_direct:<pubkey>"):
+            #     direct-channel cashout via _attempt_direct_channel_
+            #     cashout_to_own_node — the funding tx IS the cashout
+            #     (push_sat sends the funds atomically with channel
+            #     open). Tagged with the destination pubkey suffix so
+            #     the dashboard can render the peer as the destination.
+            # Without these branches, on-chain cashouts fall into the
+            # catch-all `else` and inflate the channel-open bucket.
+            if (
+                tx_label == CASHOUT_REASON
+                or tx_label.startswith(CASHOUT_DIRECT_CHANNEL_REASON)
+            ):
+                if transaction.get("incoming"):
+                    continue
+                store_stats.onchain_network_fees_paid_for_payouts_in_sats += (
+                    abs(float(transaction.get("fee_sat") or 0))
+                )
+                continue
             if is_lsp_channel_order_transaction(transaction):
                 if transaction.get("incoming"):
                     continue
@@ -1776,7 +1817,16 @@ async def new_calc_invoice_stats(
                 continue # ignore incoming transactions
             if transaction['type']=='payment' and transaction['amount_msat']<0: #outgoing
                 if transaction['label'] == CASHOUT_REASON:
-                    store_stats.ln_network_fees_paid_for_payouts_in_sats += abs(transaction['amount_msat']/1000)
+                    # fee_msat is the LN ROUTING FEE; amount_msat is the
+                    # cashout PRINCIPAL. Earlier code used amount_msat
+                    # here, which silently inflated the "LN payouts
+                    # network fees" bucket by the full cashout volume —
+                    # and downstream fed into calc_total_bb_fees_paid_in_
+                    # sats, which made the dev fee silently stop paying
+                    # once cumulative cashouts exceeded the true dev-fee
+                    # obligation. See tests/referral_fee_tests.py::
+                    # test_cashout_label_records_only_routing_fee_not_principal
+                    store_stats.ln_network_fees_paid_for_payouts_in_sats += abs(transaction['fee_msat']/1000)
                     continue
                 if transaction['label'] == FEE_PAYOUT_REASON:
                     store_stats.ln_network_fees_paid_for_fee_payments_in_sats += abs(transaction['fee_msat']/1000)

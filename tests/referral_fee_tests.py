@@ -195,7 +195,10 @@ def _replay_ln_history(transactions: List[Dict[str, Any]],
             continue
         if transaction['type'] == 'payment' and transaction['amount_msat'] < 0:
             if transaction['label'] == CASHOUT_REASON:
-                stats.ln_network_fees_paid_for_payouts_in_sats += abs(transaction['amount_msat']/1000)
+                # See production code: fee_msat is the LN ROUTING FEE
+                # (what belongs in the network-fees bucket); amount_msat
+                # is the cashout PRINCIPAL (an outflow, not a fee).
+                stats.ln_network_fees_paid_for_payouts_in_sats += abs(transaction['fee_msat']/1000)
                 continue
             if transaction['label'] == FEE_PAYOUT_REASON:
                 stats.ln_network_fees_paid_for_fee_payments_in_sats += abs(transaction['fee_msat']/1000)
@@ -244,6 +247,141 @@ def test_dev_and_referral_payments_are_independently_tracked():
     assert stats.total_referral_fees_paid_in_sats == 10_000
     assert stats.ln_network_fees_paid_for_fee_payments_in_sats == 100
     assert stats.ln_network_fees_paid_for_referral_payments_in_sats == 50
+
+
+# ---------------------------------------------------------------------------
+# Cashout fee bucketing — regression pins for amount_msat-vs-fee_msat bug
+# ---------------------------------------------------------------------------
+
+def test_cashout_label_records_only_routing_fee_not_principal():
+    """Pin against the original double-counting bug: an LN cashout
+    with payment label CASHOUT_REASON had the entire cashout PRINCIPAL
+    added to ln_network_fees_paid_for_payouts_in_sats, instead of only
+    the routing fee. That inflated the network-fees dashboard row by
+    the full cashout volume AND silently stopped the dev fee from
+    paying once cumulative cashouts > true dev fee owed (because
+    calc_total_bb_fees_paid_in_sats reads this field).
+
+    Correct behavior: the bucket holds the FEE (fee_msat / 1000) and
+    nothing else. Principal goes out the door but isn't a "fee paid"
+    in any sense the engine should track."""
+    txs = [{
+        "type": "payment", "label": "lnhelper_cashout",
+        "amount_msat": -10_000_000,   # 10,000 sat cashout
+        "fee_msat": 50_000,           # 50 sat routing fee
+    }]
+    stats = _replay_ln_history(txs)
+    # The fee, not the principal:
+    assert stats.ln_network_fees_paid_for_payouts_in_sats == 50, (
+        f"expected 50 (the fee), got "
+        f"{stats.ln_network_fees_paid_for_payouts_in_sats}"
+    )
+    # Cashouts MUST NOT count against the dev fee — they're an
+    # operator outflow, not a fee paid to anyone.
+    assert stats.total_bb_fees_paid_in_sats == 0
+
+
+def test_cashout_does_not_reduce_remaining_dev_fee_due():
+    """Second-order pin for the same bug: with the old behavior,
+    a single cashout of 1M sat would add 1M sat to
+    calc_total_bb_fees_paid_in_sats(include_ln_network_fees=True),
+    which is compared against `eligible_revenue * 0.02` in
+    calculate_fees. With realistic revenue (~100k sat eligible →
+    2k sat fee owed), the cashout immediately blew past the owed
+    amount and the engine stopped paying the dev fee forever.
+
+    Correct behavior: after a cashout, the dev fee owed should be
+    unchanged (cashouts don't pay any fees)."""
+    txs = [{
+        "type": "payment", "label": "lnhelper_cashout",
+        "amount_msat": -1_000_000_000,  # 1M sat cashout
+        "fee_msat": 200_000,            # 200 sat fee
+    }]
+    stats = _replay_ln_history(txs)
+    stats.revenue_eligible_for_fee = 100_000
+    # With 100k eligible × 2% = 2_000 sat dev fee owed, and only
+    # 200 sat of routing fee already paid (NOT the 1M principal),
+    # remaining due should be 2_000 - 200 = 1_800. Pre-fix this
+    # would be 2_000 - 1_000_200 = -998_200 → clamped/never paid.
+    already_paid = stats.calc_total_bb_fees_paid_in_sats(
+        include_onchain_network_fees=True, include_ln_network_fees=True,
+    )
+    assert already_paid == 200, (
+        f"expected 200 (only the routing fee), got {already_paid}. "
+        f"If this is 1_000_200 you're hitting the original bug — the "
+        f"cashout principal leaked into the dev-fee accounting."
+    )
+
+
+def test_onchain_cashout_label_buckets_into_payouts_not_channel_opens():
+    """Pin against the on-chain cashout mis-bucketing: on-chain
+    cashouts via do_onchain_cashouts use label CASHOUT_REASON. The
+    old on-chain loop had no branch for that label and the tx fell
+    through to the catch-all `else` that bucketed it as a channel-
+    open fee. Operators saw inflated channel-open fees that didn't
+    correspond to any real channel opens.
+
+    Correct behavior: bucket the miner fee into
+    onchain_network_fees_paid_for_payouts_in_sats."""
+    import importlib
+    import liquidityhelper
+    importlib.reload(liquidityhelper)
+    stats = _empty_store_stats()
+
+    # Simulate the on-chain bucketing loop on a CASHOUT-labeled tx.
+    tx = {
+        "label": liquidityhelper.CASHOUT_REASON,
+        "incoming": False,
+        "fee_sat": 250,
+        "amount_sat": -50_000,
+    }
+    tx_label = (tx.get("label") or "").strip()
+    if tx_label == liquidityhelper.CASHOUT_REASON or tx_label.startswith(
+        liquidityhelper.CASHOUT_DIRECT_CHANNEL_REASON
+    ):
+        stats.onchain_network_fees_paid_for_payouts_in_sats += abs(
+            float(tx.get("fee_sat") or 0)
+        )
+    assert stats.onchain_network_fees_paid_for_payouts_in_sats == 250
+    assert stats.onchain_network_fees_paid_for_channel_opens_in_sats == 0
+
+
+def test_direct_channel_cashout_label_buckets_into_payouts_not_channel_opens():
+    """Pin against the direct-channel cashout label clobber: the
+    funding tx for a direct-channel cashout is tagged
+    'lnhelper_cashout_direct:<peer_pubkey>' via LabelTransaction.
+    _lnd_list_onchain_history used to overwrite that label with the
+    structural 'OPEN CHANNEL' tag (because the tx is in the funding
+    set), causing the tx to be bucketed as a plain channel-open AND
+    disappear from the Recent Cashouts dashboard table.
+
+    Correct behavior: the cashout label survives the structural
+    override, the tx is bucketed under cashout payouts, and the
+    dashboard sees it as a cashout."""
+    import importlib
+    import liquidityhelper
+    importlib.reload(liquidityhelper)
+    stats = _empty_store_stats()
+
+    direct_label = (
+        f"{liquidityhelper.CASHOUT_DIRECT_CHANNEL_REASON}:"
+        f"02abc1234567890abcdef1234567890abcdef1234567890abcdef1234567890ab"
+    )
+    tx = {
+        "label": direct_label,
+        "incoming": False,
+        "fee_sat": 1100,
+        "amount_sat": -5_000_000,
+    }
+    tx_label = (tx.get("label") or "").strip()
+    if tx_label == liquidityhelper.CASHOUT_REASON or tx_label.startswith(
+        liquidityhelper.CASHOUT_DIRECT_CHANNEL_REASON
+    ):
+        stats.onchain_network_fees_paid_for_payouts_in_sats += abs(
+            float(tx.get("fee_sat") or 0)
+        )
+    assert stats.onchain_network_fees_paid_for_payouts_in_sats == 1100
+    assert stats.onchain_network_fees_paid_for_channel_opens_in_sats == 0
 
 
 # ---------------------------------------------------------------------------
