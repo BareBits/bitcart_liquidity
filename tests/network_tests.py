@@ -268,8 +268,9 @@ def test_electrum_pay_ln_invoice_lnd(lnd_pair):
 
 def test_electrum_pay_ln_invoice_lnd_returns_false_on_bad_invoice(lnd_pair):
     """The LND path should return False (not raise) when payment fails. We
-    feed a synthetic invoice with an unknown destination so SendPaymentSync
-    returns a non-empty payment_error."""
+    rely on LND's duplicate-payment rejection: pay an invoice once, then
+    attempt to re-pay the same invoice — SendPaymentSync returns a non-empty
+    payment_error."""
     wallet_id = "test-wallet-A"
     a = lnd_pair.a
 
@@ -282,11 +283,6 @@ def test_electrum_pay_ln_invoice_lnd_returns_false_on_bad_invoice(lnd_pair):
             add_resp = await lnd_pair.b._stub.AddInvoice(
                 lightning_pb2.Invoice(value=500, memo="will-be-canceled")
             )
-            await lnd_pair.b._stub.CancelInvoice(
-                __import__(
-                    "lnd_proto.invoices_pb2", fromlist=["CancelInvoiceMsg"]
-                ).CancelInvoiceMsg(payment_hash=add_resp.r_hash)
-            ) if False else None  # placeholder — see fallback path below
             # Simpler reliable failure path: re-pay the invoice we just paid.
             # SendPaymentSync rejects duplicate payment_hash.
             bolt11 = add_resp.payment_request

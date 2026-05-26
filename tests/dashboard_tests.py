@@ -631,9 +631,7 @@ def test_recent_payments_no_usd_when_rate_unavailable(monkeypatch):
 
 
 def test_recent_channel_closures_reads_from_db(monkeypatch):
-    """LightningChannel rows with non-null close_reason appear in the
-    closures list. Test isolates DB state per-test via the closure
-    of all existing rows before this test runs."""
+    """LightningChannel rows with non-null close_reason appear in the closures list. (Tests already get a fresh in-memory DB via the autouse fixture in conftest; the explicit delete here is just paranoia.)"""
     from node_database import LightningChannel
     # Clean slate
     LightningChannel.delete().execute()
@@ -731,7 +729,7 @@ def test_close_reason_persisted_by_attempt_cooperative_close(monkeypatch):
     from node_database import LightningChannel
     LightningChannel.delete().execute()
 
-    # Stub out the actual close so this doesn't try to talk to LND/electrum.
+    # Stub out electrum_rpc so this doesn't try to talk to an Electrum daemon (the Electrum branch is the one this test exercises — wallet currency is 'btc').
     async def fake_electrum_close(*args, **kwargs):
         return {"closed": True}
     monkeypatch.setattr(liquidityhelper, "electrum_rpc", fake_electrum_close)

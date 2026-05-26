@@ -18,10 +18,12 @@
 //   re-renders the drawer.
 //
 // Defense in depth:
-//   The page route itself is gated with `middleware: "superuserOnly"`
-//   in pages/index.vue, so even if the entry leaked into the sidebar
-//   for a non-superuser (e.g. via store debugging tools) the route
-//   would still redirect them to "/".
+//   pages/index.vue renders an inline "Admin access required" alert
+//   for non-superusers (no redirect — see the comment in its <script>
+//   block), and the backend plugin endpoints
+//   (/api/plugins/liquidityhelper/*) enforce the same auth check
+//   independently. The sidebar entry leaking is therefore only a
+//   cosmetic regression, not a privilege escalation.
 
 const NAV_ITEM = Object.freeze({
   icon: "mdi-water-pump",

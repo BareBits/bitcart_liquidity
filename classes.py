@@ -77,11 +77,11 @@ class StoreStats:
     ineligible_revenue_because_of_promo_in_sats: int
     ineligible_revenue_because_of_topups_in_sats: int
     ineligible_revenue_because_of_bb_topups_in_sats: int
-    ln_network_fees_paid_for_bb_topup_returns_in_sats: int # not actually used yet, using misc_ln_network_fees_in_sats
+    ln_network_fees_paid_for_bb_topup_returns_in_sats: int # currently always zero; bb-topup returns route through misc_ln_network_fees_in_sats
     onchain_network_fees_paid_for_bb_topup_returns_in_sats: int
-    ln_network_fees_paid_for_fee_payments_in_sats:int # not actually used yet, using misc_ln_network_fees_in_sats
+    ln_network_fees_paid_for_fee_payments_in_sats:int
     onchain_network_fees_paid_for_fee_payments_in_sats: int
-    ln_network_fees_paid_for_payouts_in_sats: int # not actually used yet, using misc_ln_network_fees_in_sats
+    ln_network_fees_paid_for_payouts_in_sats: int
     misc_ln_network_fees_in_sats: int # these are fees not correlated to a specific payout/fee since we don't need that amount of precision yet
     onchain_network_fees_paid_for_payouts_in_sats: int
     onchain_network_fees_paid_for_channel_opens_in_sats: int
@@ -312,10 +312,12 @@ class BitcartAPI:
         Return results of a paginated query. "Result" is the most recent result.
 
         Args:
-            limit: Maximum number of invoices to retrieve (default: 50)
-
+            url: endpoint to GET.
+            params: optional query-string dict.
+            limit: optional per-page row cap (passed as the API's `limit` parameter).
         Returns:
-            Most recent response + List of contents of 'result' from query or None
+            Tuple of (last httpx response, accumulated list of `result` entries).
+            Returns None only on credential rejection.
         """
         current_count=0
         results_to_return=[]
@@ -379,10 +381,10 @@ class BitcartAPI:
         return None
     async def is_authenticated(self) -> bool:
         """
-        Check if the API client has an authentication token.
-
-        Returns:
-            bool: True if auth token is available, False otherwise
+        Check whether the API client is authenticated against the configured
+        Bitcart instance. Returns False if no auth_token is set OR if a probe
+        GET /wallets fails (network error / bad token). Returns True only
+        after a successful round-trip.
         """
         if not self.auth_token:
             return False
@@ -447,9 +449,12 @@ class BitcartAPI:
             return None
     async def get_store_total_liquidity(self, store_id:str) -> Optional[int]:
         """
-        Get live inbound + outbound liquidity in sats for a given wallet.
+        Get live INBOUND liquidity in sats for the best LN wallet of a given
+        store, counting only channels in OPEN state with a healthy peer_state.
+        (Despite the name, outbound is NOT included.)
 
         Args:
+            store_id: Store id
 
         Returns:
             Sats or None if errored
@@ -502,7 +507,7 @@ class BitcartAPI:
 
         Args:
         Returns:
-            List of wallet dictionaries or None if error occurred
+            List of payout dictionaries or None if error occurred
         """
         try:
 
@@ -640,10 +645,10 @@ class BitcartAPI:
         Return wallets node id/pubkey.
 
         Args:
-            walletid: Wallet channels
+            walletid: Wallet id
 
         Returns:
-            List of invoice dictionaries or None if error occurred
+            Node id/pubkey string (from /wallets/{id}/checkln) or None if error occurred.
         """
         try:
 
@@ -670,10 +675,14 @@ class BitcartAPI:
     #             FORCE_CLOSING
     #   LND:      OPEN, PENDING_OPEN, PENDING_CLOSE, PENDING_FORCE_CLOSE,
     #             WAITING_CLOSE, CLOSING, FORCE_CLOSING, CLOSED
+    #   Also: `ACTIVE` accepted as an alias for OPEN to defend against
+    #         daemon variants that report it that way.
     #
-    # An unrecognized state lands in the warn-and-skip branch at the
-    # bottom; we used to also warn-and-skip on perfectly-healthy LND
-    # peer states (peer_state != 'GOOD'), which spammed logs.
+    # An unrecognized state lands in the debug-log-and-skip branch at
+    # the bottom; we used to also warn-and-skip on perfectly-healthy
+    # LND peer states (peer_state != 'GOOD'), which spammed logs.
+    # Demoted to debug after that change — the function's own docstring
+    # documents the silent-skip behavior.
     _OPEN_CHANNEL_STATES = {'OPEN', 'ACTIVE'}
     _NON_OPEN_CHANNEL_STATES = {
         # Electrum
@@ -770,12 +779,13 @@ class BitcartAPI:
         Returns the first invoice found which matches note and is not expired
 
         Args:
-            limit: Maximum number of invoices to retrieve (default: 50)
+            limit: Maximum number of invoices to scan (default: 250).
             note: the note to search for
             require_unlimited: require returned invoice have no invoice amount
 
         Returns:
-            List of invoice dictionaries or None if error occurred
+            First invoice dict matching `note` with `time_left > 90` (and, if
+            require_unlimited=True, price == 0); None if not found or on error.
         """
         try:
             params = {
@@ -848,7 +858,7 @@ class BitcartAPI:
             channel_id: The ID of the channel to retrieve
 
         Returns:
-            Invoice dictionary or None if not found/error occurred
+            Channel dictionary or None if not found/error occurred
         """
         try:
             response = await self.get_wallet_ln_channels(wallet_id)
@@ -1018,7 +1028,9 @@ class BitcartAPI:
         return False
     async def is_channel_close_pending(self,wallet_id:str)->bool:
         """
-        Given wallet ID, return True if a channel open is pending or unable to figure out if a channel open is pending
+        Given wallet ID, return True if a channel CLOSE is pending or
+        unable to determine whether one is pending (errors fall through
+        to True so callers can treat ambiguity as "wait, don't act").
         """
         try:
             current_channels=await self.get_wallet_ln_channels(wallet_id)
@@ -1027,7 +1039,7 @@ class BitcartAPI:
                     return True
             return False
         except Exception as e:
-            print(f'Error in is_channel_open_pending: {e}')
+            print(f'Error in is_channel_close_pending: {e}')
             return True
     async def is_channel_open_pending(self,wallet_id:str)->bool:
         """
@@ -1158,6 +1170,10 @@ class BitcartAPI:
             buyer_email: Buyer's email address
             notification_url: URL for webhook notifications
             redirect_url: URL to redirect after payment
+            expiration_in_seconds: optional invoice expiration in seconds; passed through
+                as the API's `expiration` field.
+            notes: optional free-text tag stored on the invoice; only included in the
+                request when truthy. Used by topup-invoice flow (TOPUP_NAME / TOPUP_BAREBITS).
 
         Returns:
             Created invoice dictionary or None if error occurred
@@ -1198,9 +1214,10 @@ class BitcartAPI:
 
     async def get_btc_usd_rate(self) -> Optional[float]:
         """Fetch the current BTC→USD spot price from Bitcart's
-        `/api/cryptos/{coin}/rate` endpoint. Returns None on any failure
-        (network error, non-JSON response, missing field) so callers
-        can show "USD unavailable" without crashing.
+        `/cryptos/rate` endpoint (crypto + fiat passed as query
+        parameters, see param-shape note below). Returns None on any
+        failure (network error, non-JSON response, missing field) so
+        callers can show "USD unavailable" without crashing.
 
         Bitcart proxies CoinGecko under the hood; calling it via Bitcart
         means we use whatever rate Bitcart itself shows on store pages —

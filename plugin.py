@@ -69,7 +69,7 @@ def _build_schema_router(auth_dependency: Any | None = None):
 
     @router.get("/schema", dependencies=deps)
     async def schema() -> dict:
-        """Return [{group, settings: [{name, description, type, default}]}]
+        """Return [{group, settings: [{name, description, default}]}]
         in declaration order — Vue iterates this to render sections."""
         from pydantic_core import PydanticUndefined
         groups_payload = []
@@ -247,6 +247,25 @@ class Plugin(BasePlugin):
         self._loop_task: asyncio.Task[None] | None = None
 
     def setup_app(self, app: FastAPI) -> None:  # noqa: D401 — Bitcart hook
+        # PyCharm remote-debug attach (gunicorn HTTP worker side).
+        # No-ops when the launcher hasn't set up debug; otherwise
+        # connects this process back to PyCharm's listener so HTTP
+        # handlers (dashboard, logs, etc.) can be stepped through.
+        # Worker process attaches separately in worker_setup().
+        try:
+            _ensure_engine_importable()
+            from liquidityhelper import (
+                _load_debug_env_file as _liq_load_debug_env_file,
+                maybe_attach_pycharm_debugger as _liq_maybe_attach_pycharm_debugger,
+            )
+            _liq_load_debug_env_file()
+            _liq_maybe_attach_pycharm_debugger()
+        except Exception:
+            logger.exception(
+                "plugin setup_app: debug-attach helpers failed "
+                "(non-fatal — engine continues without debugger)"
+            )
+
         # Mount log-viewer endpoints. The bitcart auth dependency is
         # imported lazily so test code can mount the same router with a
         # stub. Routes:
@@ -260,9 +279,10 @@ class Plugin(BasePlugin):
         app.include_router(build_debug_router(AuthDependency()))
 
     async def startup(self) -> None:
-        # Registering the schema with the empty model gives Bitcart what
-        # it needs to render the settings page even before worker_setup
-        # has run (worker_setup only fires on worker processes).
+        # Registering the schema (built from config.py at import time)
+        # gives Bitcart what it needs to render the settings page even
+        # before worker_setup has run — worker_setup only fires on
+        # worker processes, so HTTP-only processes also need this call.
         self.register_settings(PluginSettings)
         # Settings-changed hook: name format is fixed by plugin_registry,
         # see `set_plugin_settings_dict`.
@@ -347,6 +367,21 @@ class Plugin(BasePlugin):
 
     async def worker_setup(self) -> None:
         _ensure_engine_importable()
+        # Worker-side PyCharm remote-debug attach. The tick loop runs
+        # in this process; without an attach here, breakpoints inside
+        # liquidityhelper.main() / do_cashouts() / etc. would never fire.
+        try:
+            from liquidityhelper import (
+                _load_debug_env_file as _liq_load_debug_env_file,
+                maybe_attach_pycharm_debugger as _liq_maybe_attach_pycharm_debugger,
+            )
+            _liq_load_debug_env_file()
+            _liq_maybe_attach_pycharm_debugger()
+        except Exception:
+            logger.exception(
+                "plugin worker_setup: debug-attach helpers failed "
+                "(non-fatal — worker continues without debugger)"
+            )
 
         # Apply current settings BEFORE importing the engine. Even though
         # the bridge can setattr post-import, doing this once up-front

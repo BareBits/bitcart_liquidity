@@ -113,8 +113,7 @@ def _record_called_paths(monkeypatch):
 
     Under the current model:
       - LN leg fires unless PREFER_CASHOUT_ONCHAIN is set
-      - Drain helper fires when (PREFER_CASHOUT_ONCHAIN) OR (LN failed
-        AND LN is known stale)
+      - Drain helper fires when (PREFER_CASHOUT_ONCHAIN and not PREFER_LN_CASHOUT) OR (LN attempted, failed, AND LN is known stale per _ln_known_stale_for_cashout)
       - On-chain leg fires ALWAYS (sweeps on-chain revenue independently)
     """
     called = []

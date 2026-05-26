@@ -50,7 +50,7 @@ DATABASE_NAME = _resolve_db_path()
 db = SqliteDatabase(DATABASE_NAME)
 
 class BaseModel(Model):
-    """Base model that all models will inherit from"""
+    """Base model that the models in this module inherit from."""
 
     class Meta:
         database = db
@@ -61,6 +61,7 @@ class LOrder(BaseModel):
     date = DateTimeField()
 
     class Meta:
+        # Legacy table name retained from the original LRequest class to avoid a schema migration.
         table_name = 'lrequests'
 
 class SimpleDateTimeField(BaseModel):
@@ -74,8 +75,15 @@ class SimpleDateTimeField(BaseModel):
     name = CharField(max_length=255, unique=True)
     date = DateTimeField()
 class Notification(BaseModel):
-    """Model for notifications table"""
-    type =CharField(max_length=15) # Valid options: LOWLIQ
+    """Model for notifications table.
+
+    No live code path writes Notification rows; count_notifications_sent reads the table but is itself unused. Kept for schema continuity.
+    The "LOWLIQ" enum value originally tracked low-liquidity warnings;
+    those have since moved to the dashboard's health_warnings system
+    (see `collect_health_warnings`). Kept here for schema continuity
+    only; safe to delete once a migration plan is in place.
+    """
+    type = CharField(max_length=15)  # reserved; previously: LOWLIQ
     body = TextField(null=True)
     date_sent = DateTimeField(null=True)
 class LastRunTracker(BaseModel):
@@ -97,6 +105,7 @@ class SimpleCacheField(BaseModel):
         """
         now = datetime.now()
         # Delete all records where current time > date + expiry_in_seconds
+        # NOTE: relies on peewee/SQLite implicit coercion of DATETIME (ISO string) values to numerics — verify against current SQLite before trusting expiry semantics for new schema changes.
         count = cls.delete().where(
             cls.date + cls.expiry_in_seconds < now.timestamp()
         ).execute()
@@ -114,8 +123,7 @@ def create_order(order_id, date=None):
         order_id (str): Order ID
         date (datetime, optional): Date of order. Defaults to current time.
 
-    Returns:
-        LRequest: Created request object
+    Returns: LOrder: Created order object
     """
     if date is None:
         date = datetime.now()

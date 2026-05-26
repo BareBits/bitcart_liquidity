@@ -465,7 +465,7 @@ def test_pick_best_channel_partners_proceeds_when_pull_fresh(
     # The gate's "refusing to return candidates" message must NOT
     # have fired — the gate was open this time.
     assert not any(
-        "refusing to return candidates" in m for m in seen_messages
+        "refusing to return candidates" in m.lower() for m in seen_messages
     ), (
         f"the gate should NOT have fired; got decisions={seen_messages}"
     )

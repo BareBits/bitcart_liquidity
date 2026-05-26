@@ -78,6 +78,28 @@
               <code>liquidityhelper</code> wallet.
             </v-alert>
 
+            <!-- Health warnings (config sanity + LN-cashout staleness).
+                 Backed by dashboard.health_warnings; each entry has
+                 severity HIGH (red) or MEDIUM (yellow). Same conditions
+                 are also emitted to decisions.log via log_decision so
+                 operators can grep history of when warnings appeared
+                 and cleared. -->
+            <v-alert
+              v-for="w in (dashboard && dashboard.health_warnings) || []"
+              :key="w.id"
+              :type="w.severity === 'HIGH' ? 'error' : 'warning'"
+              :color="w.severity === 'HIGH' ? 'red lighten-4' : 'amber lighten-4'"
+              :icon="w.severity === 'HIGH' ? 'mdi-alert-octagon' : 'mdi-alert'"
+              text
+              class="mb-2 health-warning"
+            >
+              <strong>{{ w.title }}</strong>
+              <div class="text-body-2 mt-1">{{ w.message }}</div>
+              <div class="text-caption mt-1 grey--text text--darken-1">
+                category: {{ w.category }} · id: {{ w.id }}
+              </div>
+            </v-alert>
+
             <!-- Range selector + refresh -->
             <v-row align="center" class="mb-3">
               <v-col cols="12" sm="4">
@@ -284,8 +306,9 @@
                     Channels the liquidity helper has closed (or initiated
                     closure of), newest first. The reason column explains why —
                     e.g. <code>AUDIT_FAILURE</code> includes the failing audit
-                    criteria; <code>OFFLINE_BEYOND_THRESHOLD</code> means the
-                    peer has been unreachable past the configured limit;
+                    criteria (<code>HIGH_FEE_RATE</code>,
+                    <code>LOW_EFFECTIVE_DEGREE</code>,
+                    <code>LONG_OUTAGE</code>, …);
                     <code>FORCE_CLOSE_AFTER_COOP_TIMEOUT</code> means the
                     cooperative close was escalated to a unilateral close
                     after the peer remained unresponsive.
@@ -825,23 +848,38 @@ export default {
       const reasons = m[1].split(",").map(s => s.trim()).filter(Boolean)
       return { category: "AUDIT_FAILURE", reasons }
     },
-    // Make audit-reason tokens (which are SNAKE_CASE constants set
-    // by the engine's audit_existing_peer function) human-readable
-    // for the dashboard. Unknown tokens fall back to the raw value
-    // with underscores → spaces so the table never shows a blank.
+    // Make audit-reason tokens (UPPER_SNAKE_CASE constants set by
+    // node_database.audit_existing_peer / is_node_blacklisted)
+    // human-readable. Unknown tokens fall back to the generic
+    // underscore-stripping titlecase logic.
     humanizeAuditReason(token) {
       const map = {
-        peer_offline_too_long: "Peer offline beyond the configured threshold",
-        peer_offline: "Peer offline",
-        low_local_balance: "Local balance fell below the configured floor",
-        low_remote_balance: "Remote balance below the configured floor",
-        fee_too_high: "Routing/anchor fee exceeded the configured cap",
-        channel_too_small: "Channel capacity below the configured floor",
-        channel_too_large: "Channel capacity above the configured ceiling",
-        inactive_too_long: "Channel inactive past the configured threshold",
-        unrecoverable: "Channel reported unrecoverable state",
-        stuck_htlcs: "Channel has stuck HTLCs",
-        force_close_pending: "Counterparty initiated a force-close",
+        // Tokens emitted by audit_existing_peer
+        HIGH_FEE_RATE: "Routing fee above the configured ceiling",
+        LOW_EFFECTIVE_DEGREE: "Peer has too few effective channels",
+        LOW_TWO_HOP_REACH: "Peer's 2-hop reach is too small",
+        LOW_CAPACITY: "Peer's total capacity is below the threshold",
+        LOW_OUTBOUND_CAPACITY: "Peer's outbound capacity is too low",
+        HIGH_MIN_HTLC: "Peer's min_htlc would block small payments",
+        LOW_MAX_HTLC: "Peer's max_htlc is below the threshold",
+        LONG_OUTAGE: "Peer has been offline beyond the allowed window",
+        HIGH_FAILURE_RATIO: "Peer's payment failure rate is too high",
+        // Additional tokens emitted by is_node_blacklisted (pre-open
+        // gate). Audit re-uses some of these via _evaluate_uptime_signals
+        // and the shared capacity/HTLC checks; the rest only appear when
+        // surfacing pre-open rejection reasons.
+        FORCE_CLOSE_BLACKLISTED: "Peer is serving a force-close blacklist",
+        AUDIT_BLACKLISTED: "Peer is serving an audit-failure blacklist",
+        NO_IPV4: "Peer has no IPv4 address advertised",
+        REMOTE_CLOSE_COUNT: "Peer has remote-closed too many of our channels",
+        UNKNOWN_CHANNEL_COUNT: "Peer's channel count is not yet known",
+        MIN_CHANNEL_COUNT: "Peer has fewer channels than the minimum",
+        UNKNOWN_CAPACITY: "Peer's total capacity is not yet known",
+        NO_OLDEST_KNOWN_DATE: "Peer's first-seen date is not yet known",
+        NOT_OLD_ENOUGH: "Peer is newer than the minimum age",
+        UNKNOWN_FEE_RATE: "Peer's median fee rate is not yet known",
+        UNKNOWN_HTLC_LIMITS: "Peer's HTLC limits are not yet known",
+        UNKNOWN_CONNECTEDNESS: "Peer's connectedness metrics are not yet known",
       }
       if (map[token]) return map[token]
       return token.replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase())

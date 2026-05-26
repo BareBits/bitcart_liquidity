@@ -16,10 +16,11 @@ import json
 
 import os as _os
 def _resolve_node_db_path() -> str:
-    """Same resolution as ``database._resolve_db_path``: prefer
-    bitcart's plugin_data dir, then env override, fall back to a
-    location next to this file. See database.py for why CWD-relative
-    fails as a plugin."""
+    """Same resolution as ``database._resolve_db_path``: env override
+    first (LIQUIDITYHELPER_NODE_DB_PATH), then bitcart's plugin_data
+    dir (BITCART_DATADIR/plugin_data/liquidityhelper or /datadir/...),
+    fall back to a location next to this file. See database.py for
+    why CWD-relative fails as a plugin."""
     override = _os.environ.get("LIQUIDITYHELPER_NODE_DB_PATH")
     if override:
         return override
@@ -49,6 +50,44 @@ class BaseModel(Model):
     class Meta:
         database = node_db
 
+    # Per-subclass opt-in list of DateTimeField names that should be
+    # backfilled with ``datetime.now()`` at save-time if still None.
+    # Subclasses override. Empty default = no auto-stamping.
+    #
+    # Why an explicit list and not auto-detection: many DateTimeField
+    # columns on LightningNode (last_audit_failure_at,
+    # audit_close_blacklist_until, force_close_blacklist_until,
+    # current_window_started_at, ...) are legitimately nullable and
+    # MUST stay None until something explicitly sets them. Peewee
+    # gives every field a default of None when no default= is passed,
+    # so inspecting ``field.default`` can't distinguish "opt-in
+    # sentinel" from "naturally nullable column". Hence the explicit
+    # allow-list per model.
+    _auto_now_on_insert_fields: tuple = ()
+
+    def save(self, *args, **kwargs):
+        """Backfill the per-model ``_auto_now_on_insert_fields`` with
+        ``datetime.now()`` before delegating to peewee's save().
+
+        Necessary because the legacy schema used
+        ``DateTimeField(default=datetime.now())`` (parenthesized),
+        which evaluates ONCE at module import — every row would share
+        the same timestamp. Switching the field declaration to
+        ``default=None`` removes the import-time freeze; this hook
+        restores the intended "stamp on write" semantics without
+        forcing every call site to pass the value explicitly.
+
+        Only fills fields currently None — explicitly-set values
+        (including timestamps the caller chose, e.g. backdated
+        timestamps in tests) are preserved.
+        """
+        if self._auto_now_on_insert_fields:
+            now = datetime.now()
+            for field_name in self._auto_now_on_insert_fields:
+                if getattr(self, field_name, None) is None:
+                    setattr(self, field_name, now)
+        return super().save(*args, **kwargs)
+
 
 class LightningNode(BaseModel):
     """Discovered Lightning node, sourced from LND gossip.
@@ -69,16 +108,21 @@ class LightningNode(BaseModel):
     `self.set_oldest_known_date()` after every mutation so
     `oldest_known_date` stays sortable.
     """
+    # See BaseModel.save — these DateTimeFields use default=None as a
+    # sentinel and get backfilled with datetime.now() at write time.
+    # Replaces the broken ``default=datetime.now()`` (parenthesized)
+    # pattern that evaluated once at import.
+    _auto_now_on_insert_fields = ("oldest_known_date", "last_lnd_query")
     node_address:str = CharField(unique=True, primary_key=True) # pubkey, LOWERCASE 66-hex
-    oldest_channel:Optional[DateTimeField] = DateTimeField(null=True) # block-time of node's earliest channel (approx via height*600s)
+    oldest_channel:Optional[DateTimeField] = DateTimeField(null=True) # block-time of node's earliest channel (approx via height * ~575s — see lnd_graph_pull._AVG_BLOCK_INTERVAL_SEC)
     number_of_channels:Optional[int]=IntegerField(null=True) # GetNodeInfo.num_channels
     total_capacity:Optional[int] = BigIntegerField(null=True) # GetNodeInfo.total_capacity (sat)
     smallest_channel_size:Optional[int]=BigIntegerField(null=True) # min(GetNodeInfo.channels[].capacity)
-    oldest_known_date:datetime=DateTimeField(default=datetime.now()) # max of oldest_channel and oldest_known_date — sortable lower bound
+    oldest_known_date:datetime=DateTimeField(default=None, null=True) # max of oldest_channel and oldest_known_date — sortable lower bound. Default=None (was datetime.now() which evaluates once at import); BaseModel.save() backfills to datetime.now() before INSERT.
     tor_address:Optional[str] = CharField(null=True)  # validated v3 onion + port, e.g. xxx...xxx.onion:9735
     ipv4_address:Optional[str] = CharField(null=True)  # validated dotted-quad + port, e.g. 1.2.3.4:9735
     ipv6_address:Optional[str] = CharField(null=True)  # validated bracketed + port, e.g. [2001:db8::1]:9735
-    last_lnd_query:datetime=DateTimeField(default=datetime.now())  # last time we hit DescribeGraph/GetNodeInfo for this node
+    last_lnd_query:datetime=DateTimeField(default=None, null=True)  # last time we hit DescribeGraph/GetNodeInfo for this node. Default=None (was datetime.now() which evaluates once at import); BaseModel.save() backfills to datetime.now() before INSERT.
     lnd_queries: int = IntegerField(default=0)                      # cumulative count of refreshes
     # Median of fee_rate_milli_msat across the node's announced
     # outbound channel policies. NULL = we haven't computed it yet
@@ -157,6 +201,13 @@ class LightningNode(BaseModel):
         """
         Returns True if we should re-query LND for this node's details.
         """
+        # last_lnd_query is nullable since the schema default changed to
+        # None (BaseModel.save backfills on insert, but an in-memory
+        # row that hasn't been saved yet — or an older row where the
+        # column happens to be NULL — needs to be treated as "stale,
+        # please refresh").
+        if self.last_lnd_query is None:
+            return True
         time_between_insertion = datetime.now() - self.last_lnd_query
 
         if time_between_insertion.days > update_frequency_in_days:
@@ -221,9 +272,9 @@ class LightningChannel(BaseModel):
     force_close_initiated_at: Optional[datetime] = DateTimeField(null=True)
     # Human-readable explanation for WHY this channel was closed. Set
     # by every close-initiation path (audit failure → "AUDIT_FAILURE:
-    # HIGH_FEE_RATE,LOW_LIQUIDITY"; offline-channel sweep → "OFFLINE_
-    # BEYOND_THRESHOLD"; force-close escalation → "FORCE_CLOSE_AFTER_
-    # COOP_TIMEOUT: <original>"). Surfaced by the dashboard's "Recent
+    # HIGH_FEE_RATE,LOW_LIQUIDITY"; force-close escalation →
+    # "FORCE_CLOSE_AFTER_COOP_TIMEOUT: AUDIT_FAILURE: HIGH_FEE_RATE").
+    # Surfaced by the dashboard's "Recent
     # channel closures" table — operators expect to see why each
     # closure happened. Nullable because the column was added in a
     # later migration; rows from before then will have it unset.
@@ -284,7 +335,7 @@ class LspChannelOrder(BaseModel):
     """LSP orders we've committed to (paid or attempted). Used to:
 
     - Enforce the one-LSP-channel-per-wallet invariant
-      (`wallet_has_open_lsp_order(wallet_id)` checks for non-terminal rows).
+      (`_wallet_has_open_lsp_order(wallet_id)` checks for non-terminal rows).
     - Identify which on-chain channels were funded by an LSP
       (match `lsp_peer_pubkey` against channel peers).
     - Resume polling order state across script restarts.

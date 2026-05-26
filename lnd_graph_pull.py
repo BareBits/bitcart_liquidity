@@ -276,12 +276,12 @@ _AVG_BLOCK_INTERVAL_SEC = 575
 
 def estimate_block_time(block_height: int) -> Optional[datetime.datetime]:
     """Approximate the timestamp of block N as
-        genesis_time + N * 600 seconds.
+        genesis_time + N * _AVG_BLOCK_INTERVAL_SEC (currently 575s).
 
-    Accurate to within ~1 day after the difficulty-adjustment algorithm
-    stabilised (post-block 200_000 or so — well before any LN channel
-    existed). This is plenty good for the age-in-days candidate filter.
-    Returns None for implausible heights.
+    Using the empirical post-2009 average (575s/block, not the protocol
+    target of 600s) keeps the estimate within ~30 days of truth — vs
+    ~245 days with a naive 600. This is plenty good for the
+    age-in-days candidate filter. Returns None for implausible heights.
     """
     if not sane_block_height(block_height):
         return None
@@ -728,7 +728,7 @@ def _outbound_min_htlc_for_node(
     _outbound_fee_rate_for_node. Note: LND's gRPC exposes the field
     as `min_htlc` for the millisat value (despite the bare name).
     Returns None on negative or absurdly high values (>1e12 msat =
-    >1k BTC per HTLC; almost certainly misconfiguration).
+    >10 BTC per HTLC; almost certainly misconfiguration).
     """
     node1 = parse_pubkey(getattr(edge, "node1_pub", ""))
     node2 = parse_pubkey(getattr(edge, "node2_pub", ""))

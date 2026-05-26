@@ -12,7 +12,7 @@ Layout per LND wallet:
     ./loop_data/<wallet_id>/
         lnd-tls.cert         # copy of the wallet's LND TLS cert (loopd reads)
         lnd-admin.macaroon   # copy of the wallet's LND admin macaroon
-        regtest/             # loopd's own state dir (network depends on config)
+        <network>/           # loopd's own state dir (mainnet/testnet/signet/regtest, set by LOOPD_NETWORK)
             tls.cert
             tls.key
             macaroons/
@@ -23,9 +23,10 @@ Wiring in production:
   - `LOOP_OUT_ENABLED=False` (default) — `find_loop_out_candidates`
     runs each tick and logs which channels would be candidates; no
     loopd is started and no swap is initiated.
-  - `LOOP_OUT_ENABLED=True` — `do_cashouts._drain_ln_for_cashout_if_enabled`
-    calls `drain_ln_to_onchain`, which uses LoopdManager to spawn a
-    per-wallet loopd subprocess and initiate the swap. Triggered when
+  - `LOOP_OUT_ENABLED=True` — `liquidityhelper._drain_ln_for_cashout_if_enabled`
+    (called from the do_cashouts loop) invokes `drain_ln_to_onchain`, which
+    uses LoopdManager to spawn a per-wallet loopd subprocess and initiate
+    the swap. Triggered when
     LN cashouts have been failing past the staleness threshold OR
     when PREFER_CASHOUT_ONCHAIN=True. Tests can also call the swap
     functions directly to bypass the gate.
@@ -52,7 +53,7 @@ from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 import grpc
 import httpx
-from google.protobuf.json_format import MessageToDict, ParseDict
+from google.protobuf.json_format import MessageToDict
 
 from loop_proto import client_pb2, client_pb2_grpc
 
@@ -83,7 +84,7 @@ class SwapQuote:
     direction: SwapDirection
     amount_sat: int
     swap_fee_sat: int       # provider's flat + ppm fee
-    miner_fee_sat: int      # est on-chain fees (HTLC + sweep)
+    miner_fee_sat: int      # est on-chain fees (for loop-out: HTLC sweep only; HTLC publish is server-side)
     total_fee_sat: int      # swap_fee_sat + miner_fee_sat
     fee_percent: float      # total_fee_sat / amount_sat
     # Optional raw provider response for debugging / audit
@@ -492,9 +493,6 @@ class LoopProvider(SwapProvider):
 
     def __init__(self, manager: LoopdManager):
         self.manager = manager
-        # `quote_out` is wallet-agnostic but needs *some* loopd to ask. Cache
-        # the last-used wallet to avoid starting multiple unnecessary loopds.
-        self._quote_loopd: Optional[LoopdInstance] = None
 
     async def _get_any_loopd(self, wallet: Dict[str, Any], api: "BitcartAPI") -> LoopdInstance:
         return await self.manager.get_loopd_for_wallet(wallet, api)
@@ -522,8 +520,6 @@ class LoopProvider(SwapProvider):
             return None
         swap_fee = int(resp.swap_fee_sat) if resp.swap_fee_sat else 0
         miner_fee = int(resp.htlc_sweep_fee_sat) if resp.htlc_sweep_fee_sat else 0
-        # Loop also charges a small prepay routing fee, accounted separately.
-        prepay = int(resp.prepay_amt_sat) if hasattr(resp, "prepay_amt_sat") else 0
         total_fee = swap_fee + miner_fee
         return SwapQuote(
             provider=self.name,

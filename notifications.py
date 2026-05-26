@@ -37,7 +37,8 @@ class EmailNotificationProvider(NotificationProvider):
         smtp_host=self.smtp_server
         smtp_port=self.smtp_port
         timeout=30
-        if self.ssl_enabled == 'ssl':
+        # ssl_enabled is a bool from SMTP_SSL — truthy means implicit TLS on connect; falsy means plain or STARTTLS.
+        if self.ssl_enabled:
             context = ssl.create_default_context()
             server = aiosmtplib.SMTP(
                 hostname=smtp_host, port=smtp_port,
@@ -50,7 +51,7 @@ class EmailNotificationProvider(NotificationProvider):
             )
         await server.connect()
         try:
-            if self.tls_enabled and self.ssl_enabled != 'ssl':
+            if self.tls_enabled and not self.ssl_enabled:
                 context = ssl.create_default_context()
                 await server.starttls(tls_context=context)
             if self.username and self.password:
@@ -84,10 +85,11 @@ class EmailNotificationProvider(NotificationProvider):
         was flaky).
 
         Args:
-            dest_email: Recipient email address
-            from_email: Sender email address
             subject: Email subject line
             body: Email body content
+            dest_email: Recipient email address
+            from_email: Sender email address
+            from_name: Sender display name (used in the From: header alongside from_email).
             smtp_host: SMTP server hostname
             smtp_port: SMTP server port
             username: SMTP authentication username (optional)
@@ -194,8 +196,5 @@ class EmailNotificationProvider(NotificationProvider):
             logger.error(f"Unexpected error: {e} ")
             traceback.print_exc()
             return False
-    async def notify(self,
-               subject: str,
-               body: str,
-               ):
-        await self.send_email(subject=subject,body=body)
+    async def notify(self, body: str, subject: Optional[str]) -> bool:
+        return await self.send_email(subject=subject, body=body)

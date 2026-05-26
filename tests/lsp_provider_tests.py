@@ -108,7 +108,7 @@ def test_picker_zeus_wins_within_10pct_when_pricier():
 
 
 def test_picker_zeus_wins_exactly_at_10pct():
-    """Boundary: Zeus is exactly 10% pricier. Tied = Zeus wins."""
+    """Boundary: Zeus is exactly 10% pricier (the upper edge of the inclusive band). Zeus wins."""
     quotes = {
         "zeus": (_StubProvider("zeus"), _make_quote("zeus", 110)),
         "megalithic": (_StubProvider("megalithic"), _make_quote("megalithic", 100)),

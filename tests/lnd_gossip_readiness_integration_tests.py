@@ -222,9 +222,10 @@ def test_pull_and_upsert_end_to_end_against_real_lnd(lnd_pair, event_loop):
 
 
 def test_lnd_uptime_self_tracker_against_real_lnd(lnd_pair, event_loop):
-    """The engine's self-tracked uptime works around the proto being
-    too old to carry GetInfoResponse.uptime. Verify the round-trip
-    against a real wallet_id pulled from the regtest LND."""
+    """The engine self-tracks uptime (rather than reading
+    GetInfoResponse.uptime, which may not be populated on older
+    bitcart-fork LND builds). Verify the round-trip against a real
+    wallet_id pulled from the regtest LND."""
     # Use the LND's own identity_pubkey as a stand-in wallet_id for
     # the per-wallet tracker. In production, wallet_id is the Bitcart
     # wallet id; here we just need a unique key.

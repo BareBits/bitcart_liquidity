@@ -277,8 +277,171 @@ def log_decision(
     decisions_logger.log(level, message, *args, **kwargs)
 
 
-_HEARTBEAT_EVERY_N_TICKS = 100   # Tick rate is work-dominated (no fixed sleep); typically tens of seconds per tick, so ~30-90 min between heartbeats in steady state.
+def own_node_pubkeys() -> Set[str]:
+    """Lowercase hex pubkeys of every entry in OWN_LIGHTNING_NODES.
+
+    OWN_LIGHTNING_NODES is the operator's own-LN-node list in
+    `pubkey@host:port` URI format. For runtime decisions ("is this
+    channel's remote peer one of mine?") we only need the pubkey
+    portion. Returned as a set for O(1) membership checks.
+
+    Malformed entries (no `@`, empty pubkey, etc.) are silently
+    skipped — they get a separate decision log in
+    _attempt_direct_channel_cashout_to_own_node, no point spamming.
+    """
+    out: Set[str] = set()
+    for uri in (OWN_LIGHTNING_NODES or ()):
+        uri = (uri or "").strip()
+        if not uri or "@" not in uri:
+            continue
+        pubkey = uri.partition("@")[0].strip().lower()
+        if pubkey:
+            out.add(pubkey)
+    return out
+
+
+def wallet_short(wallet_id: Any) -> str:
+    """Compact wallet identifier for decisions.log lines: the last 4
+    characters of the wallet ID. Wallet IDs are 26-char ULIDs (base32);
+    the last 4 chars are distinctive enough to disambiguate between a
+    handful of wallets in a single log scan without bloating every line
+    with the full identifier. Returns "?" when the ID is missing or
+    shorter than 4 chars (defensive — shouldn't happen for real wallets
+    but keeps log output legible if a caller passes None or "")."""
+    s = str(wallet_id or "")
+    return s[-4:] if len(s) >= 4 else (s or "?")
+
+
+def fmt_btc_sats(sats: Any) -> str:
+    """Render a satoshi amount with both units: "1,234 sats (0.00001234 BTC)".
+    Used in every fund-movement log line so the operator never has to
+    convert mentally between the two. Accepts int/float/None defensively."""
+    try:
+        sats_i = int(sats or 0)
+    except (TypeError, ValueError):
+        sats_i = 0
+    return f"{sats_i:,} sats ({sats_to_btc(sats_i):.8f} BTC)"
+
+
+_HEARTBEAT_EVERY_N_TICKS = 100   # Tick rate is work-dominated in steady state (no fixed sleep), so ~30-90 min between heartbeats once warmed up. First-run / auth-failure paths sleep 30-60s per attempt, so the first heartbeat may take much longer after a fresh install or credential change.
 _tick_counter = 0
+
+
+def maybe_attach_pycharm_debugger() -> None:
+    """Connect this Python process back to a PyCharm debug server,
+    if the operator launched the rig via the debug-aware launcher.
+
+    Activation: requires both PYCHARM_DEBUG_HOST and PYCHARM_DEBUG_PORT
+    to be set in the process environment. The launcher sets these by
+    writing a file at $BITCART_DATADIR/plugin_data/liquidityhelper/
+    .debug_env and the engine sources it at startup (see
+    `_load_debug_env_file`); standalone mode picks them up directly
+    from the shell that launched python.
+
+    Behavior:
+      - settrace() runs with suspend=False so the engine continues
+        normally after attaching. Breakpoints set in PyCharm fire when
+        execution reaches them; without breakpoints, the connection is
+        passive overhead only.
+      - Fails loudly via logger.warning (NEVER raises). A pydevd
+        connection that won't establish must not take the engine down.
+      - Idempotent: if pydevd has already attached (e.g. setup_app
+        already ran in the same process) the second call is a no-op
+        in practice — pydevd reuses its existing connection.
+
+    Container vs host networking: PYCHARM_DEBUG_HOST is the docker
+    bridge gateway IP (typically 172.17.0.1) as seen from inside
+    bitcart's backend container. The launcher detects this from
+    `ip route` inside the container and passes it through. The
+    reverse SSH tunnel from VPS:5678 → laptop:5678 must bind to all
+    interfaces (sshd GatewayPorts=clientspecified) so the gateway IP
+    routes to the laptop. The launcher arranges all of this.
+    """
+    host = os.environ.get("PYCHARM_DEBUG_HOST")
+    port_str = os.environ.get("PYCHARM_DEBUG_PORT")
+    if not host or not port_str:
+        return
+    try:
+        port = int(port_str)
+    except ValueError:
+        logger.warning(
+            f"PYCHARM_DEBUG_PORT={port_str!r} is not an integer; "
+            f"not attaching debugger"
+        )
+        return
+    try:
+        import pydevd_pycharm  # type: ignore
+    except ImportError:
+        logger.warning(
+            "PYCHARM_DEBUG_HOST is set but pydevd_pycharm is not "
+            "installed in this Python environment — debugger attach "
+            "skipped. The launch wrapper should have installed the "
+            "version-matched package; check its output."
+        )
+        return
+    try:
+        pydevd_pycharm.settrace(
+            host, port=port,
+            stdoutToServer=True, stderrToServer=True,
+            suspend=False,
+        )
+        logger.info(
+            f"Attached to PyCharm debugger at {host}:{port} "
+            f"(set breakpoints in PyCharm to step through code)"
+        )
+    except Exception as e:
+        logger.warning(
+            f"Could not attach to PyCharm debugger at {host}:{port}: "
+            f"{e}. Check that PyCharm's debug server is listening and "
+            f"the reverse SSH tunnel + GatewayPorts are configured."
+        )
+
+
+def _load_debug_env_file() -> None:
+    """Source the launcher-written .debug_env file into os.environ.
+
+    Plugin mode runs inside the bitcart docker container and doesn't
+    naturally inherit env vars set by the launcher on the host. The
+    launcher solves this by writing a file (KEY=VALUE per line) into
+    a path mounted into the container, and this function reads it.
+    Standalone mode harmlessly no-ops because env vars are already
+    visible there.
+
+    File path: $BITCART_DATADIR/plugin_data/liquidityhelper/.debug_env
+    or, if BITCART_DATADIR isn't set, a sibling-to-this-file fallback.
+    Missing file → no-op. Malformed lines are skipped with a warning;
+    we don't let a stray comment in the file abort engine startup.
+    """
+    candidates = []
+    datadir = os.environ.get("BITCART_DATADIR")
+    if datadir:
+        candidates.append(
+            os.path.join(datadir, "plugin_data", "liquidityhelper", ".debug_env")
+        )
+    candidates.append("/datadir/plugin_data/liquidityhelper/.debug_env")
+    candidates.append(
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), ".debug_env")
+    )
+    for path in candidates:
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "r") as f:
+                for raw in f:
+                    line = raw.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if "=" not in line:
+                        logger.warning(
+                            f"_load_debug_env_file: skipping malformed "
+                            f"line in {path}: {line!r}"
+                        )
+                        continue
+                    k, _, v = line.partition("=")
+                    os.environ.setdefault(k.strip(), v.strip())
+        except Exception as e:
+            logger.warning(f"_load_debug_env_file: could not read {path}: {e}")
+        return  # use the first existing file only
 
 
 def maybe_emit_heartbeat() -> None:
@@ -705,11 +868,14 @@ async def get_channel_partners(
         headers: Optional headers to include in the request
 
     Returns:
-        Parsed JSON data.
+        Optional[List[Dict[str, str]]]: Parsed JSON data, or None on a
+        defensive fallback (current control flow always raises or returns
+        first).
 
     Raises:
-        httpx.HTTPError: If all retry attempts fail.
-        ValueError: If the response is not valid JSON.
+        httpx.HTTPError: on non-retried HTTP errors (4xx other than 429)
+        or after exhausting retries.
+        ValueError: if the response body is not valid JSON.
     """
     import httpx
     backoff = initial_backoff
@@ -1185,6 +1351,11 @@ async def _lnd_pay_ln_invoice(
     LND has no outgoing-payment label slot, so on success we persist the
     label in our own `LndPaymentLabel` table keyed by payment_hash for
     later lookup against ListPayments output.
+
+    Raises: grpc.aio.AioRpcError on transport-level RPC failure (peer offline,
+      RPC unavailable, deadline exceeded). Unlike _lnd_pay_onchain, this helper
+      does NOT catch -- callers must wrap (see _do_keysend_cashouts_to_own_nodes
+      for an example).
     """
     conn = await _get_lnd_connection(api, wallet_id)
     stub = conn["stubs"]["Lightning"]
@@ -1208,6 +1379,84 @@ async def _lnd_pay_ln_invoice(
             # Label persistence is best-effort — the payment itself succeeded.
             logger.warning(f"failed to persist LndPaymentLabel: {e}")
     return True
+
+
+# Keysend custom-TLV record ID (per BOLT04 / Lightning spec). The sender
+# invents a random preimage, includes it in the onion's per-hop payload
+# at this TLV key, and sets the HTLC's payment_hash to sha256(preimage).
+# The receiver pulls the preimage out of the onion, verifies it hashes
+# to the HTLC, and settles -- no invoice round-trip required.
+_LN_KEYSEND_RECORD = 5482373484
+
+
+async def _lnd_keysend(
+    api: "BitcartAPI",
+    wallet_id: str,
+    dest_pubkey: str,
+    amount_sat: int,
+    outgoing_chan_id: int,
+    label: str,
+) -> bool:
+    """Send a keysend payment to a directly-connected LN node, forced
+    to route through a specific channel.
+
+    Used to push LN balance back to one of OWN_LIGHTNING_NODES when
+    we have a channel open to that peer. The cashout amount lands on
+    the peer's side with no invoice round-trip and no LN routing fees
+    beyond the single direct hop.
+
+    Args:
+      dest_pubkey: hex pubkey of the peer (lowercase, 66 chars).
+      amount_sat: amount to send in sats.
+      outgoing_chan_id: short_channel_id of the channel to force-route
+        through. Required — without it LND might pick a different
+        channel or multi-hop path, defeating the zero-fee goal.
+      label: stored in the LndPaymentLabel side-table on success so
+        the dashboard's cashout history surfaces this payment. Use
+        the `:<peer_pubkey>` suffix convention so the dashboard
+        renders the peer as the destination.
+
+    Returns True on success, False on payment_error. Logs the error
+    so the caller can decide whether to retry on the next tick.
+
+    Raises: grpc.aio.AioRpcError on transport-level RPC failure (peer offline,
+      RPC unavailable, deadline exceeded). Unlike _lnd_pay_onchain, this helper
+      does NOT catch -- callers must wrap (see _do_keysend_cashouts_to_own_nodes
+      for an example).
+    """
+    import os as _os, hashlib as _hashlib
+    preimage = _os.urandom(32)
+    payment_hash = _hashlib.sha256(preimage).digest()
+
+    conn = await _get_lnd_connection(api, wallet_id)
+    stub = conn["stubs"]["Lightning"]
+    request = _lightning_pb2.SendRequest(
+        dest=bytes.fromhex(dest_pubkey),
+        amt=int(amount_sat),
+        payment_hash=payment_hash,
+        dest_custom_records={_LN_KEYSEND_RECORD: preimage},
+        outgoing_chan_id=int(outgoing_chan_id),
+    )
+    response = await stub.SendPaymentSync(request)
+    if response.payment_error:
+        logger.warning(
+            f"LND keysend to {dest_pubkey[:16]}… (chan {outgoing_chan_id}) "
+            f"failed: {response.payment_error}"
+        )
+        return False
+    if label:
+        try:
+            from node_database import LndPaymentLabel
+            payment_hash_hex = bytes(response.payment_hash).hex().lower()
+            LndPaymentLabel.replace(
+                payment_hash=payment_hash_hex,
+                wallet_id=wallet_id,
+                label=label,
+            ).execute()
+        except Exception as e:
+            logger.warning(f"failed to persist LndPaymentLabel for keysend: {e}")
+    return True
+
 
 async def new_calc_invoice_stats(
     api: BitcartAPI,
@@ -1424,7 +1673,7 @@ async def new_calc_invoice_stats(
                 continue
             else:
                 store_stats.onchain_network_fees_paid_for_channel_opens_in_sats+=abs(float(transaction['fee_sat']))
-                logger.warning(f'Unhandled transaction: {transaction}') # TODO figure out how to handle the sweep local anchor transaction, not sure what it does
+                logger.warning(f'Unhandled transaction: {transaction}') # Note: unhandled tx kinds (including LND anchor-output sweeps) are bucketed into channel-open fees as a conservative fallback. The per-bucket dashboard numbers should be read as 'channel-open + unclassified miscellany' for that line.
         # Get LN history + fees
         ln_history_rows = await list_ln_payments_with_labels(
             wallet=full_wallet, api=api,
@@ -1458,113 +1707,6 @@ async def new_calc_invoice_stats(
 
     return auth_store_dict
 
-
-# COMMENTED OUT DEC 2025, DELETE IN 1 month if it doesn't break anything
-# async def update_ln_payout_fees(api:BitcartAPI):
-#     payout_list = await api.get_payouts()
-#     for payout in payout_list:
-#         if payout['currency']!='BTC':
-#             continue
-#         if payout['status'].lower()!='complete':
-#             continue
-#         if payout['metadata'].get('lnfees'):
-#             continue
-#         store_id=payout['store_id']
-#         if store_id not in auth_store_dict:
-#             logger.warning(f'in new_calc_invoice: store_id not in auth_store_dict {store_id}, skipping...')
-#             continue
-#         store_stats=auth_store_dict[store_id]
-#         if 'payment_hash' in payout.get('metadata',{}):
-#             # Is "fake" LN payout, OLDTODO add any ln fees found in the payout. We currently don't add this information in
-#             amount_in_sats = btc_to_sats(float(payout['amount']))
-#             network_fees_ln = btc_to_sats(float(payout['metadata'].get('lnfees',0)))
-#         else:
-#             amount_in_sats=btc_to_sats(float(payout['amount']))
-#             #OLDTODO not sure how this looks on a real payout, update the below two lines when we have one
-#             pass
-#             #network_fees_chain+=btc_to_sats(float(payout['used_fee']))
-#
-#         if payout.get('metadata',{}).get('reason','')==FEE_PAYOUT_REASON:
-#             pass
-#             # OLDTODO re-enable etc store_dict['bb_fees_paid_in_sats'] += amount_in_sats_ln
-#             continue
-# COMMENTED OUT DEC 2025 DELETE IN a few months if nothing broke
-# async def calc_invoice_stats(api:BitcartAPI)->Dict[str,InvoiceStats]:
-#     store_list=await api.get_stores()
-#     return_dict={}
-#     fee_start_datetime = None
-#     all_existing_payouts=await api.get_payouts()
-#     fees_paid_dict=count_all_fees_paid_from_payouts(all_existing_payouts)
-#     if FEE_START_DATE:
-#         format_string = "%Y/%m/%d"
-#         fee_start_datetime = datetime.datetime.strptime(FEE_START_DATE, format_string)
-#     for store in store_list:
-#         total_revenue_in_sats = 0
-#         ineligible_revenue_promo=0 # amount of fee skipped due to promo period
-#         topup_revenue = 0  # amount of fee skipped due to topups
-#         bb_topup_revenue = 0  # amount of fee skipped due to topups
-#         network_fees_in_sats=0
-#         payoutinfo = fees_paid_dict.get(store['id'])
-#
-#
-#         store_wallets={}
-#         # find all wallets
-#         for wallet_id in store['wallets']:
-#             full_wallet=await api.get_wallet(wallet_id)
-#             full_wallet_name=full_wallet['name']
-#             store_wallets[wallet_id]=full_wallet_name
-#         all_invoices = await api.get_invoices(store_id=store)
-#         for invoice in all_invoices['result']:
-#             try:
-#                 if not invoice['paid_date']:
-#                     continue
-#                 if invoice['refund_id']:
-#                     continue
-#                 for payment in invoice.get('payments',[]):
-#                     if payment['status'] == 'pending':
-#                         continue
-#                     if payment['currency']!='btc':
-#                         logger.warning(f'Warning: found payment in non-btc currency: {payment}')
-#                         continue
-#                     wallet_id=payment['wallet_id']
-#                     if not wallet_id:
-#                         # sometimes no wallet id if wallet was deleted
-#                         logger.error(f"Error: no wallet id found for invoice {invoice['id']} payment {payment}")
-#                     if wallet_id not in store_wallets:
-#                         # This can happen if a wallet was deleted, but is still associated with a past tx
-#                         logger.error(f"Warning in calc_fees: wallet id {wallet_id} not found in store wallets: {store_wallets}")
-#                     if not payment_made(payment):
-#                         continue
-#                     wallet_name = store_wallets.get(wallet_id, 'UNKNOWN')
-#                     amount_in_sats= btc_to_sats(float(payment['amount']))
-#                     payment_date=dateutil.parser.parse(payment['created'])
-#                     if wallet_name == 'liquidityhelper' or ALL_TRANSACTIONS_ELIGIBLE_FOR_FEE:
-#                         total_revenue_in_sats+=amount_in_sats
-#                         if is_topup_invoice(invoice):
-#                             topup_revenue+=amount_in_sats
-#                         if is_bb_topup_invoice(invoice):
-#                             bb_topup_revenue+=amount_in_sats
-#                         if fee_start_datetime:
-#                             if payment_date.date() < fee_start_datetime.date():
-#                                 ineligible_revenue_promo+=amount_in_sats
-#             except Exception as e:
-#                 logger.error(f"Error processing invoice in calc_fees: {e}:{invoice}")
-#         if store['id'] in fees_paid_dict:
-#             total_fees_paid_in_sats = payoutinfo.total_paid_in_sats_ln + payoutinfo.total_paid_in_sats_onchain
-#             network_fees_in_sats += payoutinfo.total_network_fees_paid_ln + payoutinfo.total_network_fees_paid_onchain
-#         else:
-#             total_fees_paid_in_sats =0
-#             network_fees_in_sats=0
-#         my_calc_fees=InvoiceStats(store['id'],
-#                                   total_revenue_in_sats,
-#                                   total_fees_paid_in_sats=total_fees_paid_in_sats,
-#                                   ineligible_revenue_because_of_promo=ineligible_revenue_promo,
-#                                   ineligible_revenue_because_of_topups=topup_revenue,
-#                                   ineligible_revenue_because_of_bb_topups=bb_topup_revenue,
-#                                   network_fees_paid_in_payouts=network_fees_in_sats,
-#                                   )
-#         return_dict[store['id']]=my_calc_fees
-#     return return_dict
 
 def max_channel_size_from_sats(sats_we_have:int)->int:
     """"
@@ -1654,7 +1796,6 @@ async def pick_best_channel_partners(ln_cashout_address: Optional[str] = None) -
 
     coinos_uri = "021294fff596e497ad2902cd5f19673e9020953d90625d68c22e91b51a45c032d3@51.79.52.200:9736"
     strike_uri = "03c8e5f583585cac1de2b7503a6ccd3c12ba477cfd139cd4905be504c2f48e86bd@34.73.189.183:9735"
-    boltz_node = "026165850492521f4ac8abd9bd8088123446d126f648ca35e60f88177dc149ceb2@143.202.162.204:9735"
     return_list = []
     partner_list = []
     try:
@@ -1744,14 +1885,21 @@ async def pick_best_channel_partners(ln_cashout_address: Optional[str] = None) -
 
 
 async def move_onchain_to_ln(
-    wallet_id: str, amount_in_btc: float, api: BitcartAPI
+    wallet_id: str, amount_in_btc: float, api: BitcartAPI,
+    force_manual: bool = False,
 ) -> bool:
     """
     Open channels.
     pubkey: open channel to specified node
     Returns True if successful, false otherwise
+
+    `force_manual=True` bypasses the MANUAL_CHANNEL_CREATION_ENABLED
+    gate. Used by the PREFER_LN_CASHOUT path, which always picks the
+    peer manually regardless of LSP mode — its whole purpose is to
+    provision channels to a diverse set of operator-chosen nodes,
+    which doesn't work if we hand peer selection off to an LSP.
     """
-    if not MANUAL_CHANNEL_CREATION_ENABLED:
+    if not MANUAL_CHANNEL_CREATION_ENABLED and not force_manual:
         # Defensive guard. The callers (decide_onchain_to_ln,
         # attempt_create_channels from liquidity_check) already gate on
         # this flag, but this catches any future call site that forgets.
@@ -1809,7 +1957,7 @@ async def move_onchain_to_ln(
             if not ln_node:
                 logger.warning(
                     "In move_onchain_to_ln, no ln_node found"
-                )  # TODO this shouldn't be happening
+                )  # Defensive: peer absent from the candidate DB after the gossip-staleness gate cleared. Rare -- likely a brand-new peer that the daily pull hasn't yet processed. Skipping this candidate is the correct fallback.
                 continue
             blacklist_result, blacklist_reason = is_node_blacklisted(ln_node)
             if blacklist_reason == "REMOTE_CLOSE_COUNT":
@@ -1827,11 +1975,23 @@ async def move_onchain_to_ln(
                     f"In move_onchain_to_ln after LND graph refresh, node is {ln_node.node_address} blacklisted for reason {blacklist_reason}"
                 )
                 continue
-            log_event("Attempting channel open to %s for %s BTC (wallet %s)",
-                      partner, amount_in_btc, wallet_id)
+            amount_sats = btc_to_sats(amount_in_btc)
+            log_event(
+                "Attempting channel open to %s for %s (wallet …%s)",
+                partner, fmt_btc_sats(amount_sats),
+                wallet_short(wallet_id),
+            )
             move_response = await api.open_ln_channel(wallet_id, partner, amount_in_btc)
             if move_response:  # channel opened successfully
-                log_event("Channel opened: %s", move_response)
+                # move_response is a daemon-shaped dict (LND: funding_txid +
+                # output_index; Electrum: similar). Include the amount and
+                # peer explicitly alongside so the operator doesn't have to
+                # parse the daemon blob to know what just happened.
+                log_event(
+                    "Channel opened to %s for %s (wallet …%s); daemon response: %s",
+                    partner, fmt_btc_sats(amount_sats),
+                    wallet_short(wallet_id), move_response,
+                )
                 return True
     return False
 
@@ -1934,7 +2094,9 @@ def should_close_channel(
     # monitoring less than one hour
     if check_period_duration < 3600:
         return "", False
-    # down longer than 5 hours per month over a > 2 month period
+    # Branch is mathematically unreachable as written (divisor is the full window
+    # in seconds, threshold is 18000 -- effectively "never"). Preserved bit-for-bit
+    # because tests/code_only_tests.py pins this exact behavior.
     if failed_check_duration / (86400 * 30) > 18000 and check_period_duration > (
         86400 * 60
     ):
@@ -2104,14 +2266,6 @@ async def _lnd_close_channel(
     return None
 
 
-# Back-compat shim: existing callers reference _lnd_cooperative_close.
-# Forward to the unified _lnd_close_channel with force=False.
-async def _lnd_cooperative_close(
-    api: "BitcartAPI", wallet_id: str, channel_point: str,
-) -> Optional[dict]:
-    return await _lnd_close_channel(api, wallet_id, channel_point, force=False)
-
-
 async def wallet_creation(
     api: BitcartAPI,
 ) -> Optional[bool]:
@@ -2259,6 +2413,12 @@ async def store_needs_liquidity(
     Assumes any balance in LN is "inbound" since it will be converted to
     inbound next time cashout runs.
 
+    Channels to OWN_LIGHTNING_NODES peers are EXCLUDED from both the
+    inbound total and the channel count — only externally-routable
+    inbound capacity counts toward the goal. (The operator's own node
+    may be a phone wallet / occasionally offline, so we don't expect
+    incoming customer payments to route through it.)
+
     Args:
         min_channel_count: minimum number of channels this store should have.
         min_sats_liquidity: minimum amount of liquidity we want this store to have.
@@ -2275,9 +2435,19 @@ async def store_needs_liquidity(
         open_channels = await api.get_wallet_ln_channels(
             wallet_id, active_only=True, online_only=True,
         )
-        if open_channels:
-            found_channels += len(open_channels)
-        for channel in open_channels:
+        # Channels to OWN_LIGHTNING_NODES peers don't count toward
+        # the inbound-liquidity goal OR the channel-count goal. The
+        # operator's own node may be a phone wallet or otherwise
+        # intermittently online; we don't want incoming customer
+        # payments routed through it. LSP channels (or random-peer
+        # channels) provide the actually-routable inbound capacity,
+        # so the engine treats this store as if those OWN channels
+        # weren't there when deciding whether to acquire more.
+        own_pubkeys = own_node_pubkeys()
+        for channel in (open_channels or []):
+            if (channel.get("remote_pubkey") or "").lower() in own_pubkeys:
+                continue
+            found_channels += 1
             found_inbound_liquidity += float(channel["remote_balance"])
             found_inbound_liquidity += float(channel["local_balance"])
     if (
@@ -2785,13 +2955,20 @@ async def _pay_dev_fee_via_ln(
     ok = await electrum_pay_ln_invoice(
         invoice, FEE_PAYOUT_REASON, wallet=wallet_to_use, api=api,
     )
+    # Update the LN-payment streak markers in one call regardless of
+    # outcome: success clears the failing-streak marker, failure sets
+    # it if it isn't set yet. Drives _ln_known_stale_for_fee_payment.
+    _record_ln_payment_attempt_outcome(
+        success_key="LAST_SUCCESSFUL_LN_FEE_PAYMENT",
+        first_failure_key="FIRST_LN_FEE_FAILURE_SINCE_SUCCESS",
+        succeeded=bool(ok),
+    )
     if ok:
-        log_event("Fee payment successful (%d sats, wallet %s)",
-                  amount, wallet_to_use.get("id"))
-        SimpleDateTimeField.replace(
-            name="LAST_SUCCESSFUL_LN_FEE_PAYMENT",
-            date=datetime.datetime.now(),
-        ).execute()
+        log_event(
+            "LN fee payment sent: %s (wallet …%s)",
+            fmt_btc_sats(amount),
+            wallet_short(wallet_to_use.get("id")),
+        )
         return True
     logger.error('Failed to pay fee via LN!')
     return False
@@ -2806,6 +2983,21 @@ async def _pay_dev_fee_via_onchain(
             "cannot send. Store %s", store_id,
         )
         return False
+    # Minimum-amount gate. Sending a tiny on-chain fee where mining
+    # fees would exceed the fee itself is a net loss for the operator.
+    # The MIN_ONCHAIN_CASHOUT threshold (default 25_000 sat) is shared
+    # with the cashout sweep — fees just keep accumulating until a tick
+    # has enough due to clear the threshold, then go out in one tx.
+    if amount < MIN_ONCHAIN_CASHOUT:
+        log_decision(
+            ("onchain_fee_below_min", store_id), True,
+            "Dev fee on-chain payment skipped for store %s: amount %s "
+            "< MIN_ONCHAIN_CASHOUT=%d. Will defer until enough fee due "
+            "accumulates to clear the threshold.",
+            store_id, fmt_btc_sats(amount), int(MIN_ONCHAIN_CASHOUT),
+        )
+        return False
+    log_decision(("onchain_fee_below_min", store_id), False, "")
     if await has_pending_channel_activity(wallet=wallet_to_use, api=api):
         log_decision(
             ("fee_blocked_pending", store_id), True,
@@ -2830,8 +3022,10 @@ async def _pay_dev_fee_via_onchain(
     )
     if ok:
         log_event(
-            "Onchain dev-fee payment sent: %d sat from wallet %s to %s",
-            amount, wallet_to_use.get("id"), ONCHAIN_FEE_DEST,
+            "Onchain dev-fee payment sent: %s from wallet …%s to %s",
+            fmt_btc_sats(amount),
+            wallet_short(wallet_to_use.get("id")),
+            ONCHAIN_FEE_DEST,
         )
         SimpleDateTimeField.replace(
             name="LAST_SUCCESSFUL_ONCHAIN_FEE_PAYMENT",
@@ -2886,15 +3080,18 @@ async def _pay_referral_via_ln(
     ok = await electrum_pay_ln_invoice(
         invoice, REFERRAL_PAYOUT_REASON, wallet=wallet_to_use, api=api,
     )
+    # Failing-streak markers, same shape as the dev-fee path.
+    _record_ln_payment_attempt_outcome(
+        success_key="LAST_SUCCESSFUL_LN_REFERRAL_PAYMENT",
+        first_failure_key="FIRST_LN_REFERRAL_FAILURE_SINCE_SUCCESS",
+        succeeded=bool(ok),
+    )
     if ok:
         log_event(
-            "Referral payment successful (%d sats, store %s, wallet %s)",
-            amount, store_id, wallet_to_use.get("id"),
+            "LN referral payment sent: %s (store %s, wallet …%s)",
+            fmt_btc_sats(amount), store_id,
+            wallet_short(wallet_to_use.get("id")),
         )
-        SimpleDateTimeField.replace(
-            name="LAST_SUCCESSFUL_LN_REFERRAL_PAYMENT",
-            date=datetime.datetime.now(),
-        ).execute()
         return True
     logger.error("Failed to pay referral fee via LN for store %s", store_id)
     return False
@@ -2909,6 +3106,20 @@ async def _pay_referral_via_onchain(
             "cannot send. Store %s, %d sat due.", store_id, amount,
         )
         return False
+    # Minimum-amount gate. Same rationale + shared threshold as
+    # _pay_dev_fee_via_onchain — avoid losing money to mining fees
+    # on a tiny referral tx; defer until the accumulated referral
+    # due clears MIN_ONCHAIN_CASHOUT.
+    if amount < MIN_ONCHAIN_CASHOUT:
+        log_decision(
+            ("onchain_referral_below_min", store_id), True,
+            "Referral on-chain payment skipped for store %s: amount %s "
+            "< MIN_ONCHAIN_CASHOUT=%d. Will defer until enough referral "
+            "due accumulates to clear the threshold.",
+            store_id, fmt_btc_sats(amount), int(MIN_ONCHAIN_CASHOUT),
+        )
+        return False
+    log_decision(("onchain_referral_below_min", store_id), False, "")
     if await has_pending_channel_activity(wallet=wallet_to_use, api=api):
         log_decision(
             ("referral_blocked_pending", store_id), True,
@@ -2933,8 +3144,10 @@ async def _pay_referral_via_onchain(
     )
     if ok:
         log_event(
-            "Onchain referral payment sent: %d sat from wallet %s to %s",
-            amount, wallet_to_use.get("id"), REFERRAL_ONCHAIN_DEST,
+            "Onchain referral payment sent: %s from wallet …%s to %s",
+            fmt_btc_sats(amount),
+            wallet_short(wallet_to_use.get("id")),
+            REFERRAL_ONCHAIN_DEST,
         )
         SimpleDateTimeField.replace(
             name="LAST_SUCCESSFUL_ONCHAIN_REFERRAL_PAYMENT",
@@ -3045,32 +3258,106 @@ def should_prefer_onchain_referral_payment() -> bool:
     return False
 
 
-def _ln_known_stale_for_fee_payment() -> bool:
-    """True only when LN fee history exists AND is stale beyond
-    threshold. Used by the post-LN-failure fallback decision — distinct
-    from `should_prefer_onchain_fee_payment` because it ignores the
-    `FORCE_FEE_ONCHAIN_INSTEAD_OF_LN` knob (the caller already
-    short-circuited that path)."""
-    if FEE_SWITCH_TO_ONCHAIN_AFTER_X_DAYS is None:
+def _record_ln_payment_attempt_outcome(
+    success_key: str,
+    first_failure_key: str,
+    *,
+    succeeded: bool,
+) -> None:
+    """Update the per-rail streak markers after an LN payment attempt.
+
+    Two timestamps drive the staleness fallback for each LN-payment
+    family (fee / referral / cashout):
+
+      - `<success_key>` — last time this rail succeeded. Used by
+        humans + dashboards. Also bumped here for completeness.
+      - `<first_failure_key>` — start of the CURRENT failing streak.
+        Set on the first failure after a success; cleared on the next
+        success. The staleness predicate compares (now - this) against
+        the threshold so a single failure after a long quiet period
+        does NOT count as a multi-day failing streak.
+
+    Without the first-failure marker, the threshold check conflates
+    "quiet period" (no fees due, no attempts) with "failing for that
+    long" (attempts happening but all failing) — a store that hadn't
+    needed an LN fee in a month would fall back to on-chain on the
+    very first failure, losing BB_STOREID attribution.
+    """
+    now = datetime.datetime.now()
+    if succeeded:
+        SimpleDateTimeField.replace(name=success_key, date=now).execute()
+        # Streak is broken — clear the first-failure marker so a future
+        # failure starts a fresh streak.
+        SimpleDateTimeField.delete().where(
+            SimpleDateTimeField.name == first_failure_key
+        ).execute()
+        return
+    # Failure path. Only set first-failure if there isn't one already —
+    # a streak in progress keeps its original start time, growing the
+    # window each tick until it crosses the threshold.
+    if get_last_date(first_failure_key) is None:
+        SimpleDateTimeField.replace(name=first_failure_key, date=now).execute()
+
+
+def _ln_failure_streak_exceeds(
+    first_failure_key: str, threshold_days: Optional[int],
+) -> bool:
+    """Shared staleness predicate. Returns True iff the current failing
+    streak (most-recent unbroken sequence of failed LN attempts) has
+    been going on for more than `threshold_days`.
+
+    Returns False when:
+      - threshold is None (operator disabled the fallback)
+      - first_failure_key is unset (no current failing streak — either
+        the rail's never been used, or the most-recent attempt
+        succeeded and cleared the marker)
+
+    Returns False even on the same day as the first failure — only
+    a streak STRICTLY longer than threshold_days counts as stale.
+    """
+    if threshold_days is None:
         return False
-    days = days_since_last_successful_ln_fee_payment()
-    return days is not None and days > FEE_SWITCH_TO_ONCHAIN_AFTER_X_DAYS
+    first_failure = get_last_date(first_failure_key)
+    if first_failure is None:
+        return False
+    streak_days = (datetime.datetime.now() - first_failure).days
+    return streak_days > threshold_days
+
+
+def _ln_known_stale_for_fee_payment() -> bool:
+    """True only when the dev-fee LN rail has been failing for longer
+    than FEE_SWITCH_TO_ONCHAIN_AFTER_X_DAYS. Used by the post-LN-
+    failure fallback decision — distinct from
+    `should_prefer_onchain_fee_payment` because it ignores the
+    `FORCE_FEE_ONCHAIN_INSTEAD_OF_LN` knob (the caller already
+    short-circuited that path).
+
+    Streak length is the gap between FIRST_LN_FEE_FAILURE_SINCE_SUCCESS
+    and now — not "days since last success", which would mis-count
+    quiet periods (no fees due → no attempts → no failures) as failures.
+    """
+    return _ln_failure_streak_exceeds(
+        "FIRST_LN_FEE_FAILURE_SINCE_SUCCESS",
+        FEE_SWITCH_TO_ONCHAIN_AFTER_X_DAYS,
+    )
 
 
 def _ln_known_stale_for_referral_payment() -> bool:
-    """Referral counterpart to _ln_known_stale_for_fee_payment."""
-    if REFERRAL_SWITCH_TO_ONCHAIN_AFTER_X_DAYS is None:
-        return False
-    days = days_since_last_successful_ln_referral_payment()
-    return days is not None and days > REFERRAL_SWITCH_TO_ONCHAIN_AFTER_X_DAYS
+    """Referral counterpart to _ln_known_stale_for_fee_payment.
+    Same failure-streak semantics — see that function's docstring."""
+    return _ln_failure_streak_exceeds(
+        "FIRST_LN_REFERRAL_FAILURE_SINCE_SUCCESS",
+        REFERRAL_SWITCH_TO_ONCHAIN_AFTER_X_DAYS,
+    )
 
 
 def _ln_known_stale_for_cashout() -> bool:
-    """Cashout counterpart."""
-    if CASHOUT_SWITCH_TO_ONCHAIN_AFTER_X_DAYS is None:
-        return False
-    days = days_since_last_successful_ln_cashout()
-    return days is not None and days > CASHOUT_SWITCH_TO_ONCHAIN_AFTER_X_DAYS
+    """Cashout counterpart. Same failure-streak semantics —
+    see _ln_known_stale_for_fee_payment's docstring."""
+    return _ln_failure_streak_exceeds(
+        "FIRST_LN_CASHOUT_FAILURE_SINCE_SUCCESS",
+        CASHOUT_SWITCH_TO_ONCHAIN_AFTER_X_DAYS,
+    )
 
 
 def should_prefer_onchain_cashout() -> bool:
@@ -3088,10 +3375,19 @@ def should_prefer_onchain_cashout() -> bool:
         is configured, and the last successful LN cashout is older than
         that threshold.
 
+    Returns False unconditionally when PREFER_LN_CASHOUT is set —
+    that flag is the explicit opposite of on-chain preference and
+    overrides both PREFER_CASHOUT_ONCHAIN and the staleness fallback
+    (under PREFER_LN_CASHOUT, on-chain excess goes into new channels
+    rather than the on-chain cashout rail, so the staleness fallback
+    has nothing useful to do).
+
     Note that `None` from `days_since_last_successful_ln_cashout()` (no
     LN cashout ever recorded) deliberately does NOT trigger the
     fallback — a brand-new install hasn't had a chance to try LN yet.
     """
+    if PREFER_LN_CASHOUT:
+        return False
     if PREFER_CASHOUT_ONCHAIN:
         return True
     if (ENABLE_CASHOUT_ONCHAIN
@@ -3138,8 +3434,11 @@ async def do_onchain_cashouts(api:BitcartAPI,
         wallet=full_wallet, api=api,
     )
     if transaction_result:
-        log_event("Onchain cashout sent: %d sats from wallet %s to %s",
-                  cashout_amount_avail_onchain, wallet_id, CASHOUT_ONCHAIN)
+        log_event(
+            "Onchain cashout sent: %s from wallet …%s to %s",
+            fmt_btc_sats(cashout_amount_avail_onchain),
+            wallet_short(wallet_id), CASHOUT_ONCHAIN,
+        )
         SimpleDateTimeField.replace(
             name="LAST_SUCCESSFUL_ONCHAIN_CASHOUT_PAYMENT",
             date=datetime.datetime.now(),
@@ -3168,9 +3467,12 @@ async def drain_ln_to_onchain(
     LND-only (loop is LND-only). Electrum wallets short-circuit so the
     caller can treat the function uniformly.
 
-    Reserve: leaves MIN_INBOUND_LIQUIDITY_PER_CHANNEL × channel_count
-    behind, so we keep at least some inbound liquidity. Without this,
-    repeated draining would close us out of receiving capacity.
+    Reserve: leaves MIN_INBOUND_LIQUIDITY_PER_CHANNEL × the count of
+    EXTERNAL (non-OWN_LIGHTNING_NODES) channels behind, so we keep at
+    least some routable inbound liquidity. OWN-node channels are
+    excluded from both the local-balance sum and the reserve term —
+    their funds aren't drained because they're already at the
+    operator's preferred destination.
 
     Returns True iff a swap was successfully initiated (the swap itself
     is still in flight on return; this only confirms the server accepted
@@ -3203,17 +3505,38 @@ async def drain_ln_to_onchain(
     if not channels:
         return False
 
-    total_local = sum(int(c.get("local_balance") or 0) for c in channels)
-    reserve = MIN_INBOUND_LIQUIDITY_PER_CHANNEL * len(channels)
+    # Exclude channels to OWN_LIGHTNING_NODES from the drain math.
+    # Their local balance is intentionally there (cashout destination
+    # for the OWN-node path) — draining it to on-chain would defeat
+    # the purpose of opening the channel in the first place.
+    own_pubkeys = own_node_pubkeys()
+    external_channels = [
+        c for c in channels
+        if (c.get("remote_pubkey") or "").lower() not in own_pubkeys
+    ]
+    excluded_own_count = len(channels) - len(external_channels)
+
+    if not external_channels:
+        log_decision(
+            ("ln_drain_excess", wallet_id), 0,
+            "LN drain on wallet …%s: every active channel is to an "
+            "OWN_LIGHTNING_NODES peer (%d total); no external balance "
+            "to drain.",
+            wallet_short(wallet_id), excluded_own_count,
+        )
+        return False
+
+    total_local = sum(int(c.get("local_balance") or 0) for c in external_channels)
+    reserve = MIN_INBOUND_LIQUIDITY_PER_CHANNEL * len(external_channels)
     excess = total_local - reserve
 
     log_decision(
         ("ln_drain_excess", wallet_id),
         excess,
-        "LN drain math for wallet %s: total_local=%d - reserve=%d "
-        "(%d channels × %d) = excess=%d sat",
-        wallet_id, total_local, reserve, len(channels),
-        MIN_INBOUND_LIQUIDITY_PER_CHANNEL, excess,
+        "LN drain math for wallet %s: external_local=%d - reserve=%d "
+        "(%d ext channels × %d, %d OWN channels excluded) = excess=%d sat",
+        wallet_id, total_local, reserve, len(external_channels),
+        MIN_INBOUND_LIQUIDITY_PER_CHANNEL, excluded_own_count, excess,
     )
 
     if excess < LN_DRAIN_MIN_SWAP_SAT:
@@ -3221,8 +3544,9 @@ async def drain_ln_to_onchain(
 
     amount = min(excess, LN_DRAIN_MAX_PER_TICK_SAT)
     log_event(
-        "LN drain: initiating loop-out of %d sat (excess=%d) from wallet %s -> %s",
-        amount, excess, wallet_id, dest_addr,
+        "LN drain: initiating loop-out of %s (excess=%s) from wallet …%s -> %s",
+        fmt_btc_sats(amount), fmt_btc_sats(excess),
+        wallet_short(wallet_id), dest_addr,
     )
     try:
         result = await initiate_lightning_to_onchain_swap(
@@ -3238,7 +3562,8 @@ async def drain_ln_to_onchain(
     if result is None:
         return False
     log_event(
-        "LN drain accepted by provider: swap_id=%s, htlc_address=%s",
+        "LN drain accepted by provider: %s from wallet …%s, swap_id=%s, htlc_address=%s",
+        fmt_btc_sats(amount), wallet_short(wallet_id),
         result.swap_id[:16] + "...", result.htlc_address,
     )
     return True
@@ -3289,6 +3614,7 @@ async def do_ln_cashouts(api:BitcartAPI,
     )
 
     actual_cashout_amount = cashout_amount_avail_ln
+    succeeded = False
     while actual_cashout_amount >= MIN_LN_CASHOUT_IN_SATS:
         SimpleDateTimeField.replace(
             name="LAST_LN_CASHOUT_ATTEMPT",
@@ -3302,24 +3628,171 @@ async def do_ln_cashouts(api:BitcartAPI,
             )
             if not invoice:
                 logger.error('Error turning LNURL to invoice, not making cashout')
-                return False
+                break
         ln_transaction_result = await electrum_pay_ln_invoice(
             invoice, label=CASHOUT_REASON,
             wallet=full_wallet, api=api,
         )
         if ln_transaction_result:
             log_event(
-                "LN cashout sent: %d sats from wallet %s to %s",
-                actual_cashout_amount, wallet_id, CASHOUT_LIGHTNING_ADDRESS,
+                "LN cashout sent: %s from wallet …%s to %s",
+                fmt_btc_sats(actual_cashout_amount),
+                wallet_short(wallet_id), CASHOUT_LIGHTNING_ADDRESS,
             )
             SimpleDateTimeField.replace(
                 name="LAST_SUCCESSFUL_LN_CASHOUT_PAYMENT",
                 date=datetime.datetime.now(),
             ).execute()
-            return True
+            succeeded = True
+            break
         actual_cashout_amount = int(actual_cashout_amount / 2)
-    return False
+    # Failing-streak markers. Drives _ln_known_stale_for_cashout() —
+    # any path through this function that actually ATTEMPTED the LN
+    # cashout counts as a streak event (success clears, failure sets
+    # the streak start once). The early-returns above (no destination,
+    # amount below floor, DRY_RUN) bail without reaching here so they
+    # don't pollute the streak.
+    _record_ln_payment_attempt_outcome(
+        success_key="LAST_SUCCESSFUL_LN_CASHOUT_PAYMENT",
+        first_failure_key="FIRST_LN_CASHOUT_FAILURE_SINCE_SUCCESS",
+        succeeded=succeeded,
+    )
+    return succeeded
 
+
+async def _do_keysend_cashouts_to_own_nodes(
+    api: BitcartAPI, wallet_id: str,
+    own_channels: List[Dict[str, Any]],
+) -> bool:
+    """Keysend each OWN-peer channel's local balance back to that peer.
+
+    Called from `do_cashouts` for channels whose remote_pubkey is in
+    OWN_LIGHTNING_NODES. Acts as the LN-leg cashout for those channels:
+    instead of summing local balance and routing through the public
+    graph to CASHOUT_LIGHTNING_ADDRESS, we send a single-hop keysend
+    over each channel directly to the peer (zero LN routing fees).
+
+    Per-channel logic:
+      - payable = local_balance - local_chan_reserve_sat - 100 (commit fee buffer)
+      - skip if payable < MIN_LN_CASHOUT_IN_SATS (would lose to dust)
+      - keysend via _lnd_keysend with outgoing_chan_id forced to this
+        channel's chan_id, label=`CASHOUT_REASON:<peer_pubkey>` so the
+        dashboard surfaces it as a cashout with the peer in the
+        destination column
+
+    Note: FORCE_CASHOUT_AMOUNT_LN is intentionally not honored here.
+    That knob applies to the external-cashout test path only — a
+    forced amount that doesn't fit one of these channels would just
+    fail and add noise.
+
+    Returns True if ANY channel's keysend succeeded — the caller treats
+    that as "LN cashout this tick was not a no-op" for the recency-
+    fallback / stranded-funds logic. Each successful keysend updates
+    LAST_SUCCESSFUL_LN_CASHOUT_PAYMENT (via _record_ln_payment_attempt_
+    outcome), so the on-chain staleness fallback clock resets the same
+    way a normal LN cashout does.
+
+    No external destination — the LN-address invoice path still runs
+    separately for channels whose remote_pubkey isn't in OWN_LIGHTNING_NODES.
+    """
+    if not own_channels:
+        return False
+    any_ok = False
+    for ch in own_channels:
+        peer_pubkey = (ch.get("remote_pubkey") or "").lower()
+        chan_id_raw = ch.get("chan_id") or ch.get("channel_id")
+        if not peer_pubkey or not chan_id_raw:
+            logger.warning(
+                "_do_keysend_cashouts_to_own_nodes: channel on wallet "
+                "…%s missing remote_pubkey or chan_id; skipping.",
+                wallet_short(wallet_id),
+            )
+            continue
+        try:
+            chan_id = int(chan_id_raw)
+        except (TypeError, ValueError):
+            logger.warning(
+                "_do_keysend_cashouts_to_own_nodes: chan_id=%r is not "
+                "an int; skipping.", chan_id_raw,
+            )
+            continue
+        local_balance = int(ch.get("local_balance") or 0)
+        # local_chan_reserve_sat is per-channel, set by the protocol /
+        # peer policy at open time. Subtract it (and a small commit-fee
+        # cushion) to get what's actually payable.
+        reserve = int(ch.get("local_chan_reserve_sat") or 0)
+        payable = max(0, local_balance - reserve - 100)
+        if payable < MIN_LN_CASHOUT_IN_SATS:
+            log_decision(
+                ("own_keysend_below_min", wallet_id, peer_pubkey),
+                True,
+                "OWN-node keysend (wallet …%s, peer %s): payable=%s "
+                "< MIN_LN_CASHOUT_IN_SATS=%d. Skipping until balance "
+                "accumulates.",
+                wallet_short(wallet_id), peer_pubkey,
+                fmt_btc_sats(payable), MIN_LN_CASHOUT_IN_SATS,
+            )
+            continue
+        log_decision(
+            ("own_keysend_below_min", wallet_id, peer_pubkey),
+            False,
+            "OWN-node keysend (wallet …%s, peer %s): payable=%s "
+            "above threshold; attempting keysend.",
+            wallet_short(wallet_id), peer_pubkey, fmt_btc_sats(payable),
+        )
+        if DRY_RUN_FUNDS:
+            logger.info(
+                f"DRY RUN: would keysend {payable} sat from wallet "
+                f"…{wallet_short(wallet_id)} to peer {peer_pubkey[:16]}… "
+                f"via chan_id={chan_id}"
+            )
+            continue
+        SimpleDateTimeField.replace(
+            name="LAST_LN_CASHOUT_ATTEMPT",
+            date=datetime.datetime.now(),
+        ).execute()
+        try:
+            ok = await _lnd_keysend(
+                api, wallet_id,
+                dest_pubkey=peer_pubkey,
+                amount_sat=payable,
+                outgoing_chan_id=chan_id,
+                label=f"{CASHOUT_REASON}:{peer_pubkey}",
+            )
+        except Exception as e:
+            logger.error(
+                f"_do_keysend_cashouts_to_own_nodes: keysend to "
+                f"{peer_pubkey[:16]}… raised: {e} {traceback.print_exc()}"
+            )
+            ok = False
+        log_decision(
+            ("own_keysend_attempt", wallet_id, peer_pubkey),
+            "success" if ok else "failed",
+            "OWN-node keysend (wallet …%s, peer %s, %s): %s",
+            wallet_short(wallet_id), peer_pubkey,
+            fmt_btc_sats(payable),
+            "succeeded" if ok else "failed — will retry next tick",
+        )
+        # Update the cashout-side failing-streak markers per attempt.
+        # Success clears the streak; failure (peer offline / route
+        # not found) sets the streak start once and grows it on
+        # subsequent ticks — matches the dev-fee / external-cashout
+        # semantics, so _ln_known_stale_for_cashout sees consistent
+        # data regardless of which sub-leg is exercising it.
+        _record_ln_payment_attempt_outcome(
+            success_key="LAST_SUCCESSFUL_LN_CASHOUT_PAYMENT",
+            first_failure_key="FIRST_LN_CASHOUT_FAILURE_SINCE_SUCCESS",
+            succeeded=bool(ok),
+        )
+        if ok:
+            log_event(
+                "LN cashout (keysend to own node) sent: %s from wallet "
+                "…%s to peer %s via direct channel chan_id=%d",
+                fmt_btc_sats(payable),
+                wallet_short(wallet_id), peer_pubkey, chan_id,
+            )
+            any_ok = True
+    return any_ok
 
 
 async def notused_do_onchain_cashouts(
@@ -3329,7 +3802,7 @@ async def notused_do_onchain_cashouts(
         return
     if not ENABLE_CASHOUT_ONCHAIN:
         logger.warning(
-            f"Skipping actual onchain cashout due to ENABLE_CASHOUT_ONCHAIN. Would have sent {cashout_amount_avail_onchain} from {wallet_id} to {ONCHAIN_FEE_DEST}"
+            f"Skipping actual onchain cashout due to ENABLE_CASHOUT_ONCHAIN. Would have sent {cashout_amount_avail_onchain} from {wallet_id} to {CASHOUT_ONCHAIN}"
         )
         return
     if cashout_amount_avail_onchain < MIN_ONCHAIN_CASHOUT:
@@ -3362,13 +3835,54 @@ async def notused_do_onchain_cashouts(
 
 
 async def do_cashouts(api: BitcartAPI) -> Optional[bool]:
-    """
-    Make appropriate LN cashouts, return False/None if some kind of error
+    """Drive every cashout decision for every store/wallet on this tick.
+
+    Two independent legs per wallet:
+
+    LN leg (depending on PREFER_CASHOUT_ONCHAIN / PREFER_LN_CASHOUT):
+      - Splits active channels into OWN_LIGHTNING_NODES peers vs.
+        external peers.
+      - OWN-node sub-leg: per-channel keysend back to the peer via the
+        direct channel (zero LN routing fees). No LSP-shortfall
+        holdback. Bumps LAST_SUCCESSFUL_LN_CASHOUT_PAYMENT.
+      - External sub-leg: sums external local_balance, applies the
+        LSP-shortfall holdback (so we keep enough LN balance to cover
+        future LSP-channel purchases if on-chain is short), then
+        invoice-cashes to CASHOUT_LIGHTNING_ADDRESS via do_ln_cashouts.
+      - On failure + staleness: triggers drain_ln_to_onchain (loop-out
+        of external balance only) and surfaces a stranded-funds
+        WARNING.
+
+    On-chain leg (per PREFER_LN_CASHOUT):
+      - PREFER_LN_CASHOUT=True: _attempt_ln_channel_open_for_cashout —
+        first tries OWN_LIGHTNING_NODES direct-channel push_sat, then
+        falls back to a random-peer manual-mode channel-open.
+      - default: _attempt_onchain_cashout sweeps on-chain excess to
+        CASHOUT_ONCHAIN.
+
+    Returns True on a complete tick (one or both legs ran), False on
+    exception, None when all cashout paths are gated off.
     """
     logger.info("Calculating cashouts...")
-    if not ENABLE_CASHOUT_ONCHAIN and not ENABLE_CASHOUT_LN:
+    if (not ENABLE_CASHOUT_ONCHAIN
+            and not ENABLE_CASHOUT_LN
+            and not PREFER_LN_CASHOUT):
+        # PREFER_LN_CASHOUT redirects on-chain excess into channel
+        # opens rather than the on-chain cashout rail, so it needs the
+        # tick loop to run even when both ENABLE_CASHOUT_* are off.
         logger.info("SKIPPING CASHOUTS DUE TO ENABLE_CASHOUT_*")
         return None
+    log_decision(
+        ("prefer_ln_overrides_prefer_onchain",),
+        bool(PREFER_LN_CASHOUT and PREFER_CASHOUT_ONCHAIN),
+        "Both PREFER_LN_CASHOUT and PREFER_CASHOUT_ONCHAIN are True. "
+        "PREFER_LN_CASHOUT wins: on-chain excess will be used to open "
+        "new channels, LN balance will continue to cash out to "
+        "CASHOUT_LIGHTNING_ADDRESS, and the LN-drain-to-on-chain "
+        "loop-out is suppressed. Unset one of the two to remove this "
+        "warning.",
+        level=logging.WARNING,
+    )
 
     store_list=await api.get_stores()
     used_wallets=set()
@@ -3385,26 +3899,64 @@ async def do_cashouts(api: BitcartAPI) -> Optional[bool]:
         # auto-refreshes LAST_SUCCESSFUL_LN_CASHOUT_PAYMENT; LN failure
         # paired with staleness triggers the drain helper to move LN
         # funds out via loop-out (when LOOP_OUT_ENABLED).
+        #
+        # PREFER_LN_CASHOUT keeps the LN balance leg running even when
+        # PREFER_CASHOUT_ONCHAIN is also set — the two settings are
+        # opposites and PREFER_LN_CASHOUT wins.
         ln_ok = False
         ln_attempted = False
-        if not PREFER_CASHOUT_ONCHAIN:
-            available_ln = 0
-            for channel in await api.get_wallet_ln_channels(
+        if not ENABLE_CASHOUT_LN:
+            log_decision(
+                ("ln_cashout_disabled", wallet_id), True,
+                "LN cashout skipped for wallet %s: ENABLE_CASHOUT_LN=False",
+                wallet_id,
+            )
+        elif PREFER_LN_CASHOUT or not PREFER_CASHOUT_ONCHAIN:
+            # Split active channels by peer identity: OWN-node channels
+            # get keysent back to the peer directly (zero LN routing
+            # fees); external channels get the existing LN-address
+            # invoice cashout with LSP-shortfall holdback applied.
+            own_pubkeys = own_node_pubkeys()
+            all_channels = await api.get_wallet_ln_channels(
                 wallet_id, active_only=True, online_only=True,
-            ):
-                available_ln += int(channel['local_balance'])
+            )
+            own_channels: List[Dict[str, Any]] = []
+            external_channels: List[Dict[str, Any]] = []
+            for ch in (all_channels or []):
+                if (ch.get("remote_pubkey") or "").lower() in own_pubkeys:
+                    own_channels.append(ch)
+                else:
+                    external_channels.append(ch)
+
+            # --- OWN-node keysend leg ---
+            # No LSP-shortfall holdback applied here: keysent funds
+            # leave the wallet's domain entirely (they go to the
+            # operator's other node), so holding them back wouldn't
+            # change reserve availability.
+            own_ok = False
+            if own_channels:
+                try:
+                    own_ok = await _do_keysend_cashouts_to_own_nodes(
+                        api, wallet_id, own_channels,
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"_do_keysend_cashouts_to_own_nodes raised for "
+                        f"wallet {wallet_id}: {e} {traceback.print_exc()}"
+                    )
+
+            # --- External LN-address invoice leg ---
+            available_ln = sum(
+                int(ch.get("local_balance") or 0) for ch in external_channels
+            )
             if FORCE_CASHOUT_AMOUNT_LN:
                 # Operator override: send exactly this amount, no LSP
                 # shortfall reservation.
                 available_ln = FORCE_CASHOUT_AMOUNT_LN
             else:
                 # Hold back enough LN balance to cover the on-chain
-                # shortfall vs the LSP-purchase reserve floor. If on
-                # chain is already healthy, shortfall is 0 and the
-                # full LN balance is eligible for cashout. The held-
-                # back amount stays in the channel; if the operator
-                # later needs on-chain funds to buy an LSP channel,
-                # closing a channel returns the local balance on-chain.
+                # shortfall vs the LSP-purchase reserve floor. Applies
+                # to external balance only (see OWN-node leg comment).
                 wallet_onchain_sat = btc_to_sats(
                     float(best_wallet.get("balance") or 0)
                 )
@@ -3414,113 +3966,124 @@ async def do_cashouts(api: BitcartAPI) -> Optional[bool]:
                     held_back = min(lsp_shortfall, available_ln)
                     log_decision(
                         ("ln_cashout_holdback", wallet_id), held_back,
-                        "LN cashout (wallet %s): holding back %d sat for "
-                        "LSP shortfall (on-chain %d < reserve floor %d)",
-                        wallet_id, held_back, wallet_onchain_sat, reserve_floor,
+                        "LN cashout (wallet …%s): holding back %s for "
+                        "LSP shortfall (on-chain %s < reserve floor %s)",
+                        wallet_short(wallet_id),
+                        fmt_btc_sats(held_back),
+                        fmt_btc_sats(wallet_onchain_sat),
+                        fmt_btc_sats(reserve_floor),
                     )
                     available_ln = max(0, available_ln - lsp_shortfall)
                 else:
                     # Healthy on-chain — clear any prior holdback state.
                     log_decision(
                         ("ln_cashout_holdback", wallet_id), 0,
-                        "LN cashout (wallet %s): no LSP shortfall; "
-                        "full LN balance eligible for cashout", wallet_id,
+                        "LN cashout (wallet …%s): no LSP shortfall; "
+                        "full LN balance eligible for cashout",
+                        wallet_short(wallet_id),
                     )
             if available_ln < 0:
                 logger.warning(
                     f"Reported negative LN cashout due for wallet {wallet_id}"
                 )
-            elif available_ln > 0:
+            external_ok = False
+            if available_ln > 0:
                 ln_attempted = True
                 log_decision(
                     ("cashout_rail_ln", wallet_id), "ln_try",
-                    "Cashout LN leg (wallet %s): trying", wallet_id,
+                    "Cashout LN leg (wallet %s): trying external "
+                    "LN-address cashout for %s",
+                    wallet_id, fmt_btc_sats(available_ln),
                 )
                 try:
-                    ln_ok = await do_ln_cashouts(api, wallet_id, available_ln)
+                    external_ok = await do_ln_cashouts(api, wallet_id, available_ln)
                 except Exception as e:
                     logger.error(
                         f'Exception in do_ln_cashouts: {e} {traceback.print_exc()}'
                     )
-                    ln_ok = False
-                if ln_ok:
+                    external_ok = False
+            elif own_channels:
+                # We had OWN channels but no external balance to
+                # cash out — keysends already ran above; that's a
+                # successful tick if any of them landed.
+                ln_attempted = ln_attempted or bool(own_channels)
+            ln_ok = own_ok or external_ok
+            if ln_ok:
+                log_decision(
+                    ("cashout_rail_ln", wallet_id), "ln_success",
+                    "Cashout LN leg (wallet %s): succeeded", wallet_id,
+                )
+                # Clear any prior "funds stranded" warning — LN
+                # works again. Logs an INFO transition exactly once,
+                # when stranded state flips back to False.
+                log_decision(
+                    ("ln_funds_stranded", wallet_id), False,
+                    "Wallet %s: LN cashouts recovered; funds no "
+                    "longer stranded in channels.", wallet_id,
+                )
+            elif ln_attempted and _ln_known_stale_for_cashout():
+                # Persistent LN failure on EXTERNAL channels — drain
+                # stranded channel funds via loop-out (loop-out
+                # already excludes OWN channels from the drain math,
+                # so this is safe).
+                log_decision(
+                    ("cashout_rail_ln", wallet_id), "ln_stale_fallback",
+                    "Cashout LN leg (wallet %s): failed and stale; "
+                    "running drain helper", wallet_id,
+                )
+                await _drain_ln_for_cashout_if_enabled(
+                    api, wallet_id, best_wallet,
+                )
+                # The drain helper is a silent no-op when
+                # LOOP_OUT_ENABLED is off or CASHOUT_ONCHAIN is
+                # unset. In that case the operator's external LN
+                # funds are genuinely stuck — surface this loudly
+                # exactly once per state transition.
+                drain_will_run = bool(LOOP_OUT_ENABLED and CASHOUT_ONCHAIN)
+                stranded = available_ln > 0 and not drain_will_run
+                if stranded:
+                    days_stale = days_since_last_successful_ln_cashout()
                     log_decision(
-                        ("cashout_rail_ln", wallet_id), "ln_success",
-                        "Cashout LN leg (wallet %s): succeeded", wallet_id,
+                        ("ln_funds_stranded", wallet_id), True,
+                        "STRANDED LN FUNDS: wallet %s has %d sat in "
+                        "external channels but LN cashouts have been "
+                        "failing for %s days. Automatic recovery is "
+                        "OFF (LOOP_OUT_ENABLED=%s, CASHOUT_ONCHAIN=%s). "
+                        "To recover, do ONE of: "
+                        "(a) set LOOP_OUT_ENABLED=True AND set "
+                        "CASHOUT_ONCHAIN to a Bitcoin address; "
+                        "(b) close the channel cooperatively or by "
+                        "force-close; "
+                        "(c) manually pay an outbound LN invoice "
+                        "to drain the channel into something you "
+                        "control.",
+                        wallet_id, available_ln, days_stale,
+                        "True" if LOOP_OUT_ENABLED else "False",
+                        "set" if CASHOUT_ONCHAIN else "unset",
+                        level=logging.WARNING,
                     )
-                    # Clear any prior "funds stranded" warning — LN
-                    # works again. Logs an INFO transition exactly once,
-                    # when stranded state flips back to False.
+                else:
+                    # Either drain is wired up and will run, or
+                    # there's nothing to strand. Clear any prior
+                    # warning so the operator sees the recovery.
                     log_decision(
                         ("ln_funds_stranded", wallet_id), False,
-                        "Wallet %s: LN cashouts recovered; funds no "
-                        "longer stranded in channels.", wallet_id,
+                        "Wallet %s: LN drain pathway is configured "
+                        "or no LN balance to strand.", wallet_id,
                     )
-                elif _ln_known_stale_for_cashout():
-                    # Persistent LN failure — drain stranded channel
-                    # funds out via loop-out so they don't accumulate.
-                    log_decision(
-                        ("cashout_rail_ln", wallet_id), "ln_stale_fallback",
-                        "Cashout LN leg (wallet %s): failed and stale; "
-                        "running drain helper", wallet_id,
-                    )
-                    await _drain_ln_for_cashout_if_enabled(
-                        api, wallet_id, best_wallet,
-                    )
-                    # The drain helper is a silent no-op when
-                    # LOOP_OUT_ENABLED is off or CASHOUT_ONCHAIN is
-                    # unset. In that case the operator's LN funds are
-                    # genuinely stuck — the script can't recover them
-                    # without external action. Surface this loudly
-                    # exactly once per state transition so it lands in
-                    # decisions.log, the console, and the plugin Logs
-                    # tab without spamming every tick.
-                    drain_will_run = bool(LOOP_OUT_ENABLED and CASHOUT_ONCHAIN)
-                    stranded = available_ln > 0 and not drain_will_run
-                    if stranded:
-                        days_stale = days_since_last_successful_ln_cashout()
-                        log_decision(
-                            ("ln_funds_stranded", wallet_id), True,
-                            "STRANDED LN FUNDS: wallet %s has %d sat in "
-                            "channels but LN cashouts have been failing "
-                            "for %s days. Automatic recovery is OFF "
-                            "(LOOP_OUT_ENABLED=%s, CASHOUT_ONCHAIN=%s). "
-                            "To recover, do ONE of: "
-                            "(a) set LOOP_OUT_ENABLED=True AND set "
-                            "CASHOUT_ONCHAIN to a Bitcoin address (a "
-                            "running loopd is required for each LND "
-                            "wallet); "
-                            "(b) close the channel cooperatively or by "
-                            "force-close — the local balance returns "
-                            "on-chain after the timelock and the next "
-                            "tick's on-chain cashout will sweep it; "
-                            "(c) manually pay an outbound LN invoice "
-                            "to drain the channel into something you "
-                            "control.",
-                            wallet_id, available_ln, days_stale,
-                            "True" if LOOP_OUT_ENABLED else "False",
-                            "set" if CASHOUT_ONCHAIN else "unset",
-                            level=logging.WARNING,
-                        )
-                    else:
-                        # Either drain is wired up and will run, or
-                        # there's nothing to strand. Clear any prior
-                        # warning so the operator sees the recovery.
-                        log_decision(
-                            ("ln_funds_stranded", wallet_id), False,
-                            "Wallet %s: LN drain pathway is configured "
-                            "or no LN balance to strand.", wallet_id,
-                        )
-                else:
-                    log_decision(
-                        ("cashout_rail_ln", wallet_id), "ln_retry_next_tick",
-                        "Cashout LN leg (wallet %s): failed but not yet "
-                        "stale; will retry LN next tick", wallet_id,
-                    )
+            elif ln_attempted:
+                log_decision(
+                    ("cashout_rail_ln", wallet_id), "ln_retry_next_tick",
+                    "Cashout LN leg (wallet %s): failed but not yet "
+                    "stale; will retry LN next tick", wallet_id,
+                )
 
-        if PREFER_CASHOUT_ONCHAIN:
+        if PREFER_CASHOUT_ONCHAIN and not PREFER_LN_CASHOUT:
             # When the operator has chosen on-chain mode, drain LN
             # balance too (the funds would otherwise be stranded).
+            # Suppressed under PREFER_LN_CASHOUT — the LN balance is
+            # exactly what that mode wants to keep, and the LN leg
+            # above is already cashing it out to CASHOUT_LIGHTNING_ADDRESS.
             log_decision(
                 ("cashout_rail_ln", wallet_id), "ln_skipped_forced",
                 "Cashout LN leg (wallet %s): skipped "
@@ -3531,13 +4094,25 @@ async def do_cashouts(api: BitcartAPI) -> Optional[bool]:
                 api, wallet_id, best_wallet,
             )
 
-        # --- on-chain cashout leg, ALWAYS attempted ---
-        # Independent of the LN leg's outcome. Sweeps any on-chain
-        # revenue (customer payments that came in on-chain) regardless
-        # of LN state. safe_to_spend already accounts for the LSP
-        # price floor via effective_min_reserve_onchain, so we won't
-        # drain below what's needed to buy a fresh LSP channel.
-        await _attempt_onchain_cashout(api, store_id, wallet_id, best_wallet)
+        # --- on-chain cashout leg ---
+        # Two possible destinations for on-chain excess:
+        #   - PREFER_LN_CASHOUT: open a NEW Lightning channel — first
+        #     to an OWN_LIGHTNING_NODES peer (always tried, no
+        #     existing-channel filter; push_sat sends the cashout
+        #     amount straight to the peer in one op), then falling
+        #     back to a random new peer (filtered by existing
+        #     partners) if the direct-channel attempt fails. The
+        #     cashout is delayed until safe_to_spend clears both
+        #     MIN_CHANNEL_SIZE_IN_SATS and the reserve floor.
+        #   - default: sweep on-chain excess to CASHOUT_ONCHAIN.
+        # The LN-leg above runs in either case so LN balance still
+        # cashes out to CASHOUT_LIGHTNING_ADDRESS.
+        if PREFER_LN_CASHOUT:
+            await _attempt_ln_channel_open_for_cashout(
+                api, store_id, wallet_id, best_wallet,
+            )
+        else:
+            await _attempt_onchain_cashout(api, store_id, wallet_id, best_wallet)
     return True
 
 
@@ -3565,14 +4140,25 @@ async def _attempt_onchain_cashout(
     api: BitcartAPI, store_id: str, wallet_id: str, best_wallet: dict,
 ) -> bool:
     """Send the wallet's on-chain excess to CASHOUT_ONCHAIN. Fires every
-    tick (not just on LN fallback) so on-chain customer revenue doesn't
-    pile up while LN cashouts are working. Returns True if a tx was
+    tick that ENABLE_CASHOUT_ONCHAIN is True AND no channel-open /
+    coop-close is pending — so on-chain customer revenue doesn't pile
+    up while LN cashouts are working. Returns True if a tx was
     broadcast.
 
-    Reserve math: safe_to_spend() subtracts MIN_RESERVE_ONCHAIN PLUS the
-    6-month LSP price high-water mark (effective_min_reserve_onchain),
-    so the wallet always has enough headroom to fund a fresh LSP
-    channel order."""
+    Reserve math: safe_to_spend() subtracts the floor from
+    effective_min_reserve_onchain() — the LSP-mode formula
+    (max(MIN_RESERVE_ONCHAIN, 6-month LSP peak), capped at
+    LSP_RESERVE_CAP_SAT) OR the manual-mode formula (target_liquidity +
+    open/close fees + loop-out budget + safety) — so the wallet
+    always has enough headroom for the next channel-acquisition step
+    appropriate to its mode."""
+    if not ENABLE_CASHOUT_ONCHAIN:
+        log_decision(
+            ("onchain_cashout_disabled", wallet_id), True,
+            "On-chain cashout skipped for wallet %s: "
+            "ENABLE_CASHOUT_ONCHAIN=False", wallet_id,
+        )
+        return False
     if await has_pending_channel_activity(wallet=best_wallet, api=api):
         log_decision(
             ("onchain_cashout_blocked_pending", wallet_id),
@@ -3605,71 +4191,352 @@ async def _attempt_onchain_cashout(
         logger.error(f'Exception in do_onchain_cashouts: {e} {traceback.print_exc()}')
         return False
 
+
+async def _attempt_ln_channel_open_for_cashout(
+    api: BitcartAPI, store_id: str, wallet_id: str, best_wallet: dict,
+) -> bool:
+    """PREFER_LN_CASHOUT path: instead of sweeping on-chain excess to
+    CASHOUT_ONCHAIN, use it to open a Lightning channel that pushes the
+    cashout amount to one of our peers.
+
+    Returns True if a channel-open attempt was kicked off. False (and a
+    decision-log entry explaining why) on any pre-check skip — those
+    skips mean "delay the cashout", not "give up": funds keep
+    accumulating until the next tick's checks pass.
+
+    Gates, in order:
+      1. Pending channel activity on this wallet — wait for it to clear.
+      2. LND-only — peer selection / push_sat are LND-specific.
+      3. `safe_to_spend(api, store_id)` is the on-chain budget that
+         would otherwise be cashed out. Two thresholds, both checked
+         independently:
+           a. `< effective_min_reserve_onchain()` — opening would dip
+              below the reserve floor (LSP-replenish cost in LSP mode,
+              full target-liquidity budget in manual mode). Delay.
+           b. `< MIN_CHANNEL_SIZE_IN_SATS` — not enough on hand to open
+              even a minimum-sized channel. Delay.
+         The wallet must clear BOTH gates — effectively
+         `safe_to_spend >= max(reserve_floor, MIN_CHANNEL_SIZE_IN_SATS)`,
+         not their sum.
+
+    Channel open dispatch (after gates clear):
+      - FIRST: `_attempt_direct_channel_cashout_to_own_node` iterates
+        OWN_LIGHTNING_NODES and tries each peer with `push_sat` set so
+        the cashout amount lands on YOUR node in one atomic op (zero LN
+        routing fees, gives you inbound liquidity for free). Always
+        tried, with no existing-channel filter.
+      - FALLBACK (only if the direct-channel attempt returns False):
+        `move_onchain_to_ln(force_manual=True)` opens a channel to a
+        new randomly-picked peer (`pick_best_channel_partners` filtered
+        by `remove_existing_channel_partners`). LN balance from this
+        channel will be cashed out to CASHOUT_LIGHTNING_ADDRESS by a
+        later tick.
+    """
+    if await has_pending_channel_activity(wallet=best_wallet, api=api):
+        log_decision(
+            ("ln_cashout_open_blocked_pending", wallet_id), True,
+            "PREFER_LN_CASHOUT skipped for wallet %s: pending channel "
+            "open or coop close. Will retry next tick.", wallet_id,
+        )
+        return False
+    log_decision(
+        ("ln_cashout_open_blocked_pending", wallet_id), False,
+        "PREFER_LN_CASHOUT: pending-channel guard clear on wallet %s",
+        wallet_id,
+    )
+
+    if best_wallet.get("currency") != "btclnd":
+        log_decision(
+            ("ln_cashout_open_non_lnd", wallet_id), True,
+            "PREFER_LN_CASHOUT skipped for wallet %s: currency=%s, "
+            "not btclnd. Peer selection runs off LND gossip metrics, "
+            "so non-LND wallets can't use this path.",
+            wallet_id, best_wallet.get("currency"),
+        )
+        return False
+
+    safe = await safe_to_spend(api, store_id)
+    reserve_floor = effective_min_reserve_onchain()
+    if safe < reserve_floor:
+        log_decision(
+            ("ln_cashout_open_reserve_gate", wallet_id), "below_reserve_floor",
+            "PREFER_LN_CASHOUT delaying cashout for wallet %s: "
+            "safe_to_spend=%d sat < reserve floor=%d sat. Opening a "
+            "channel now would dip below the reserve floor. Waiting "
+            "for more on-chain revenue to accumulate.",
+            wallet_id, safe, reserve_floor,
+        )
+        return False
+    if safe < MIN_CHANNEL_SIZE_IN_SATS:
+        log_decision(
+            ("ln_cashout_open_reserve_gate", wallet_id), "below_min_channel",
+            "PREFER_LN_CASHOUT delaying cashout for wallet %s: "
+            "safe_to_spend=%d sat < MIN_CHANNEL_SIZE_IN_SATS=%d. "
+            "Waiting for more revenue to accumulate.",
+            wallet_id, safe, MIN_CHANNEL_SIZE_IN_SATS,
+        )
+        return False
+    log_decision(
+        ("ln_cashout_open_reserve_gate", wallet_id), "ok",
+        "PREFER_LN_CASHOUT reserve gate clear on wallet %s: "
+        "safe_to_spend=%d sat (reserve floor=%d, min channel=%d)",
+        wallet_id, safe, reserve_floor, MIN_CHANNEL_SIZE_IN_SATS,
+    )
+
+    max_channel_size = common_functions.sats_to_max_channel_size(safe)
+    if max_channel_size < MIN_CHANNEL_SIZE_IN_SATS:
+        log_decision(
+            ("ln_cashout_open_size_gate", wallet_id), "below_min",
+            "PREFER_LN_CASHOUT delaying cashout for wallet %s: "
+            "max_channel_size=%d < MIN_CHANNEL_SIZE_IN_SATS=%d after "
+            "deducting on-chain open fees from safe_to_spend=%d.",
+            wallet_id, max_channel_size, MIN_CHANNEL_SIZE_IN_SATS, safe,
+        )
+        return False
+
+    log_event(
+        "PREFER_LN_CASHOUT: opening new LN channel from wallet …%s with "
+        "%s of cashout-eligible on-chain funds (safe_to_spend=%s)",
+        wallet_short(wallet_id),
+        fmt_btc_sats(max_channel_size),
+        fmt_btc_sats(safe),
+    )
+
+    # First-try path: open a channel DIRECTLY to one of the operator's
+    # own LN nodes with push_sat, so the cashout amount lands on their
+    # side in one atomic op (no LN routing fees, no invoice round-trip).
+    # Returns True if any OWN_LIGHTNING_NODES entry accepted the channel.
+    # Returns False without side effects on all-fail — we then fall
+    # through to the random-peer path that the engine has always done.
+    try:
+        direct_ok = await _attempt_direct_channel_cashout_to_own_node(
+            api, wallet_id, max_channel_size,
+        )
+    except Exception as e:
+        logger.error(
+            f"Exception in direct-channel cashout attempt for wallet "
+            f"{wallet_id}: {e} {traceback.print_exc()}"
+        )
+        direct_ok = False
+    if direct_ok:
+        return True
+
+    try:
+        return await move_onchain_to_ln(
+            wallet_id=wallet_id,
+            amount_in_btc=sats_to_btc(max_channel_size),
+            api=api,
+            force_manual=True,
+        )
+    except Exception as e:
+        logger.error(
+            f"Exception in PREFER_LN_CASHOUT channel-open for wallet "
+            f"{wallet_id}: {e} {traceback.print_exc()}"
+        )
+        return False
+
+
+async def _attempt_direct_channel_cashout_to_own_node(
+    api: BitcartAPI, wallet_id: str, channel_size_sats: int,
+) -> bool:
+    """Open a channel directly to one of the operator's own LN nodes
+    (OWN_LIGHTNING_NODES) with `push_sat` set so the cashout amount
+    arrives on their side immediately. One atomic on-chain operation,
+    zero LN fees.
+
+    Returns True iff a channel-open succeeded against any configured
+    node. False if OWN_LIGHTNING_NODES is empty, if every entry failed,
+    or if the wallet isn't LND (push_sat is an LND-specific concept;
+    Electrum's open_channel doesn't expose it).
+
+    Each URI is `pubkey@host:port`. We ConnectPeer (idempotent — LND
+    no-ops if already peered), then OpenChannelSync with
+    push_sat = floor(0.98 × channel_size). The 2% remainder covers
+    LND's default channel reserve (1%) + fee bump headroom on our side.
+
+    Side effects on success:
+      - LND broadcasts the funding transaction. We tag it via
+        Lightning.LabelTransaction with `<CASHOUT_DIRECT_CHANNEL_REASON>:
+        <peer_pubkey>` so the dashboard's cashout history surfaces it.
+      - LAST_SUCCESSFUL_LN_CASHOUT_PAYMENT is bumped (so the staleness
+        clock the dashboard + fallback logic care about resets the same
+        way a normal LN cashout would).
+      - log_event with the amount + peer URI so decisions.log records
+        what happened.
+    """
+    if not OWN_LIGHTNING_NODES:
+        log_decision(
+            ("direct_channel_cashout_no_nodes", wallet_id), True,
+            "PREFER_LN_CASHOUT: OWN_LIGHTNING_NODES is empty for "
+            "wallet …%s; skipping direct-channel path, will fall back "
+            "to random-peer.", wallet_short(wallet_id),
+        )
+        return False
+    log_decision(
+        ("direct_channel_cashout_no_nodes", wallet_id), False,
+        "PREFER_LN_CASHOUT: %d OWN_LIGHTNING_NODES configured for "
+        "wallet …%s; attempting direct-channel cashout.",
+        len(OWN_LIGHTNING_NODES), wallet_short(wallet_id),
+    )
+
+    # push_sat is the amount sent to the remote side at funding time.
+    # 0.98 × capacity leaves ~2% on our side for channel reserve
+    # (LND's default reserve is 1% of capacity) plus a small fee
+    # bump cushion. LND will reject the open if push_sat exceeds the
+    # allowed maximum, so a conservative floor avoids surprises.
+    push_sat = int(channel_size_sats * 0.98)
+
+    for uri in OWN_LIGHTNING_NODES:
+        uri = (uri or "").strip()
+        if not uri or "@" not in uri:
+            log_decision(
+                ("direct_channel_cashout_bad_uri",
+                 wallet_id, uri),
+                True,
+                "PREFER_LN_CASHOUT: malformed OWN_LIGHTNING_NODES "
+                "entry %r (expected pubkey@host:port); skipping.", uri,
+            )
+            continue
+        pubkey, _, host_port = uri.partition("@")
+        pubkey = pubkey.lower()
+
+        # Best-effort peer connection. Idempotent: LND.ConnectPeer
+        # returns success when the peer is already connected and an
+        # error otherwise. We log + swallow connect failures because
+        # OpenChannelSync will surface the same problem more concretely.
+        try:
+            await lnd_rpc(api, wallet_id, "ConnectPeer", {
+                "addr": {"pubkey": pubkey, "host": host_port},
+                "perm": False,
+            }, "Lightning")
+        except Exception as e:
+            log_decision(
+                ("direct_channel_cashout_connect", wallet_id, pubkey),
+                "failed",
+                "PREFER_LN_CASHOUT: ConnectPeer %s (wallet …%s) "
+                "failed: %s. Will still attempt OpenChannelSync — peer "
+                "may already be in LND's peer list from a prior run.",
+                uri, wallet_short(wallet_id), e,
+            )
+
+        # OpenChannelSync is the blocking unary RPC variant. Returns a
+        # ChannelPoint with funding_txid_str + output_index when the
+        # funding tx is broadcast; raises otherwise.
+        #
+        # `private` flips on whether the channel is announced to the
+        # public Lightning graph. OWN_LIGHTNING_NODES peers default to
+        # private because their nodes may be mobile / occasionally
+        # offline — announced channels through an offline peer cause
+        # customer payment failures at checkout. The operator can
+        # set OWN_LIGHTNING_NODES_ANNOUNCE_CHANNELS=True to override
+        # if their peer is reliably always online.
+        channel_private = not OWN_LIGHTNING_NODES_ANNOUNCE_CHANNELS
+        try:
+            open_resp = await lnd_rpc(api, wallet_id, "OpenChannelSync", {
+                "node_pubkey_string": pubkey,
+                "local_funding_amount": int(channel_size_sats),
+                "push_sat": push_sat,
+                "private": channel_private,
+            }, "Lightning")
+        except Exception as e:
+            log_decision(
+                ("direct_channel_cashout_open", wallet_id, pubkey),
+                "failed",
+                "PREFER_LN_CASHOUT: OpenChannelSync to %s for wallet "
+                "…%s failed: %s. Trying next OWN_LIGHTNING_NODES entry.",
+                uri, wallet_short(wallet_id), e,
+            )
+            continue
+        log_decision(
+            ("direct_channel_cashout_open", wallet_id, pubkey),
+            "success",
+            "PREFER_LN_CASHOUT: OpenChannelSync to %s for wallet "
+            "…%s succeeded.", uri, wallet_short(wallet_id),
+        )
+
+        funding_txid = (
+            open_resp.get("funding_txid_str")
+            or open_resp.get("funding_txid_bytes")
+            or ""
+        )
+        # Tag the funding tx with the cashout label so the dashboard's
+        # Recent Cashouts table picks it up. The peer pubkey is embedded
+        # in the label so dashboard rendering can show the destination
+        # without a separate lookup.
+        if funding_txid:
+            tx_label = f"{CASHOUT_DIRECT_CHANNEL_REASON}:{pubkey}"
+            try:
+                await lnd_rpc(api, wallet_id, "LabelTransaction", {
+                    "txid": funding_txid,
+                    "label": tx_label,
+                    "overwrite": True,
+                }, "WalletKit")
+            except Exception as e:
+                logger.warning(
+                    f"direct-channel cashout: LabelTransaction "
+                    f"failed for {funding_txid}: {e}. Channel opened "
+                    f"OK; dashboard will show it as a regular "
+                    f"channel-open rather than a cashout."
+                )
+
+        log_event(
+            "PREFER_LN_CASHOUT direct-channel cashout: pushed %s to "
+            "%s (wallet …%s) via new %s channel funding_txid=%s "
+            "(channel_size=%s)",
+            fmt_btc_sats(push_sat), uri,
+            wallet_short(wallet_id),
+            "private (unannounced)" if channel_private else "PUBLIC (announced)",
+            funding_txid or "<unknown>",
+            fmt_btc_sats(channel_size_sats),
+        )
+        SimpleDateTimeField.replace(
+            name="LAST_SUCCESSFUL_LN_CASHOUT_PAYMENT",
+            date=datetime.datetime.now(),
+        ).execute()
+        return True
+
+    log_decision(
+        ("direct_channel_cashout_all_failed", wallet_id), True,
+        "PREFER_LN_CASHOUT: every OWN_LIGHTNING_NODES entry (%d) "
+        "failed for wallet …%s; falling back to random-peer "
+        "channel-open path.",
+        len(OWN_LIGHTNING_NODES), wallet_short(wallet_id),
+    )
+    return False
+
+
 async def topup_goal_amount(api:BitcartAPI,store_id:str)->Optional[int]:
     """How much on-chain balance a store should aim for so it can
     acquire the configured MIN_INBOUND_LIQUIDITY. Returns None on
     failure or zero-goal.
 
-    Branches on MANUAL_CHANNEL_CREATION_ENABLED:
+    Both modes delegate to effective_min_reserve_onchain(), which
+    encodes the mode-specific cost structure:
 
-      Manual mode: caller funds each channel themselves. The goal
-        is the sum of (per-channel size + per-channel on-chain fee
-        reserve). With defaults (100k inbound, 2 channels), this
-        is roughly ~125k sat — channel capital dominates.
+      LSP mode (default): max(MIN_RESERVE_ONCHAIN, recent LSP price
+        high-water), capped at LSP_RESERVE_CAP_SAT. Typical: 10k–50k
+        sat with defaults (MIN_RESERVE_ONCHAIN=10_000,
+        LSP_RESERVE_CAP_SAT=50_000).
 
-      LSP mode (default): caller pays the LSP an invoice (a few
-        percent of channel size) and the LSP funds their side. We
-        only open ONE LSP channel per wallet at a time
-        (see _wallet_has_open_lsp_order — one-LSP-channel-per-wallet
-        invariant), so the topup goal is just the cost of one
-        channel. effective_min_reserve_onchain() already encodes
-        this: it returns max(MIN_RESERVE_ONCHAIN, 6-month recent
-        LSP high-water price) capped at LSP_RESERVE_CAP_SAT.
-        Typical LSP cost: a few thousand sat.
+      Manual mode: target_liquidity + per-channel open/close fees +
+        loop-out fee budget + safety. Encodes the assumption that
+        the operator funds inbound by opening channels and looping
+        the local side back out. Typical: ~106k sat with defaults.
 
-    The previous behavior always computed the manual-mode amount
-    regardless of mode, over-asking by ~40× in the default LSP
-    deployment.
+    The store_id parameter is kept for API compatibility (some
+    callers pass it, some don't); the reserve formula itself is
+    global, not per-store.
     """
-    if not MANUAL_CHANNEL_CREATION_ENABLED:
-        # LSP mode. The goal IS the on-chain reserve floor — the
-        # amount we need to keep on-hand to buy a fresh LSP channel.
-        # If the recent 6-month LSP price is zero (no quotes yet),
-        # we fall back to MIN_RESERVE_ONCHAIN; if quotes have been
-        # high, we track them up to LSP_RESERVE_CAP_SAT. Either way,
-        # the goal is single-channel-cost, NOT multi-channel sized.
-        goal = effective_min_reserve_onchain()
-        if goal <= 0:
-            logger.error(
-                f"topup_goal_amount LSP-mode goal is {goal} sat — "
-                f"effective_min_reserve_onchain() returned non-positive. "
-                f"Check MIN_RESERVE_ONCHAIN / LSP_RESERVE_CAP_SAT config "
-                f"for store {store_id}"
-            )
-            return None
-        return goal
-
-    # Manual mode: caller opens channels themselves; topup must
-    # cover the full channel size plus on-chain fee headroom per
-    # channel. This is the historical calculation.
-    liquidity_result = await store_needs_liquidity(
-        store_id, api, MIN_INBOUND_LIQUIDITY, MIN_CHANNEL_COUNT,
-        assume_zero=True,
-    )
-    if not liquidity_result:
-        logger.error(f'Topup_goal_amount reports zero goal, this should not happen: {store_id}')
+    goal = effective_min_reserve_onchain()
+    if goal <= 0:
+        logger.error(
+            f"topup_goal_amount: effective_min_reserve_onchain() "
+            f"returned non-positive ({goal} sat) for store {store_id}. "
+            f"Check MIN_RESERVE_ONCHAIN / LSP_RESERVE_CAP_SAT (LSP mode) "
+            f"or MIN_INBOUND_LIQUIDITY / MANUAL_* (manual mode) config."
+        )
         return None
-    liquidity_needed = liquidity_result.liquidity_needed_sat
-    channels_needed = liquidity_result.channels_needed
-    needed_channel_liquidity_sizes = common_functions.distribute_sats_over_channels(liquidity_needed, channels_needed)
-    channel_sizes = [common_functions.liquidity_to_channel_size(item) for item in needed_channel_liquidity_sizes]
-    addl_onchain_reserves_needed = sum(
-        [common_functions.onchain_reserves_to_keep_for_channel(item) for item in channel_sizes])
-    final_amount = addl_onchain_reserves_needed + sum(channel_sizes)
-    if final_amount <= 0:
-        logger.error(f'2Topup_goal_amount reports zero goal, this should not happen: {store_id}')
-        return None
-    return final_amount
+    return goal
 async def store_needs_topup(api: BitcartAPI, store_id: str) -> Optional[int]:
     """
     If store needs top-up, returns amount needed (int, sats) for the top-up, None otherwise.
@@ -3695,7 +4562,14 @@ async def calculate_topups(
     api: BitcartAPI
 ) -> Optional[Tuple[Union[str,None],Union[str,None]]]:
     """
-    Create topup invoices for stores that need it. Returns URLs for own,bb topups
+    Create topup invoices for stores that need it. Returns URLs for own,bb topups.
+
+    Suppresses the warning (log + SMTP + invoice creation) when the
+    deficit is within MANUAL_RESERVE_SAFETY_SAT of the reserve floor.
+    This is a hysteresis zone so small fluctuations around the floor
+    don't generate notifications. Action gates elsewhere
+    (liquidity_check, decide_onchain_to_ln) still treat any positive
+    deficit as 'topup needed' and refuse to take new actions.
     """
     list_of_stores=await api.get_stores()
     for store in list_of_stores:
@@ -3703,6 +4577,32 @@ async def calculate_topups(
             store_needs_topup_result = await store_needs_topup(api, store["id"])
             if not store_needs_topup_result:
                 continue
+            # Safety-zone hysteresis: don't emit the warning when the
+            # deficit is smaller than the safety buffer baked into the
+            # reserve floor. Without this, operators would get pinged
+            # every time the wallet drifted a few hundred sats below
+            # the floor — e.g. from an on-chain fee on the last cashout
+            # cycle.
+            if store_needs_topup_result <= MANUAL_RESERVE_SAFETY_SAT:
+                log_decision(
+                    ("topup_warning_in_safety_zone", store["id"]),
+                    True,
+                    "calculate_topups: store %s wallet is below reserve "
+                    "floor by %s — within MANUAL_RESERVE_SAFETY_SAT=%d "
+                    "hysteresis zone, suppressing top-up warning.",
+                    store["id"],
+                    fmt_btc_sats(store_needs_topup_result),
+                    int(MANUAL_RESERVE_SAFETY_SAT),
+                )
+                continue
+            log_decision(
+                ("topup_warning_in_safety_zone", store["id"]),
+                False,
+                "calculate_topups: store %s wallet deficit %s exceeds "
+                "safety zone — emitting top-up warning.",
+                store["id"],
+                fmt_btc_sats(store_needs_topup_result),
+            )
             fetched_wallet = await api.get_best_ln_wallet_for_store(store)
             amount_remaining = store_needs_topup_result+1000 #(add 1000 sats as a buffer)
             found_own_invoice = await api.get_invoice_by_note(note=TOPUP_NAME,require_unlimited=True)
@@ -3780,7 +4680,8 @@ async def safe_to_spend(api:BitcartAPI,store_id:str)->int:
             remote_balance=int(float(channel['remote_balance']))
             channel_sat_list.append(local_balance+remote_balance)
         # Sum the per-channel reserve requirements so we have a single
-        # scalar to compare against MIN_RESERVE_ONCHAIN.
+        # scalar to compare against the floor returned by
+        # effective_min_reserve_onchain().
         per_channel_reserves_total = sum(
             common_functions.onchain_reserves_to_keep_for_channel(item)
             for item in channel_sat_list
@@ -3788,9 +4689,14 @@ async def safe_to_spend(api:BitcartAPI,store_id:str)->int:
     else:
         per_channel_reserves_total = 0
 
-    # effective_min_reserve_onchain() bumps MIN_RESERVE_ONCHAIN up to the
-    # 6-month LSP price peak (capped at LSP_RESERVE_CAP_SAT) so the wallet
-    # always has enough headroom to pay for a new LSP-funded channel.
+    # effective_min_reserve_onchain() is mode-aware:
+    #   LSP mode (default): max(MIN_RESERVE_ONCHAIN, 6-month LSP price
+    #     peak), capped at LSP_RESERVE_CAP_SAT — headroom to pay for a
+    #     new LSP-funded channel.
+    #   Manual mode: target_liquidity + per-channel open/close fees +
+    #     loop-out fee budget + MANUAL_RESERVE_SAFETY_SAT — headroom
+    #     to provision MIN_INBOUND_LIQUIDITY from scratch via
+    #     channel-open + loop-out.
     floor = effective_min_reserve_onchain()
     max_reserve_requirement_found=max(floor, per_channel_reserves_total)
     sats_remaining=max(0,wallet_balance-max_reserve_requirement_found)
@@ -3875,8 +4781,10 @@ async def decide_onchain_to_ln(api:BitcartAPI):
     '''
     Figure out what on-chain funds are safe to spend making channels, make new channels if appropriate
     '''
-    # Channel creation has been delegated to an LSP (e.g. Zeus); the
-    # script no longer opens channels itself. See MANUAL_CHANNEL_CREATION_ENABLED.
+    # In LSP mode (MANUAL_CHANNEL_CREATION_ENABLED=False, the default),
+    # channel creation is delegated to an LSP and this function early-
+    # returns. In manual mode the rest of the function runs and opens
+    # channels itself via move_onchain_to_ln.
     if not MANUAL_CHANNEL_CREATION_ENABLED:
         log_decision(
             "manual_channel_creation_gate",
@@ -4127,8 +5035,11 @@ async def find_loop_out_candidates(api: "BitcartAPI") -> List[Dict[str, Any]]:
     Returns a list of candidate dicts with keys: wallet_id, channel_point,
     remote_pubkey, local_balance_sat, remote_balance_sat.
 
-    Pure read-only. Does NOT start any swap. Production caller currently
-    just logs these (LOOP_OUT_ENABLED gates the actual initiation).
+    Pure read-only. Does NOT start any swap -- find_loop_out_candidates is
+    a detection helper that main() prints to decisions.log. Automated
+    initiation happens via the entirely separate `do_cashouts ->
+    drain_ln_to_onchain -> initiate_lightning_to_onchain_swap` path, gated
+    by LOOP_OUT_ENABLED + LN-cashout staleness OR PREFER_CASHOUT_ONCHAIN.
     """
     candidates: List[Dict[str, Any]] = []
     try:
@@ -4164,8 +5075,8 @@ async def find_loop_out_candidates(api: "BitcartAPI") -> List[Dict[str, Any]]:
 
 
 async def cleanup_old_swap_quotes() -> int:
-    """Delete SwapPriceQuote rows older than 6 months. Returns the number of
-    rows deleted. Called via run_every_x_days from main()."""
+    """Delete SwapPriceQuote rows older than 183 days (~6 months). Returns
+    the number of rows deleted. Called via run_every_x_days from main()."""
     cutoff = datetime.datetime.now() - datetime.timedelta(days=183)
     try:
         n = SwapPriceQuote.delete().where(
@@ -4277,9 +5188,12 @@ def _wallet_has_open_lsp_order(wallet_id: str) -> bool:
 
 
 def _can_quote_lsp_for_wallet(provider_name: str, wallet_id: str) -> bool:
-    """Per-LSP-per-wallet daily throttle. Each LspPriceQuote.fetched_at is
-    the timestamp of a successful create_order; if the latest is within
-    LSP_QUOTE_THROTTLE_HOURS we skip this provider for now."""
+    """Per-LSP-per-wallet daily throttle. Each LspPriceQuote.fetched_at marks
+    the time of a successful create_order RPC for the wallet (including quotes
+    that were ultimately rejected by the cap). If the latest is within
+    LSP_QUOTE_THROTTLE_HOURS we skip this provider; a provider that quotes
+    above cap repeatedly will appear throttled even though its quotes never
+    landed."""
     cutoff = datetime.datetime.now() - datetime.timedelta(
         hours=LSP_QUOTE_THROTTLE_HOURS,
     )
@@ -4292,8 +5206,8 @@ def _can_quote_lsp_for_wallet(provider_name: str, wallet_id: str) -> bool:
 
 def max_lsp_quote_in_last_6_months_sat() -> int:
     """Largest fee_total_sat across ANY LSP for ANY wallet in the last
-    6 months — restricted to quotes that would NOT be rejected by the
-    current LSP_MAX_FEE_PERCENT cap. Used to compute the dynamic
+    183 days (~6 months) — restricted to quotes that would NOT be rejected
+    by the current LSP_MAX_FEE_PERCENT cap. Used to compute the dynamic
     on-chain reserve floor.
 
     Filtering by the cap keeps the reserve floor honest: if our policy
@@ -4315,9 +5229,53 @@ def max_lsp_quote_in_last_6_months_sat() -> int:
 
 
 def effective_min_reserve_onchain() -> int:
-    """The on-chain reserve floor used by safe_to_spend() and related
-    callers. max(static MIN_RESERVE_ONCHAIN, 6-month LSP price peak),
-    capped at LSP_RESERVE_CAP_SAT."""
+    """The on-chain reserve floor used by safe_to_spend(), the LN
+    cashout LSP-shortfall holdback, the PREFER_LN_CASHOUT reserve
+    gate, and topup_goal_amount.
+
+    The formula branches on MANUAL_CHANNEL_CREATION_ENABLED because
+    the two modes have entirely different cost structures:
+
+    LSP mode (default): we pay an LSP a small fee to obtain inbound
+        liquidity. The reserve only has to cover the worst recent
+        LSP quote, so it tracks LspPriceQuote 6-month high-water:
+            min(LSP_RESERVE_CAP_SAT,
+                max(MIN_RESERVE_ONCHAIN, recent_lsp_peak))
+
+    Manual mode: we open channels ourselves, then loop-out the local
+        side back to on-chain to convert outbound capacity into
+        inbound. The reserve has to fund that entire workflow up to
+        the configured liquidity target:
+            target_liquidity
+              + MIN_CHANNEL_COUNT * MANUAL_CHANNEL_OPEN_FEE_ESTIMATE_SAT * 2
+              + target_liquidity * MANUAL_LIQUIDITY_LOOPOUT_FEE_PERCENT
+              + MANUAL_RESERVE_SAFETY_SAT
+        where target_liquidity = max(MIN_INBOUND_LIQUIDITY,
+                                    MIN_INBOUND_LIQUIDITY_PER_CHANNEL
+                                    * MIN_CHANNEL_COUNT).
+        The ×2 on the per-channel open fee covers the eventual close
+        as well. The 1% loop-out fee is applied to the full target
+        (not per-channel-and-multiplied-again).
+    """
+    if MANUAL_CHANNEL_CREATION_ENABLED:
+        target_liquidity = max(
+            int(MIN_INBOUND_LIQUIDITY),
+            int(MIN_INBOUND_LIQUIDITY_PER_CHANNEL) * int(MIN_CHANNEL_COUNT),
+        )
+        open_close_total = (
+            int(MIN_CHANNEL_COUNT)
+            * int(MANUAL_CHANNEL_OPEN_FEE_ESTIMATE_SAT)
+            * 2
+        )
+        loop_out_total = int(
+            target_liquidity * float(MANUAL_LIQUIDITY_LOOPOUT_FEE_PERCENT)
+        )
+        return (
+            target_liquidity
+            + open_close_total
+            + loop_out_total
+            + int(MANUAL_RESERVE_SAFETY_SAT)
+        )
     return min(LSP_RESERVE_CAP_SAT, max(
         int(MIN_RESERVE_ONCHAIN),
         max_lsp_quote_in_last_6_months_sat(),
@@ -4350,41 +5308,41 @@ def _pick_with_zeus_preference(
         # Edge case: cheaper_fee == 0 -> both effectively free, prefer Zeus.
         if cheaper_fee <= 0 or pricier_fee <= cheaper_fee * 1.10:
             log_event(
-                "LSP pay decision: chose zeus (fee=%d sat) over megalithic "
-                "(fee=%d sat) — within ±10%% tiebreaker",
-                zeus_fee, meg_fee,
+                "LSP pay decision: chose zeus (fee=%s) over megalithic "
+                "(fee=%s) — within ±10%% tiebreaker",
+                fmt_btc_sats(zeus_fee), fmt_btc_sats(meg_fee),
             )
             return zeus_pair
         if zeus_fee < meg_fee:
             log_event(
-                "LSP pay decision: chose zeus (fee=%d sat) over megalithic "
-                "(fee=%d sat) — zeus is strictly cheaper outside ±10%% band",
-                zeus_fee, meg_fee,
+                "LSP pay decision: chose zeus (fee=%s) over megalithic "
+                "(fee=%s) — zeus is strictly cheaper outside ±10%% band",
+                fmt_btc_sats(zeus_fee), fmt_btc_sats(meg_fee),
             )
             return zeus_pair
         log_event(
-            "LSP pay decision: chose megalithic (fee=%d sat) over zeus "
-            "(fee=%d sat) — megalithic is >10%% cheaper",
-            meg_fee, zeus_fee,
+            "LSP pay decision: chose megalithic (fee=%s) over zeus "
+            "(fee=%s) — megalithic is >10%% cheaper",
+            fmt_btc_sats(meg_fee), fmt_btc_sats(zeus_fee),
         )
         return meg_pair
     if zeus_pair and not meg_pair:
         log_event(
-            "LSP pay decision: chose zeus (fee=%d sat) — only provider available",
-            zeus_pair[1].fee_total_sat,
+            "LSP pay decision: chose zeus (fee=%s) — only provider available",
+            fmt_btc_sats(zeus_pair[1].fee_total_sat),
         )
         return zeus_pair
     if meg_pair and not zeus_pair:
         log_event(
-            "LSP pay decision: chose megalithic (fee=%d sat) — only provider available",
-            meg_pair[1].fee_total_sat,
+            "LSP pay decision: chose megalithic (fee=%s) — only provider available",
+            fmt_btc_sats(meg_pair[1].fee_total_sat),
         )
         return meg_pair
     fallback = next(iter(quotes.values()), None)
     if fallback is not None:
         log_event(
-            "LSP pay decision: chose %s (fee=%d sat) — only provider available",
-            fallback[1].provider, fallback[1].fee_total_sat,
+            "LSP pay decision: chose %s (fee=%s) — only provider available",
+            fallback[1].provider, fmt_btc_sats(fallback[1].fee_total_sat),
         )
     return fallback
 
@@ -4407,6 +5365,19 @@ async def pick_best_lsp_for_inbound(
     Returns (provider, LspQuote) or None if no provider returned a quote
     we'd consider taking, or the wallet isn't LND-backed.
     """
+    if MANUAL_CHANNEL_CREATION_ENABLED:
+        # Defensive: callers (request_inbound_liquidity_from_lsp via
+        # liquidity_check) are already mode-gated, but guard here too
+        # so any future caller can't accidentally pull LSP quotes when
+        # the operator has chosen manual channel creation.
+        log_decision(
+            ("pick_lsp_skip_manual_mode", wallet.get("id")), True,
+            "pick_best_lsp_for_inbound: wallet %s — "
+            "MANUAL_CHANNEL_CREATION_ENABLED=True, not fetching LSP "
+            "quotes (manual mode owns channel creation).",
+            wallet.get("id"),
+        )
+        return None
     if wallet.get("currency") != "btclnd":
         log_decision(
             ("pick_lsp_skip_non_lnd", wallet.get("id")), True,
@@ -4490,10 +5461,12 @@ async def pick_best_lsp_for_inbound(
             quote_pct = quote.fee_total_sat / quote.lsp_balance_sat
             if quote_pct > LSP_MAX_FEE_PERCENT:
                 log_event(
-                    "LSP %s quote rejected for wallet %s: fee %d sat / "
-                    "channel %d sat = %.4f > cap %.4f",
-                    provider.name, wallet_id, quote.fee_total_sat,
-                    quote.lsp_balance_sat, quote_pct, LSP_MAX_FEE_PERCENT,
+                    "LSP %s quote rejected for wallet …%s: fee %s / "
+                    "channel %s = %.4f > cap %.4f",
+                    provider.name, wallet_short(wallet_id),
+                    fmt_btc_sats(quote.fee_total_sat),
+                    fmt_btc_sats(quote.lsp_balance_sat),
+                    quote_pct, LSP_MAX_FEE_PERCENT,
                 )
                 skip_reasons[provider.name] = (
                     f"fee_above_cap "
@@ -4616,10 +5589,12 @@ async def request_inbound_liquidity_from_lsp(
         state="ORDERED",
     )
     log_event(
-        "LSP order created: provider=%s order_id=%s fee=%d sat "
-        "lsp_balance=%d sat; paying on-chain to %s",
-        provider.name, quote.order_id, quote.fee_total_sat,
-        quote.lsp_balance_sat, quote.onchain_address,
+        "LSP order created: provider=%s order_id=%s fee=%s "
+        "lsp_balance=%s; paying on-chain to %s (wallet …%s)",
+        provider.name, quote.order_id,
+        fmt_btc_sats(quote.fee_total_sat),
+        fmt_btc_sats(quote.lsp_balance_sat),
+        quote.onchain_address, wallet_short(wallet_id),
     )
 
     label = f"lsp_channel_order:{quote.order_id}"
@@ -4640,15 +5615,19 @@ async def request_inbound_liquidity_from_lsp(
         order.state = "FAILED"
         order.save()
         log_event(
-            "LSP order %s: on-chain payment FAILED", quote.order_id,
+            "LSP order %s: on-chain payment FAILED (would have sent %s from wallet …%s to %s)",
+            quote.order_id, fmt_btc_sats(quote.order_total_sat),
+            wallet_short(wallet_id), quote.onchain_address,
         )
         return None
 
     order.state = "PAID"
     order.save()
     log_event(
-        "LSP order %s paid (%d sat); LSP will open channel from %s",
-        quote.order_id, quote.order_total_sat, quote.lsp_peer_uri,
+        "LSP order %s paid: %s on-chain from wallet …%s to %s; LSP will open channel from %s",
+        quote.order_id, fmt_btc_sats(quote.order_total_sat),
+        wallet_short(wallet_id), quote.onchain_address,
+        quote.lsp_peer_uri,
     )
     return order
 
@@ -4899,6 +5878,13 @@ async def process_pending_closes(api: "BitcartAPI") -> None:
     Force-close path is gated per-wallet (default 1/day) so an anomaly
     flagging many channels for escalation on the same day can't burst
     them all into the on-chain CSV timelock window simultaneously.
+
+    OWN_LIGHTNING_NODES exemption: channels whose peer is in
+    OWN_LIGHTNING_NODES are EXEMPT from automatic force-close
+    escalation regardless of timeout. The operator opted into "this
+    peer may be offline" by listing it; we don't risk locking funds
+    behind a CSV timelock for a peer expected to go offline. Operator
+    can close such channels manually if needed.
     """
     if not CHANNEL_COOP_CLOSE_RETRY_ENABLED:
         log_decision(
@@ -4965,11 +5951,14 @@ async def process_pending_closes(api: "BitcartAPI") -> None:
             # Channel is no longer in any wallet's channel list —
             # the close confirmed on-chain and was reaped by LND/
             # Electrum. Clear the markers; nothing more to do.
+            # The LightningChannel row only carries channel_point
+            # (chan_id / capacity aren't persisted), so the
+            # close-confirmation line surfaces what we have.
             log_decision(
                 ("pending_close_resolved", cp), True,
-                "process_pending_closes: channel %s no longer "
-                "present in any wallet (close confirmed); clearing "
-                "tracking markers.", cp,
+                "process_pending_closes: channel_point=%s no longer "
+                "present in any wallet (close confirmed on-chain); "
+                "clearing tracking markers.", cp,
             )
             row.cooperative_close_requested = None
             row.last_close_attempt_at = None
@@ -4997,6 +5986,21 @@ async def process_pending_closes(api: "BitcartAPI") -> None:
             # Escalation path: been waiting longer than the timeout
             # with no successful coop. Check per-wallet rate limit.
             wallet_id = wallet["id"]
+            # OWN_LIGHTNING_NODES channels are exempt from automatic
+            # force-close — the peer may be a phone wallet or other
+            # intermittently-online node, and the user prefers to
+            # leave such channels alone rather than risk locking funds
+            # behind a CSV timelock unnecessarily.
+            peer_pubkey = (channel_dict.get("remote_pubkey") or "").lower()
+            if peer_pubkey in own_node_pubkeys():
+                log_decision(
+                    ("force_close_skipped_own_node", cp), True,
+                    "process_pending_closes: channel_point=%s peer=%s "
+                    "is in OWN_LIGHTNING_NODES; skipping force-close "
+                    "escalation. Operator can close manually if needed.",
+                    cp, peer_pubkey, level=logging.WARNING,
+                )
+                continue
             if (force_closes_this_run.get(wallet_id, 0)
                     >= CHANNEL_FORCE_CLOSE_MAX_PER_DAY_PER_WALLET):
                 log_decision(
@@ -5010,12 +6014,17 @@ async def process_pending_closes(api: "BitcartAPI") -> None:
                 continue
             log_decision(
                 ("pending_close_escalating", cp), True,
-                "FORCE CLOSE: channel %s has been waiting %d days "
-                "for cooperative close (peer unresponsive across %d "
+                "FORCE CLOSE: channel_point=%s chan_id=%s capacity=%s "
+                "(wallet …%s) has been waiting %d days for "
+                "cooperative close (peer unresponsive across %d "
                 "attempts); escalating to force close. Funds will "
                 "be locked behind the CSV timelock until the unilateral "
                 "close confirms and resolves.",
-                cp, first_request_age.days,
+                cp,
+                channel_dict.get("chan_id") or "unknown",
+                fmt_btc_sats(channel_dict.get("capacity") or 0),
+                wallet_short(wallet_id),
+                first_request_age.days,
                 row.cooperative_close_attempts,
                 level=logging.WARNING,
             )
@@ -5038,8 +6047,13 @@ async def process_pending_closes(api: "BitcartAPI") -> None:
                 log_decision(
                     ("pending_close_escalated", cp), True,
                     "process_pending_closes: force close submitted "
-                    "for channel %s on wallet %s.",
-                    cp, wallet_id, level=logging.WARNING,
+                    "for channel_point=%s chan_id=%s capacity=%s "
+                    "on wallet …%s.",
+                    cp,
+                    channel_dict.get("chan_id") or "unknown",
+                    fmt_btc_sats(channel_dict.get("capacity") or 0),
+                    wallet_short(wallet_id),
+                    level=logging.WARNING,
                 )
                 # Force close ⇒ 1-year peer blacklist. We look up the
                 # peer by channel_dict.remote_pubkey (the LightningChannel
@@ -5084,9 +6098,12 @@ async def process_pending_closes(api: "BitcartAPI") -> None:
                     log_decision(
                         ("force_close_blacklisted", peer_pubkey), True,
                         "Peer %s blacklisted from new channels until %s "
-                        "(force-closed channel %s after %d-day timeout).",
+                        "(force-closed channel_point=%s chan_id=%s "
+                        "capacity=%s after %d-day timeout).",
                         peer_pubkey,
                         peer_row.force_close_blacklist_until, cp,
+                        channel_dict.get("chan_id") or "unknown",
+                        fmt_btc_sats(channel_dict.get("capacity") or 0),
                         CHANNEL_COOP_CLOSE_TIMEOUT_DAYS,
                         level=logging.WARNING,
                     )
@@ -5094,18 +6111,28 @@ async def process_pending_closes(api: "BitcartAPI") -> None:
                     log_decision(
                         ("force_close_blacklist_skipped_no_pubkey", cp),
                         True,
-                        "process_pending_closes: force-closed %s but "
+                        "process_pending_closes: force-closed "
+                        "channel_point=%s chan_id=%s capacity=%s but "
                         "no remote_pubkey on the channel record; "
                         "could not set peer blacklist. Operator should "
                         "manually set force_close_blacklist_until on the "
-                        "peer if known.", cp, level=logging.WARNING,
+                        "peer if known.",
+                        cp,
+                        channel_dict.get("chan_id") or "unknown",
+                        fmt_btc_sats(channel_dict.get("capacity") or 0),
+                        level=logging.WARNING,
                     )
             else:
                 log_decision(
                     ("pending_close_escalate_failed", cp), True,
                     "process_pending_closes: force close attempt for "
-                    "%s returned no result; will retry next hour.",
-                    cp, level=logging.WARNING,
+                    "channel_point=%s chan_id=%s capacity=%s (wallet …%s) "
+                    "returned no result; will retry next hour.",
+                    cp,
+                    channel_dict.get("chan_id") or "unknown",
+                    fmt_btc_sats(channel_dict.get("capacity") or 0),
+                    wallet_short(wallet_id),
+                    level=logging.WARNING,
                 )
             continue
 
@@ -5120,9 +6147,14 @@ async def process_pending_closes(api: "BitcartAPI") -> None:
             continue
         log_decision(
             ("pending_close_retry", cp), row.cooperative_close_attempts,
-            "process_pending_closes: retrying coop close for %s "
+            "process_pending_closes: retrying coop close for "
+            "channel_point=%s chan_id=%s capacity=%s (wallet …%s) "
             "(attempt #%d, first requested %d days ago)",
-            cp, row.cooperative_close_attempts + 1,
+            cp,
+            channel_dict.get("chan_id") or "unknown",
+            fmt_btc_sats(channel_dict.get("capacity") or 0),
+            wallet_short(wallet["id"]),
+            row.cooperative_close_attempts + 1,
             first_request_age.days,
         )
         try:
@@ -5158,6 +6190,10 @@ async def audit_existing_channels(api: "BitcartAPI") -> None:
         contains blast radius of any graph-pull anomaly.
       - "Missing data" (peer's gossip metrics not yet computed) is
         treated as 'skip audit this tick', not 'fail'.
+      - OWN_LIGHTNING_NODES peers are EXEMPT — gossip-derived audit
+        metrics are not meaningful for a peer the operator knows may
+        be a phone wallet / on tor / occasionally offline. The channel
+        is skipped entirely with a per-channel decision-log entry.
 
     Notification: every close emits a WARNING decision listing each
     failing criterion by name. The plugin Logs tab + decisions.log file
@@ -5202,12 +6238,28 @@ async def audit_existing_channels(api: "BitcartAPI") -> None:
                 f"failed for {wallet_id}: {e}"
             )
             continue
+        own_pubkeys = own_node_pubkeys()
         for channel in channels:
             if closes_today >= CHANNEL_AUDIT_MAX_CLOSES_PER_DAY:
                 break
             peer_pubkey = (channel.get("remote_pubkey") or "").lower()
             channel_point = channel.get("channel_point")
             if not peer_pubkey or not channel_point:
+                continue
+            # Channels to OWN_LIGHTNING_NODES peers are exempt from
+            # the audit. The peer may be a phone wallet, on tor, or
+            # otherwise intermittently online — gossip-derived audit
+            # metrics computed against such a peer aren't meaningful.
+            # The operator explicitly opted into "this peer is mine
+            # and I accept it may be offline" by listing it.
+            if peer_pubkey in own_pubkeys:
+                log_decision(
+                    ("channel_audit_exempt_own", peer_pubkey, channel_point),
+                    True,
+                    "Channel audit skipped for channel_point=%s peer=%s "
+                    "(wallet …%s): peer is in OWN_LIGHTNING_NODES.",
+                    channel_point, peer_pubkey, wallet_short(wallet_id),
+                )
                 continue
             peer_node = LightningNode.get_or_none(
                 LightningNode.node_address == peer_pubkey
@@ -5255,9 +6307,13 @@ async def audit_existing_channels(api: "BitcartAPI") -> None:
                 ("channel_audit_closing", channel_point), True,
                 "CHANNEL AUDIT CLOSE: peer %s failed %d consecutive "
                 "daily audits, reasons=%s. Cooperatively closing "
-                "channel %s and blacklisting peer for %d days.",
+                "channel_point=%s chan_id=%s capacity=%s (wallet …%s) "
+                "and blacklisting peer for %d days.",
                 peer_pubkey, peer_node.consecutive_failed_audits,
                 ",".join(reasons), channel_point,
+                channel.get("chan_id") or "unknown",
+                fmt_btc_sats(channel.get("capacity") or 0),
+                wallet_short(wallet_id),
                 CHANNEL_AUDIT_BLACKLIST_DAYS,
                 level=logging.WARNING,
             )
@@ -5286,9 +6342,13 @@ async def audit_existing_channels(api: "BitcartAPI") -> None:
                 peer_node.save()
                 log_decision(
                     ("channel_audit_closed", peer_pubkey), True,
-                    "Channel %s coop-close initiated; peer %s "
+                    "Channel coop-close initiated: channel_point=%s "
+                    "chan_id=%s capacity=%s (wallet …%s); peer %s "
                     "blacklisted until %s.",
-                    channel_point, peer_pubkey,
+                    channel_point,
+                    channel.get("chan_id") or "unknown",
+                    fmt_btc_sats(channel.get("capacity") or 0),
+                    wallet_short(wallet_id), peer_pubkey,
                     peer_node.audit_close_blacklist_until,
                     level=logging.WARNING,
                 )
@@ -5298,10 +6358,390 @@ async def audit_existing_channels(api: "BitcartAPI") -> None:
                 # manually). Don't reset streak (the failure stands).
                 log_decision(
                     ("channel_audit_close_failed", channel_point), True,
-                    "Channel audit: coop close attempt for %s "
+                    "Channel audit: coop close attempt for "
+                    "channel_point=%s chan_id=%s capacity=%s (wallet …%s) "
                     "returned no result; will retry on next audit.",
-                    channel_point, level=logging.WARNING,
+                    channel_point,
+                    channel.get("chan_id") or "unknown",
+                    fmt_btc_sats(channel.get("capacity") or 0),
+                    wallet_short(wallet_id),
+                    level=logging.WARNING,
                 )
+
+
+# ---------------------------------------------------------------------------
+# Health warnings (config sanity + LN-cashout staleness).
+#
+# Every check below produces zero or one HealthWarning-shaped dict:
+#   { "id": str, "severity": "HIGH"|"MEDIUM",
+#     "category": str, "title": str, "message": str }
+# `id` doubles as the log_decision key so each warning's on/off
+# transitions land in decisions.log without per-tick spam.
+#
+# The dashboard payload reads collect_health_warnings(api) and renders
+# the resulting list as a banner. The main tick also calls it
+# (run_every_x_minutes) so log_decision fires even when nobody opens
+# the dashboard.
+# ---------------------------------------------------------------------------
+
+# Stable IDs for every health check. Used both as log_decision keys
+# AND as the set we iterate to emit "cleared" transitions when a
+# previously-active warning resolves.
+_HEALTH_WARNING_IDS = (
+    "cashout-rail-enabled-no-dest-ln",        # H1
+    "cashout-rail-enabled-no-dest-onchain",   # H2
+    "prefer-onchain-setup-mismatch",          # H3
+    "prefer-ln-setup-mismatch",               # H4
+    "all-cashout-paths-off",                  # H5
+    "both-prefer-flags-set",                  # M6
+    "staleness-fallback-unreachable",         # M7
+    "min-channel-size-below-daemon",          # H14
+    "min-channel-count-below-one",            # H15
+    "inbound-target-below-per-channel",       # M16
+    "lsp-cap-below-floor",                    # H17
+    "loopd-regtest-no-host",                  # H19
+    "autoloop-without-loopout",               # H20
+    "loopout-without-onchain-dest",           # H21
+    "manual-loopout-fee-implausible",         # M18
+    "autoloop-dual-destination",              # M22
+    "autoloop-min-above-max",                 # M23
+    "smtp-tls-and-ssl",                       # M24
+    "smtp-partial-config",                    # M25
+    "ln-cashout-failing",                     # R27
+)
+
+_LN_CASHOUT_FAIL_DAYS = 7  # fixed per operator decision
+
+
+def _warn(id_: str, severity: str, category: str, title: str, message: str) -> Dict[str, str]:
+    return {
+        "id": id_, "severity": severity, "category": category,
+        "title": title, "message": message,
+    }
+
+
+def _check_cashout_config() -> List[Dict[str, str]]:
+    """H1, H2, H3, H4, H5, M6, M7."""
+    out: List[Dict[str, str]] = []
+    if ENABLE_CASHOUT_LN and not CASHOUT_LIGHTNING_ADDRESS:
+        out.append(_warn(
+            "cashout-rail-enabled-no-dest-ln", "HIGH", "cashout",
+            "LN cashouts enabled but no destination address",
+            "ENABLE_CASHOUT_LN=True but CASHOUT_LIGHTNING_ADDRESS is "
+            "unset. Every LN cashout attempt will log an error and "
+            "skip; LN revenue will accumulate in channels until you "
+            "set a destination Lightning Address.",
+        ))
+    if ENABLE_CASHOUT_ONCHAIN and not CASHOUT_ONCHAIN:
+        out.append(_warn(
+            "cashout-rail-enabled-no-dest-onchain", "HIGH", "cashout",
+            "On-chain cashouts enabled but no destination address",
+            "ENABLE_CASHOUT_ONCHAIN=True but CASHOUT_ONCHAIN is unset. "
+            "On-chain cashouts will be skipped; on-chain revenue will "
+            "stay in the wallet until you set a destination Bitcoin "
+            "address.",
+        ))
+    if PREFER_CASHOUT_ONCHAIN and not PREFER_LN_CASHOUT and (
+        not ENABLE_CASHOUT_ONCHAIN or not CASHOUT_ONCHAIN
+    ):
+        # Suppressed when PREFER_LN_CASHOUT also set — that wins and
+        # this PREFER_* mismatch becomes irrelevant.
+        out.append(_warn(
+            "prefer-onchain-setup-mismatch", "HIGH", "cashout",
+            "PREFER_CASHOUT_ONCHAIN is set but the on-chain rail isn't usable",
+            f"PREFER_CASHOUT_ONCHAIN=True requires both "
+            f"ENABLE_CASHOUT_ONCHAIN=True and CASHOUT_ONCHAIN set. "
+            f"Currently: ENABLE_CASHOUT_ONCHAIN={ENABLE_CASHOUT_ONCHAIN}, "
+            f"CASHOUT_ONCHAIN={'set' if CASHOUT_ONCHAIN else 'unset'}.",
+        ))
+    if PREFER_LN_CASHOUT and (
+        not ENABLE_CASHOUT_LN or not CASHOUT_LIGHTNING_ADDRESS
+    ):
+        out.append(_warn(
+            "prefer-ln-setup-mismatch", "HIGH", "cashout",
+            "PREFER_LN_CASHOUT is set but the LN rail isn't usable",
+            f"PREFER_LN_CASHOUT=True requires both ENABLE_CASHOUT_LN=True "
+            f"and CASHOUT_LIGHTNING_ADDRESS set so the LN balance can "
+            f"continue to cash out. Currently: "
+            f"ENABLE_CASHOUT_LN={ENABLE_CASHOUT_LN}, "
+            f"CASHOUT_LIGHTNING_ADDRESS="
+            f"{'set' if CASHOUT_LIGHTNING_ADDRESS else 'unset'}.",
+        ))
+    if (not ENABLE_CASHOUT_LN
+            and not ENABLE_CASHOUT_ONCHAIN
+            and not PREFER_LN_CASHOUT):
+        out.append(_warn(
+            "all-cashout-paths-off", "HIGH", "cashout",
+            "All cashout paths are disabled",
+            "ENABLE_CASHOUT_LN, ENABLE_CASHOUT_ONCHAIN, and "
+            "PREFER_LN_CASHOUT are all False/off — no cashouts will "
+            "ever fire. Revenue will accumulate indefinitely.",
+        ))
+    if PREFER_LN_CASHOUT and PREFER_CASHOUT_ONCHAIN:
+        out.append(_warn(
+            "both-prefer-flags-set", "MEDIUM", "cashout",
+            "Both PREFER_CASHOUT_ONCHAIN and PREFER_LN_CASHOUT are True",
+            "These two settings are opposites. PREFER_LN_CASHOUT wins: "
+            "on-chain excess opens new LN channels and LN balance "
+            "continues to sweep to CASHOUT_LIGHTNING_ADDRESS. Unset "
+            "one to remove this warning.",
+        ))
+    if (CASHOUT_SWITCH_TO_ONCHAIN_AFTER_X_DAYS is not None
+            and not ENABLE_CASHOUT_ONCHAIN):
+        out.append(_warn(
+            "staleness-fallback-unreachable", "MEDIUM", "cashout",
+            "Cashout staleness fallback cannot activate",
+            f"CASHOUT_SWITCH_TO_ONCHAIN_AFTER_X_DAYS is set to "
+            f"{CASHOUT_SWITCH_TO_ONCHAIN_AFTER_X_DAYS} but "
+            f"ENABLE_CASHOUT_ONCHAIN=False, so when LN cashouts go "
+            f"stale there's no on-chain rail to switch to. Either "
+            f"enable on-chain cashouts or set the staleness window to "
+            f"None.",
+        ))
+    return out
+
+
+def _check_channel_reserve_config() -> List[Dict[str, str]]:
+    """H14, H15, M16, H17."""
+    out: List[Dict[str, str]] = []
+    daemon_min = 60_000
+    if MIN_CHANNEL_SIZE_IN_SATS < daemon_min:
+        out.append(_warn(
+            "min-channel-size-below-daemon", "HIGH", "channel",
+            f"MIN_CHANNEL_SIZE_IN_SATS below daemon minimum ({daemon_min:,} sat)",
+            f"MIN_CHANNEL_SIZE_IN_SATS={MIN_CHANNEL_SIZE_IN_SATS:,} is "
+            f"below the Electrum/Bitcart daemon's hardcoded minimum of "
+            f"{daemon_min:,} sat. Any channel-open attempt at this size "
+            f"will be rejected by the daemon.",
+        ))
+    if MIN_CHANNEL_COUNT < 1:
+        out.append(_warn(
+            "min-channel-count-below-one", "HIGH", "channel",
+            "MIN_CHANNEL_COUNT must be at least 1",
+            f"MIN_CHANNEL_COUNT={MIN_CHANNEL_COUNT}. Liquidity check + "
+            f"reserve-floor formulas use this as a multiplier; values "
+            f"below 1 produce nonsensical math.",
+        ))
+    if MIN_INBOUND_LIQUIDITY < MIN_INBOUND_LIQUIDITY_PER_CHANNEL:
+        out.append(_warn(
+            "inbound-target-below-per-channel", "MEDIUM", "channel",
+            "Total inbound target is smaller than per-channel target",
+            f"MIN_INBOUND_LIQUIDITY={MIN_INBOUND_LIQUIDITY:,} sat is "
+            f"less than MIN_INBOUND_LIQUIDITY_PER_CHANNEL="
+            f"{MIN_INBOUND_LIQUIDITY_PER_CHANNEL:,} sat. One channel "
+            f"would exceed the whole-store target — probably a typo "
+            f"in one of the two values.",
+        ))
+    if LSP_RESERVE_CAP_SAT < MIN_RESERVE_ONCHAIN:
+        out.append(_warn(
+            "lsp-cap-below-floor", "HIGH", "reserves",
+            "LSP_RESERVE_CAP_SAT is below MIN_RESERVE_ONCHAIN",
+            f"LSP_RESERVE_CAP_SAT={LSP_RESERVE_CAP_SAT:,} sat is below "
+            f"MIN_RESERVE_ONCHAIN={MIN_RESERVE_ONCHAIN:,} sat. The cap "
+            f"clamps the LSP-mode reserve floor *down* to the cap, "
+            f"breaking the reserve math. The cap must be ≥ the floor.",
+        ))
+    return out
+
+
+def _check_loop_smtp_config() -> List[Dict[str, str]]:
+    """H19, H20, H21, M18, M22, M23, M24, M25."""
+    out: List[Dict[str, str]] = []
+    if LOOPD_NETWORK in {"regtest", "simnet"} and not LOOPD_SERVER_HOST:
+        out.append(_warn(
+            "loopd-regtest-no-host", "HIGH", "loop",
+            f"LOOPD_NETWORK={LOOPD_NETWORK} requires LOOPD_SERVER_HOST",
+            f"loopd has no built-in swap server URL for "
+            f"{LOOPD_NETWORK}; you must set LOOPD_SERVER_HOST to a "
+            f"reachable loopserver (e.g. 127.0.0.1:11010) or loopd "
+            f"will refuse to start.",
+        ))
+    if AUTOLOOP_ENABLED and not LOOP_OUT_ENABLED:
+        out.append(_warn(
+            "autoloop-without-loopout", "HIGH", "loop",
+            "AUTOLOOP_ENABLED=True but LOOP_OUT_ENABLED=False",
+            "Autoloop runs inside loopd; it can't operate without "
+            "LOOP_OUT_ENABLED. Either enable LOOP_OUT_ENABLED or "
+            "disable AUTOLOOP_ENABLED.",
+        ))
+    if LOOP_OUT_ENABLED and not CASHOUT_ONCHAIN:
+        out.append(_warn(
+            "loopout-without-onchain-dest", "HIGH", "loop",
+            "LOOP_OUT_ENABLED=True but CASHOUT_ONCHAIN is unset",
+            "Drain swaps (loop-out) send funds to CASHOUT_ONCHAIN. "
+            "With it unset, the drain helper is a silent no-op even "
+            "when staleness fallback or PREFER_CASHOUT_ONCHAIN would "
+            "otherwise fire it.",
+        ))
+    if MANUAL_LIQUIDITY_LOOPOUT_FEE_PERCENT > 0.10:
+        out.append(_warn(
+            "manual-loopout-fee-implausible", "MEDIUM", "loop",
+            "MANUAL_LIQUIDITY_LOOPOUT_FEE_PERCENT > 10%",
+            f"MANUAL_LIQUIDITY_LOOPOUT_FEE_PERCENT="
+            f"{MANUAL_LIQUIDITY_LOOPOUT_FEE_PERCENT:.4f}. Loop-out "
+            f"fees in practice are well under 1% — values above 10% "
+            f"are almost certainly a typo (e.g. 10 instead of 0.10).",
+        ))
+    if AUTOLOOP_DEST_ADDRESS and AUTOLOOP_ACCOUNT:
+        out.append(_warn(
+            "autoloop-dual-destination", "MEDIUM", "loop",
+            "Both AUTOLOOP_DEST_ADDRESS and AUTOLOOP_ACCOUNT are set",
+            "Set one or the other, not both. With both set, loopd's "
+            "behavior depends on its config-parse order and may not "
+            "match your intent. Clear one to remove ambiguity.",
+        ))
+    if AUTOLOOP_MIN_SWAP_AMOUNT_SAT > AUTOLOOP_MAX_SWAP_AMOUNT_SAT:
+        out.append(_warn(
+            "autoloop-min-above-max", "MEDIUM", "loop",
+            "AUTOLOOP_MIN_SWAP_AMOUNT_SAT exceeds the MAX",
+            f"AUTOLOOP_MIN_SWAP_AMOUNT_SAT="
+            f"{AUTOLOOP_MIN_SWAP_AMOUNT_SAT:,} sat > "
+            f"AUTOLOOP_MAX_SWAP_AMOUNT_SAT="
+            f"{AUTOLOOP_MAX_SWAP_AMOUNT_SAT:,} sat. autoloop will "
+            f"never find an amount in the empty range.",
+        ))
+    if SMTP_TLS and SMTP_SSL:
+        out.append(_warn(
+            "smtp-tls-and-ssl", "MEDIUM", "smtp",
+            "SMTP_TLS and SMTP_SSL are both True",
+            "These are mutually exclusive (STARTTLS vs implicit SSL). "
+            "Pick one: TLS for ports like 587, SSL for port 465.",
+        ))
+    # Partial SMTP config — at least one of the six required fields is
+    # set while at least one other is missing. Treat all-unset as "user
+    # has opted out of SMTP" (no warning); treat all-set as "SMTP is
+    # configured" (no warning). Anything in between is the footgun.
+    smtp_required = (
+        SMTP_SERVER, SMTP_PORT, SMTP_FROM_EMAIL, SMTP_TO_EMAIL,
+        SMTP_USERNAME, SMTP_PASSWORD,
+    )
+    smtp_set = [bool(v) for v in smtp_required]
+    if any(smtp_set) and not all(smtp_set):
+        missing = []
+        for name, present in zip(
+            ("SMTP_SERVER", "SMTP_PORT", "SMTP_FROM_EMAIL",
+             "SMTP_TO_EMAIL", "SMTP_USERNAME", "SMTP_PASSWORD"),
+            smtp_set,
+        ):
+            if not present:
+                missing.append(name)
+        out.append(_warn(
+            "smtp-partial-config", "MEDIUM", "smtp",
+            "SMTP partially configured — email notifications won't fire",
+            f"Some SMTP fields are set but these are still missing: "
+            f"{', '.join(missing)}. Notifications won't be sent until "
+            f"every required field is set, OR clear them all to opt "
+            f"out of SMTP.",
+        ))
+    return out
+
+
+async def _check_ln_cashout_health(api: "BitcartAPI") -> List[Dict[str, str]]:
+    """R27. Only fires when cashout-eligible LN balance exists AND
+    last successful LN cashout is older than the threshold."""
+    out: List[Dict[str, str]] = []
+    if not ENABLE_CASHOUT_LN or not CASHOUT_LIGHTNING_ADDRESS:
+        # Already handled by H1; don't double-report.
+        return out
+    days = days_since_last_successful_ln_cashout()
+    if days is None or days < _LN_CASHOUT_FAIL_DAYS:
+        return out
+    # Confirm there's actually LN balance ≥ MIN_LN_CASHOUT_IN_SATS
+    # to cash out. Without this gate a quiet store with empty channels
+    # would false-positive.
+    try:
+        stores = await api.get_stores()
+    except Exception:
+        return out
+    eligible_sats = 0
+    seen_wallets: Set[str] = set()
+    for store in stores or []:
+        try:
+            wallet = await api.get_best_ln_wallet_for_store(store)
+        except Exception:
+            continue
+        wid = wallet.get("id") if wallet else None
+        if not wid or wid in seen_wallets:
+            continue
+        seen_wallets.add(wid)
+        try:
+            channels = await api.get_wallet_ln_channels(
+                wid, active_only=True, online_only=True,
+            )
+        except Exception:
+            continue
+        for ch in channels or []:
+            try:
+                eligible_sats += int(ch.get("local_balance") or 0)
+            except (TypeError, ValueError):
+                continue
+    if eligible_sats >= MIN_LN_CASHOUT_IN_SATS:
+        out.append(_warn(
+            "ln-cashout-failing", "HIGH", "ln_health",
+            f"LN cashouts have been failing for {days} days",
+            f"Last successful LN cashout was {days} days ago "
+            f"(threshold {_LN_CASHOUT_FAIL_DAYS} days). LN balance "
+            f"eligible for cashout is currently {eligible_sats:,} sats "
+            f"({sats_to_btc(eligible_sats):.8f} BTC), so the cashout "
+            f"path is being exercised but not succeeding. Check the "
+            f"decisions.log for cashout_rail_ln=ln_retry_next_tick or "
+            f"ln_stale_fallback entries.",
+        ))
+    return out
+
+
+async def collect_health_warnings(
+    api: Optional["BitcartAPI"] = None,
+) -> List[Dict[str, str]]:
+    """Run every config-sanity check + the LN-cashout-staleness check.
+
+    Returns a list of warning dicts shaped for the HealthWarning
+    Pydantic model in dashboard.py. Emits a log_decision for every
+    known warning ID — present-now warnings transition True, cleared
+    warnings transition False. The decision-log stream and the
+    dashboard banner thus stay in sync.
+
+    The dashboard payload calls this on every (cache-miss) render; the
+    main tick also schedules it periodically (run_every_x_minutes)
+    so decisions.log gets the transitions even when nobody is looking
+    at the dashboard.
+    """
+    active: List[Dict[str, str]] = []
+    active.extend(_check_cashout_config())
+    active.extend(_check_channel_reserve_config())
+    active.extend(_check_loop_smtp_config())
+    if api is not None:
+        try:
+            active.extend(await _check_ln_cashout_health(api))
+        except Exception as e:
+            logger.warning(f"_check_ln_cashout_health raised: {e}")
+
+    # Build the active-id set so we can fire CLEARED transitions for
+    # every known ID that isn't currently in `active`. log_decision is
+    # state-deduped, so calling it with the same (key, value) every
+    # tick is a no-op after the first emit.
+    active_by_id = {w["id"]: w for w in active}
+    for known_id in _HEALTH_WARNING_IDS:
+        warning = active_by_id.get(known_id)
+        if warning is not None:
+            level = (
+                logging.WARNING
+                if warning["severity"] == "HIGH"
+                else logging.INFO
+            )
+            log_decision(
+                ("health_warning", known_id), True,
+                "Health warning %s [%s]: %s — %s",
+                known_id, warning["severity"],
+                warning["title"], warning["message"],
+                level=level,
+            )
+        else:
+            log_decision(
+                ("health_warning", known_id), False,
+                "Health warning %s: cleared.", known_id,
+            )
+    return active
 
 
 async def audit_lsp_network_compatibility(api: "BitcartAPI") -> None:
@@ -5319,7 +6759,18 @@ async def audit_lsp_network_compatibility(api: "BitcartAPI") -> None:
     manual channel management) so we never RAISE — only emit
     decisions. The dashboard reads from the same decision stream so
     operators can also see this in the log viewer.
+
+    Skipped entirely when MANUAL_CHANNEL_CREATION_ENABLED=True —
+    LSPs aren't used in manual mode, so audit data would just be
+    noise.
     """
+    if MANUAL_CHANNEL_CREATION_ENABLED:
+        log_decision(
+            ("lsp_compat_audit_gated", "global"), "manual_mode",
+            "audit_lsp_network_compatibility: skipped — "
+            "MANUAL_CHANNEL_CREATION_ENABLED=True (LSPs unused).",
+        )
+        return
     try:
         wallets = await api.get_wallets()
     except Exception as e:
@@ -5382,7 +6833,18 @@ async def ensure_lnd_wallets_peered_with_lsps(api: "BitcartAPI") -> None:
 
     Gated by LSP_AUTO_PEER (default True). No-op when False — operators
     who manage peering out of band can disable.
+
+    Also skipped when MANUAL_CHANNEL_CREATION_ENABLED=True: no LSP
+    request will ever fire in manual mode, so the peering would
+    just be wasted ConnectPeer calls.
     """
+    if MANUAL_CHANNEL_CREATION_ENABLED:
+        log_decision(
+            ("lsp_peering_gated", "global"), "manual_mode",
+            "ensure_lnd_wallets_peered_with_lsps: skipped — "
+            "MANUAL_CHANNEL_CREATION_ENABLED=True (LSPs unused).",
+        )
+        return
     if not LSP_AUTO_PEER:
         return
     try:
@@ -5537,7 +6999,7 @@ async def ensure_lnd_wallets_peered_with_lsps(api: "BitcartAPI") -> None:
 
 
 async def cleanup_old_lsp_quotes() -> int:
-    """Delete LspPriceQuote rows older than 6 months. Mirror of
+    """Delete LspPriceQuote rows older than 183 days (~6 months). Mirror of
     cleanup_old_swap_quotes; called once per day from main()."""
     cutoff = datetime.datetime.now() - datetime.timedelta(days=183)
     try:
@@ -5700,6 +7162,14 @@ async def main():
     global START_TIME
     global AUTH_TOKEN
     global NOTIFICATION_PROVIDERS
+    # PyCharm remote-debug attach. _load_debug_env_file() sources
+    # PYCHARM_DEBUG_HOST/PORT from a file when running inside the
+    # bitcart container (where the launcher can't reach the host env
+    # directly); maybe_attach_pycharm_debugger() reads those env vars
+    # and connects back to the IDE's debug server. Both are no-ops
+    # when the env vars aren't set, so this is safe in every mode.
+    _load_debug_env_file()
+    maybe_attach_pycharm_debugger()
     # See _resolve_internal_api_url(): /api prefix from outside, no
     # prefix when running inside the backend container.
     BITCART_URL = _INTERNAL_API_URL
@@ -5856,10 +7326,24 @@ async def main():
             f"Error in audit_existing_channels: {e} "
             f"{traceback.print_exc()}"
         )
+    # Health audit (config sanity + LN-cashout staleness). Cheap —
+    # mostly config reads plus one channel-balance pass for the LN
+    # health check. log_decision dedupes via state so calling on
+    # every tick is fine; this also keeps the dashboard's
+    # health_warnings list fresh when an operator IS looking.
+    try:
+        await collect_health_warnings(api)
+    except Exception as e:
+        logger.error(
+            f"Error in collect_health_warnings: {e} "
+            f"{traceback.print_exc()}"
+        )
     # Hourly retry of stuck coop closes. LND doesn't auto-retry a coop
     # close request the peer didn't respond to; we re-issue once an
-    # hour until either the peer signs OR the 10-day timeout fires
-    # and we escalate to force close (per-wallet 1/day cap).
+    # hour. Per-wallet cap is CHANNEL_COOP_CLOSE_HOURLY_RETRY_MAX; until
+    # either the peer signs OR CHANNEL_COOP_CLOSE_TIMEOUT_DAYS (default
+    # 10) elapse, at which point we escalate to force close (per-wallet
+    # cap CHANNEL_FORCE_CLOSE_MAX_PER_DAY_PER_WALLET, default 1).
     try:
         await run_every_x_hours(
             my_func=process_pending_closes, hours=1, api=api,
@@ -5933,14 +7417,6 @@ async def main():
                 cand.get("wallet_id"), cand.get("channel_point"),
                 cand.get("local_balance_sat"), cand.get("remote_balance_sat"),
                 cand.get("remote_pubkey"),
-            )
-        if loop_out_candidates and LOOP_OUT_ENABLED:
-            log_decision(
-                "loop_out_enabled_but_unwired",
-                True,
-                "LOOP_OUT_ENABLED=True but automated loop-out execution is "
-                "not yet wired; operator must invoke "
-                "initiate_lightning_to_onchain_swap() manually."
             )
     except Exception as e:
         logger.error(f"Error in loop-out candidate scan: {e} {traceback.print_exc()}")

@@ -3,9 +3,9 @@
 Two providers wired in this module: Zeus (lnolymp.us) and Megalithic.
 Both speak the LSPS1 REST API (https://docs.zeusln.app/lsp/services/lsps1,
 https://docs.megalithic.me/lightning-services/lsp1-get-inbound-liquidity-for-mobile-clients/).
-LSPS1's BOLT8 message form is deliberately not implemented here; the ABC
-is structured so a future BOLT8Provider could subclass alongside Zeus
-and Megalithic without touching callers.
+The ABC is REST-flavored today, but its method signatures (get_info /
+create_order / get_order keyed by order_id) translate cleanly to BOLT8
+LSPS1 messages should a BOLT8Provider be added later.
 
 Each provider:
   - Knows which Bitcoin networks the LSP supports (mainnet/testnet/mutinynet/etc).
@@ -83,7 +83,7 @@ class LspQuote:
     lsp_peer_uri: str           # pubkey@host:port
     lsp_balance_sat: int        # the channel inbound we requested
     fee_total_sat: int          # the LSP's price for the service
-    order_total_sat: int        # fee + any client_balance_sat we requested
+    order_total_sat: int        # fee + client_balance_sat (currently hardcoded to 0, so == fee_total_sat)
     channel_expiry_blocks: int
     onchain_address: str        # where we pay (the on-chain payment path)
     bolt11_invoice: str         # alternate LN payment path; we don't use it today

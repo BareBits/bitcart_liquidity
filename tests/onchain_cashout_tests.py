@@ -304,8 +304,7 @@ def test_pending_activity_electrum_funded(event_loop):
 
 
 def test_pending_activity_electrum_coop_closing_blocks(event_loop):
-    """Electrum CLOSING + LightningChannel row marking it cooperative
-    -> block."""
+    """Electrum CLOSING + LightningChannel row whose `cooperative_close_requested` is set → block. A coop close is in flight; force closes (no such row) do NOT block."""
     api = FakeBitcartAPI()
     api.add_wallet("w1", currency="btc", balance=1.0)
     cp = "aabbcc:0"
@@ -451,14 +450,7 @@ def test_should_not_prefer_when_onchain_disabled(monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_onchain_cashout_via_lnd_send_coins(lnd_pair, event_loop, monkeypatch):
-    """End-to-end: configure a CASHOUT_ONCHAIN address pointing at LND-B
-    (so it's reachable on regtest), invoke do_onchain_cashouts against
-    LND-A, mine confirmations, and verify:
-      - LND-B sees the funds
-      - The outgoing tx on LND-A's side carries CASHOUT_REASON as its
-        on-chain label (proves LND's native SendCoinsRequest.label
-        persists through GetTransactions for real)
-    """
+    """The outgoing tx on LND-A's side carries label="lnhelper_cashout" (== config.CASHOUT_REASON) — proves LND's native SendCoinsRequest.label persists through GetTransactions for real."""
     from lnd_proto import lightning_pb2 as lnd_pb2
 
     dest_addr = event_loop.run_until_complete(lnd_pair.b.new_address())

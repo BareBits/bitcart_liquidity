@@ -35,7 +35,7 @@ You can run this either as a **standalone script** (existing path — talks to B
 ### Option A — Standalone (external script)
 
 1. `git clone` this repository onto the server.
-2. Provide config either via `user_config.py` (copy `config.py` as the starting template) or via environment variables — env wins over both files. At minimum set `CASHOUT_LIGHTNING_ADDRESS` and `AUTH_TOKEN`. Get your auth token from Bitcart at User Profile → API keys.
+2. Provide config either via `user_config.py` (copy `config.py` as the starting template) or via environment variables — env wins over both files. **Env vars require a `LIQUIDITYHELPER_` prefix** (`LIQUIDITYHELPER_CASHOUT_LIGHTNING_ADDRESS=…`, `LIQUIDITYHELPER_AUTH_TOKEN=…`). The prefix avoids collisions with unrelated env vars in the operator's environment; bare names are ignored with a stderr warning. At minimum set `LIQUIDITYHELPER_CASHOUT_LIGHTNING_ADDRESS` and `LIQUIDITYHELPER_AUTH_TOKEN`. Get your auth token from Bitcart at User Profile → API keys.
 3. `pip install -r requirements.txt`
 4. `python3 liquidityhelper.py`
 

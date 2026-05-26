@@ -44,8 +44,9 @@ import inspect
 import os
 import re
 import sys
+import typing
 from collections import OrderedDict
-from typing import Optional
+from typing import Any, Optional
 
 # Make the engine's config.py importable as a top-level `config` module
 # regardless of load order. Without this, when bitcart loads the plugin
@@ -86,12 +87,21 @@ _ASSIGNMENT_RE = re.compile(
 
 @dataclasses.dataclass(frozen=True)
 class SettingDoc:
-    """Documentation extracted from config.py for one setting."""
+    """Documentation extracted from config.py for one setting.
+
+    `type_hint` and `default_value` are populated only when the doc is
+    built via `parse_config_module()` (which actually imports config.py
+    to read the live attribute values). Source-only callers (e.g.
+    `parse_config_source(open(...).read())` from unit tests) get None
+    for both — they're parsing prose, not introspecting the module.
+    """
 
     name: str
     description: str   # Possibly empty if no comment block precedes it.
     group: Optional[str]
     line: int          # Line number in config.py (1-based) of the assignment.
+    type_hint: Any = None      # `int`, `Optional[str]`, `List[str]`, etc.
+    default_value: Any = None  # The value config.py exposes after env overrides.
 
 
 def parse_config_source(source: str) -> "OrderedDict[str, SettingDoc]":
@@ -186,12 +196,46 @@ def _normalize(comment_lines: list[str]) -> str:
 
 def parse_config_module() -> "OrderedDict[str, SettingDoc]":
     """Convenience: locate the engine's config.py via importlib, read
-    its source, and return the parsed map. Called once at schema
-    import time; result is cached by the caller."""
+    its source, parse description + group + line from the comments,
+    AND enrich each entry with the live `type_hint` + `default_value`
+    from the imported module. Result is the single source of truth
+    used by the settings-schema generator.
+
+    Why enrich live (not parse the assignment expression):
+      - typing.get_type_hints() resolves Optional[str], List[str], etc.
+        correctly without us having to re-implement type-string parsing.
+      - The live attribute value reflects env-var overrides applied in
+        config.py's bottom loop, so settings that an operator already
+        env-overrode show their effective default in the UI.
+    """
     config_mod = importlib.import_module("config")
     source_path = inspect.getsourcefile(config_mod)
     if not source_path:
         return OrderedDict()
     with open(source_path, "r", encoding="utf-8") as f:
         source = f.read()
-    return parse_config_source(source)
+    parsed = parse_config_source(source)
+    # Pull type hints + live values from the imported module.
+    # get_type_hints returns only NAMES that carry an explicit
+    # annotation; un-annotated assignments (CASHOUT_REASON, etc.) fall
+    # back to type(value).
+    try:
+        hints = typing.get_type_hints(config_mod)
+    except Exception:
+        hints = {}
+    enriched: "OrderedDict[str, SettingDoc]" = OrderedDict()
+    for name, info in parsed.items():
+        if not hasattr(config_mod, name):
+            enriched[name] = info
+            continue
+        value = getattr(config_mod, name)
+        # type(None) is useless as a Pydantic field type; fall back to
+        # the un-annotated case by leaving type_hint None so callers
+        # can decide.
+        type_hint = hints.get(name)
+        if type_hint is None:
+            type_hint = type(value) if value is not None else None
+        enriched[name] = dataclasses.replace(
+            info, type_hint=type_hint, default_value=value,
+        )
+    return enriched

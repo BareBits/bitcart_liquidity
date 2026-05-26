@@ -19,6 +19,7 @@ if __name__=='__main__':
                      "comment": "wobloz"},
                     {"uri": "02c953421bc7f07be6052920e46843d11e6d3ffc9986177c91f140d76c6ed3a3d4@132.232.253.4:9735",
                      "comment": "LNT"},
+                    # NOTE: duplicate URI with the wobloz entry above; dedup-by-URI in the loop below silently drops this one. Verify the correct vendor and remove the wrong duplicate.
                     {"uri": "03abf6f44c355dec0d5aa155bdbdd6e0c8fefe318eff402de65c6eb2e1be55dc3e@18.221.179.73:9735",
                      "comment": "OpenNode"},
                     {"uri": "0294ac3e099def03c12a37e30fe5364b1223fd60069869142ef96580c8439c2e0a@47.242.126.50:26658",

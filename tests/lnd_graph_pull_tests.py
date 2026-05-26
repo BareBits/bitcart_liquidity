@@ -47,7 +47,7 @@ GOOD_PUBKEY_UPPER = GOOD_PUBKEY.upper()
 
 
 # ---------------------------------------------------------------------------
-# 1. Pubkey parser
+# Pubkey parser
 # ---------------------------------------------------------------------------
 
 def test_parse_pubkey_accepts_canonical_form():
@@ -83,7 +83,7 @@ def test_parse_pubkey_rejects_zero_padded_64char():
 
 
 # ---------------------------------------------------------------------------
-# 2. IPv4 parser
+# IPv4 parser
 # ---------------------------------------------------------------------------
 
 def test_parse_ipv4_accepts_canonical_form():
@@ -123,7 +123,7 @@ def test_parse_ipv4_oversize_input_is_dropped_before_regex():
 
 
 # ---------------------------------------------------------------------------
-# 3. IPv6 parser
+# IPv6 parser
 # ---------------------------------------------------------------------------
 
 def test_parse_ipv6_accepts_bracketed_form():
@@ -153,7 +153,7 @@ def test_parse_ipv6_rejects_garbage(bad):
 
 
 # ---------------------------------------------------------------------------
-# 4. Tor v3 parser
+# Tor v3 parser
 # ---------------------------------------------------------------------------
 
 # Real-ish 56-char base32 v3 onion. (Exact bytes matter less than
@@ -193,7 +193,7 @@ def test_parse_tor_v2_explicitly_rejected():
 
 
 # ---------------------------------------------------------------------------
-# 5. extract_addresses — operator-controlled `network` field is ignored
+# extract_addresses — operator-controlled `network` field is ignored
 # ---------------------------------------------------------------------------
 
 def _na(network: str, addr: str):
@@ -253,7 +253,7 @@ def test_extract_addresses_handles_empty_addr_field():
 
 
 # ---------------------------------------------------------------------------
-# 6. Alias parser — control-char stripping
+# Alias parser — control-char stripping
 # ---------------------------------------------------------------------------
 
 def test_parse_alias_strips_control_chars():
@@ -274,7 +274,7 @@ def test_parse_alias_rejects_non_strings():
 
 
 # ---------------------------------------------------------------------------
-# 7. Numeric bounds
+# Numeric bounds
 # ---------------------------------------------------------------------------
 
 def test_sane_capacity_sat_accepts_realistic_values():
@@ -307,7 +307,7 @@ def test_sane_block_height_bounds():
 
 
 # ---------------------------------------------------------------------------
-# 8. Block-time estimation
+# Block-time estimation
 # ---------------------------------------------------------------------------
 
 def test_block_height_from_channel_id_decodes_correctly():
@@ -325,9 +325,7 @@ def test_block_height_from_channel_id_rejects_invalid():
 
 
 def test_estimate_block_time_close_to_truth_for_recent_block():
-    """Block 850_000 was mined approximately 2024-07-01. Our estimate
-    should land within a few weeks of that (the 600-second average
-    drifts over years but stays within a small window)."""
+    """Block 850_000 was mined approximately 2024-07-01. estimate_block_time uses an empirical 575s/block average (close to the 600s protocol target), which keeps the estimate within ~30 days of truth — well inside the test's 40-day tolerance."""
     est = lgp.estimate_block_time(850_000)
     actual_approx = datetime.datetime(2024, 7, 1)
     delta = abs((est - actual_approx).days)
@@ -340,7 +338,7 @@ def test_estimate_block_time_rejects_implausible_height():
 
 
 # ---------------------------------------------------------------------------
-# 9. Candidate filtering via iter_graph_candidates
+# Candidate filtering via iter_graph_candidates
 # ---------------------------------------------------------------------------
 
 def _build_graph(nodes, edges):
@@ -382,7 +380,7 @@ def test_iter_graph_candidates_filters_by_capacity_and_channel_count():
     pubkeys = [pk for pk, _ in candidates]
     assert _pk("aa") in pubkeys       # passes (1M cap)
     assert _pk("bb") not in pubkeys   # fails (550k < 900k cap threshold)
-    assert _pk("cc") not in pubkeys   # fails (only 2 edges but caps add up; let's check)
+    assert _pk("cc") not in pubkeys   # fails (capacity sum 550_000 < 900_000 threshold)
 
 
 def test_iter_graph_candidates_filters_stale_announcements():
@@ -428,7 +426,7 @@ def test_iter_graph_candidates_rejects_malformed_pubkeys():
 
 
 # ---------------------------------------------------------------------------
-# 10. upsert_lightning_node — insert + merge
+# upsert_lightning_node — insert + merge
 # ---------------------------------------------------------------------------
 
 def _node_info(*, capacity, num_channels, addresses, channels=None):
@@ -521,7 +519,7 @@ def test_upsert_rejects_too_young():
 
 
 # ---------------------------------------------------------------------------
-# 11. merge_lightning_node — the JSON-seed merge helper
+# merge_lightning_node — the JSON-seed merge helper
 # ---------------------------------------------------------------------------
 
 def test_merge_lightning_node_keeps_uptime_state_when_new_lacks_it():
@@ -566,7 +564,7 @@ def test_merge_lightning_node_chooses_max_for_counters():
 
 
 # ---------------------------------------------------------------------------
-# 12. refresh_lnd_node_database — gated on MANUAL_CHANNEL_CREATION_ENABLED
+# refresh_lnd_node_database — gated on MANUAL_CHANNEL_CREATION_ENABLED
 # ---------------------------------------------------------------------------
 #
 # When MANUAL_CHANNEL_CREATION_ENABLED is False (the default LSP mode),
@@ -682,7 +680,7 @@ def test_refresh_gate_logs_transition_on_mode_flip(monkeypatch, event_loop, capl
 
 
 # ---------------------------------------------------------------------------
-# 13. derive_median_outbound_fee_rate — outbound policy side-selection
+# derive_median_outbound_fee_rate — outbound policy side-selection
 # ---------------------------------------------------------------------------
 #
 # For each channel, the node we're examining is either node1 or node2.
@@ -807,7 +805,7 @@ def test_upsert_stores_median_fee_rate():
 
 
 # ---------------------------------------------------------------------------
-# 14. is_node_blacklisted — new HIGH_FEE_RATE / LOW_OUTBOUND_CAPACITY /
+# is_node_blacklisted — new HIGH_FEE_RATE / LOW_OUTBOUND_CAPACITY /
 #     UNKNOWN_FEE_RATE reasons
 # ---------------------------------------------------------------------------
 
@@ -890,18 +888,12 @@ def test_blacklist_accepts_node_passing_all_checks():
 
 
 # ---------------------------------------------------------------------------
-# 15. pick_best_channel_partners — bucket sort
+# pick_best_channel_partners — bucket sort
 # ---------------------------------------------------------------------------
 
 @pytest.fixture(autouse=True)
 def _ensure_recent_gossip_pull_recorded():
-    """`pick_best_channel_partners` now refuses to return candidates
-    unless the last successful gossip pull was within
-    GOSSIP_MAX_STALENESS_DAYS. The bucket-sort tests in this section
-    are about ordering logic, not gossip-readiness gating — so we
-    stamp a recent successful pull before each test and clean up
-    after. Tests that specifically exercise the gossip-readiness gate
-    live in tests/gossip_readiness_tests.py and set their own state."""
+    """Module-wide autouse: every test that doesn't specifically exercise the gossip-readiness gate gets a fresh, recent `_GOSSIP_LAST_PULL_AT` stamp so it can call functions that consult it (e.g. pick_best_channel_partners). Gossip-readiness gate tests live in tests/gossip_readiness_tests.py."""
     from database import SimpleVariable
     SimpleVariable.replace(
         name=liquidityhelper._GOSSIP_LAST_PULL_AT_KEY,
@@ -943,12 +935,7 @@ def _create_node_row(
 
 
 def test_pick_best_orders_across_fee_buckets(event_loop):
-    """Cross-bucket ordering: cheaper fee bucket wins regardless of
-    reach. A 700-ppm/reach-3000 node loses to an 800-ppm/reach-5000
-    node? No — 700 is a cheaper bucket (bucket 0) than 800 (bucket 0)
-    — wait, both 700 and 800 fall in bucket 0 (700//1000 = 0, 800//1000
-    = 0). Use clearer values: 700 ppm vs 1500 ppm = bucket 0 vs bucket 1.
-    """
+    """Cross-bucket ordering: cheaper-bucket node wins even when its 2-hop reach is much lower. NODE_FEE_BUCKET_PPM defaults to 1000 (0.10% granularity), so 700 ppm → bucket 0 and 1500 ppm → bucket 1."""
     cheap_low_reach = _create_node_row(
         "a", age_days=3 * 365, fee_ppm=700, two_hop_reach=600,
     )   # bucket 0
@@ -1042,7 +1029,7 @@ def test_pick_best_excludes_under_two_years(monkeypatch, event_loop):
 
 
 # ---------------------------------------------------------------------------
-# 16. build_outbound_adjacency / compute_effective_degree / two_hop_reach
+# build_outbound_adjacency / compute_effective_degree / two_hop_reach
 # ---------------------------------------------------------------------------
 #
 # These three together define our "connectedness" view of the LN graph.
@@ -1192,18 +1179,16 @@ def test_two_hop_reach_does_not_count_through_disabled_directions():
         {"node1": b, "node2": c, "n1_disabled": True},  # B→C disabled
     )
     adj = lgp.build_outbound_adjacency(g)
-    # A → B (enabled). B → C is disabled, so C not reachable from A
-    # in 2 hops via that route. C→B is still enabled but that goes
-    # the wrong direction for OUR purpose (we're walking outbound).
+    # a→b is enabled; b→c is disabled, so c is unreachable in 2
+    # outbound hops from a. c→b is in the adjacency but we're walking
+    # from a, not from c — it never contributes. reach == 1 ({b}).
     reach = lgp.compute_two_hop_reach(adj, a)
     assert b in adj.get(a, set())
-    # Whether C is reached depends on c→b being walked in 1 hop FROM a,
-    # which requires a→c which doesn't exist. So reach == {B}.
     assert reach == 1
 
 
 # ---------------------------------------------------------------------------
-# 17. New blacklist reasons: UNKNOWN_CONNECTEDNESS, LOW_EFFECTIVE_DEGREE,
+# New blacklist reasons: UNKNOWN_CONNECTEDNESS, LOW_EFFECTIVE_DEGREE,
 #     LOW_TWO_HOP_REACH
 # ---------------------------------------------------------------------------
 
@@ -1243,7 +1228,7 @@ def test_blacklist_rejects_low_two_hop_reach(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# 17b. HTLC-limit gates — min_htlc + max_htlc_msat
+# HTLC-limit gates — min_htlc + max_htlc_msat
 # ---------------------------------------------------------------------------
 #
 # Peers that won't forward small HTLCs (high min_htlc) block our
@@ -1460,13 +1445,14 @@ def test_pick_best_excludes_blacklisted(event_loop):
 
 
 # ---------------------------------------------------------------------------
-# 18. audit_existing_peer — the post-open quality check
+# audit_existing_peer — the post-open quality check
 # ---------------------------------------------------------------------------
 #
-# Differs from is_node_blacklisted: only the 5 degradation criteria
+# Differs from is_node_blacklisted: checks only degradation-style criteria
 # (HIGH_FEE_RATE, LOW_EFFECTIVE_DEGREE, LOW_TWO_HOP_REACH, LOW_CAPACITY,
-# LOW_OUTBOUND_CAPACITY) are checked. Returns ALL matching reasons so
-# the close log can name every one.
+# LOW_OUTBOUND_CAPACITY, HIGH_MIN_HTLC, LOW_MAX_HTLC, plus uptime signals
+# LONG_OUTAGE / HIGH_FAILURE_RATIO). Pre-open-only reasons (NO_IPV4,
+# NOT_OLD_ENOUGH, REMOTE_CLOSE_COUNT, MIN_CHANNEL_COUNT) are dropped.
 
 from node_database import audit_existing_peer
 
@@ -1581,7 +1567,7 @@ def test_audit_does_not_check_ipv4():
 
 
 # ---------------------------------------------------------------------------
-# 19. AUDIT_BLACKLISTED in is_node_blacklisted
+# AUDIT_BLACKLISTED in is_node_blacklisted
 # ---------------------------------------------------------------------------
 
 def test_audit_blacklist_in_future_rejects_node():
@@ -1618,7 +1604,7 @@ def test_audit_blacklist_takes_precedence_over_other_reasons():
 
 
 # ---------------------------------------------------------------------------
-# 20. audit_existing_channels — hysteresis, rate limit, close path
+# audit_existing_channels — hysteresis, rate limit, close path
 # ---------------------------------------------------------------------------
 
 import logging as _logging
@@ -1864,7 +1850,7 @@ def test_audit_disabled_does_nothing(monkeypatch, event_loop):
 
 
 # ---------------------------------------------------------------------------
-# 21. remote_close_count tracking — INITIATOR_REMOTE filter +
+# remote_close_count tracking — INITIATOR_REMOTE filter +
 #     cross-wallet aggregation
 # ---------------------------------------------------------------------------
 #
@@ -2043,7 +2029,7 @@ def test_update_channel_closings_skips_electrum_only_deployment(
 
 
 # ---------------------------------------------------------------------------
-# 22. Coop-close retry loop with 10-day force-close escalation
+# Coop-close retry loop with 10-day force-close escalation
 # ---------------------------------------------------------------------------
 #
 # Tests cover the state machine in process_pending_closes:
@@ -2123,8 +2109,7 @@ def test_pending_closes_clears_when_channel_disappeared(monkeypatch, event_loop)
 def test_pending_closes_no_op_when_channel_in_pending_close(
     monkeypatch, event_loop,
 ):
-    """Channel state is CLOSING/PENDING_CLOSE → close tx already in
-    flight. Don't retry, don't escalate, just wait."""
+    """Channel state is CLOSING → close tx already in flight. Don't retry, don't escalate, just wait."""
     monkeypatch.setattr(liquidityhelper, "CHANNEL_COOP_CLOSE_RETRY_ENABLED", True)
     liquidityhelper._last_decision_state.clear()
     cp = "pending:0"
@@ -2374,7 +2359,7 @@ def test_pending_closes_disabled_does_nothing(monkeypatch, event_loop):
 
 
 # ---------------------------------------------------------------------------
-# 23. attempt_cooperative_close / attempt_force_close: row tracking
+# attempt_cooperative_close / attempt_force_close: row tracking
 # ---------------------------------------------------------------------------
 
 def test_attempt_coop_creates_tracking_row(monkeypatch, event_loop):
@@ -2455,7 +2440,7 @@ def test_attempt_force_sets_force_close_initiated_at(monkeypatch, event_loop):
 
 
 # ---------------------------------------------------------------------------
-# 24b. Topup goal: LSP-aware single-channel cost vs manual full-size math
+# Topup goal: LSP-aware single-channel cost vs manual full-size math
 # ---------------------------------------------------------------------------
 #
 # topup_goal_amount used to ALWAYS return the manual-channel-creation
@@ -2561,7 +2546,7 @@ def test_topup_goal_manual_mode_uses_full_channel_creation_math(monkeypatch, eve
 
 
 # ---------------------------------------------------------------------------
-# 25. Uptime: 6-month rolling window + selection/audit integration
+# Uptime: 6-month rolling window + selection/audit integration
 # ---------------------------------------------------------------------------
 #
 # Two gates derived from the rolling counters:
@@ -2698,7 +2683,7 @@ def test_uptime_signals_in_audit_existing_peer(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# 26. Rolling window reset in find_offline_channels
+# Rolling window reset in find_offline_channels
 # ---------------------------------------------------------------------------
 
 def _stub_lnd_list_channels(monkeypatch, channels: list):
@@ -2829,7 +2814,7 @@ def test_find_offline_channels_no_longer_closes_inline(
 
 
 # ---------------------------------------------------------------------------
-# 24a. FORCE_CLOSE_BLACKLISTED — 365-day peer blacklist after force close
+# FORCE_CLOSE_BLACKLISTED — 365-day peer blacklist after force close
 # ---------------------------------------------------------------------------
 #
 # Whenever process_pending_closes escalates a stuck coop close to a
@@ -3013,7 +2998,7 @@ def test_pending_closes_no_blacklist_when_channel_lacks_pubkey(
 
 
 # ---------------------------------------------------------------------------
-# 24. Electrum guards on manual channel management
+# Electrum guards on manual channel management
 # ---------------------------------------------------------------------------
 #
 # Manual channel creation depends on peer-selection metrics derived from
@@ -3111,9 +3096,9 @@ def test_decide_onchain_to_ln_skips_electrum_wallet(monkeypatch, event_loop):
 
 
 def test_lsp_skip_on_electrum_already_handled():
-    """Pre-existing behavior: the LSP request path in liquidity_check
-    already gates on currency==btclnd at line 2348ish. This test
-    pins the existing behavior so a future refactor doesn't lose it.
+    """The LSP request path in liquidity_check already gates on
+    currency==btclnd; this test pins the existing behavior so a future
+    refactor doesn't lose it.
     We exercise the small log_decision wrapper that fires when
     LSP is skipped for non-LND — exact key match."""
     # The actual gating path is reached via liquidity_check + full

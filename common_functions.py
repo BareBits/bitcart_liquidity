@@ -42,8 +42,7 @@ def onchain_reserves_to_keep_for_channel(sats:int)->int:
     Given channel of a certain size (including reserves within the channel), keep this many addl sats in on-chain wallet. Hardcoding this as
     11,000 sats for now. This is what I found was the approximate actual number when testing w Electrum wallet on Mutinynet.
     If you pick a lower number, Electrum complains that you don't have enough fees.
-    is dynamically calculated.
-    Unsure if this is a flat number or calculated based on the number of channels you have
+    Unsure whether Electrum's true requirement scales with channel count or fee environment; flat 11k has been adequate in 1 sat/vbyte testing.
     """
     # I tested every 1,000 sats between 10k and 15k. 10,001 was not sufficient, 10,500 was, leaving a bit for flex in
     # case this is based on fee environment. Testing was in a 1 sat/vbyte environment
@@ -92,8 +91,9 @@ def target_from_channel_sizes(channels:List[int],channel_buffer:int)->int:
     # find electrums required reserve
     electrum_reserve=0
     for intended_channel_size in channels:
-        dust_limit_sat = 20001  # don't know what this actually is
-        electrum_reserve += max(intended_channel_size // 100, dust_limit_sat)
+        # Electrum appears to enforce a minimum reserve regardless of channel size; 20001 is an empirical floor.
+        electrum_reserve_floor_sat = 20001
+        electrum_reserve += max(intended_channel_size // 100, electrum_reserve_floor_sat)
 
     # return the highest of the two reserve estimates plus channel amounts themselves
     return sum(channels)+(max(own_reserve,electrum_reserve))

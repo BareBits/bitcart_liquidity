@@ -1,12 +1,4 @@
-"""
-Pytest fixtures for network_tests.py.
-
-Provides `lnd_pair`: a session-scoped fixture that brings up:
-  - bitcoind regtest (peerblockfilters=1, blockfilterindex=1)
-  - LND Node A and Node B in neutrino mode, peered with bitcoind
-  - 2 BTC funded into each LND wallet
-  - 0.2 BTC channels in both directions (A->B and B->A)
-  - 6 confirmation blocks mined
+"""Pytest fixtures for the integration test suite. Provides `lnd_pair`, `lnd_pair_no_channels`, `lnd_electrum_pair`, and `loop_rig` — each per-test fixture brings up its own subprocess topology (see fixture bodies for details).
 
 All binaries auto-downloaded into ./tests/_bin/ on first run and cached there.
 All runtime state lives under ./tests/_data/ and is wiped at session start.
@@ -1006,6 +998,77 @@ async def _teardown_test_env_async(pair: LndPair) -> None:
     pair.bitcoind.stop()
 
 
+@dataclass
+class LndPairNoChannels:
+    """Minimal pair for tests that need to drive channel-open themselves
+    (e.g. OWN_LIGHTNING_NODES direct-channel push tests). Same shape as
+    LndPair minus the auto-opened channels."""
+    bitcoind: BitcoindNode
+    a: LndNode
+    b: LndNode
+
+
+async def _setup_lnd_pair_no_channels_async(
+    data_dir: Path, fee_url: str,
+) -> LndPairNoChannels:
+    """bitcoind + LND-A + LND-B, both funded 2 BTC, peered, but NO
+    channels opened. Used by tests that drive channel creation
+    themselves and need to assert on the resulting channel's state
+    (e.g. the OWN_LIGHTNING_NODES direct-channel-push cashout, where
+    the push_sat behavior is what's under test)."""
+    btc = BitcoindNode(bin_dir=BIN_DIR, data_dir=data_dir / "bitcoind")
+    btc.start()
+    btc.ensure_miner_wallet()
+    btc.mine_to_self(101)
+
+    a = LndNode(
+        name="A", bin_dir=BIN_DIR, lnddir=data_dir / "lnd-a",
+        bitcoind_p2p_port=btc.p2p_port, fee_url=fee_url,
+    )
+    a.start()
+    await a.init_wallet()
+    await a.open_lightning()
+
+    b = LndNode(
+        name="B", bin_dir=BIN_DIR, lnddir=data_dir / "lnd-b",
+        bitcoind_p2p_port=btc.p2p_port, fee_url=fee_url,
+    )
+    b.start()
+    await b.init_wallet()
+    await b.open_lightning()
+
+    await a.wait_synced()
+    await b.wait_synced()
+
+    btc.send(await a.new_address(), 2.0)
+    btc.send(await b.new_address(), 2.0)
+    btc.mine_to_self(6)
+    for n in (a, b):
+        for _ in range(60):
+            if await n.wallet_balance_sats() >= int(2 * 100_000_000 * 0.99):
+                break
+            await asyncio.sleep(1.0)
+        else:
+            raise RuntimeError(f"lnd {n.name} never saw confirmed funds")
+
+    # Peer A↔B so subsequent OpenChannel calls don't have to wait on
+    # connection establishment. Channel opens are driven by individual
+    # tests after this point.
+    await a.connect_peer(b.identity_pubkey, "127.0.0.1", b.p2p_port)
+
+    return LndPairNoChannels(bitcoind=btc, a=a, b=b)
+
+
+async def _teardown_lnd_pair_no_channels_async(pair: LndPairNoChannels) -> None:
+    with contextlib.suppress(Exception):
+        await pair.a.stop_grpc()
+    with contextlib.suppress(Exception):
+        await pair.b.stop_grpc()
+    pair.a.stop()
+    pair.b.stop()
+    pair.bitcoind.stop()
+
+
 # ----- session-scoped helpers (one-time setup, shared by every test) -------
 
 @pytest.fixture(scope="session")
@@ -1031,8 +1094,7 @@ def _wipe_data_dir():
 
 @pytest.fixture(scope="session")
 def _binaries():
-    """Ensure bitcoind + lnd + lncli are downloaded to tests/_bin/ (cached
-    across sessions)."""
+    """Ensure bitcoind + lnd + lncli + Fulcrum are downloaded to tests/_bin/ (cached across sessions)."""
     return _ensure_binaries()
 
 
@@ -1224,6 +1286,31 @@ def lnd_electrum_pair(request, event_loop, _binaries, _fee_url, _wipe_data_dir) 
 
 
 @pytest.fixture(scope="function")
+def lnd_pair_no_channels(
+    request, event_loop, _binaries, _fee_url, _wipe_data_dir,
+) -> LndPairNoChannels:
+    """Per-test bitcoind + 2 LNDs (A funded as bitcart's wallet, B as
+    the 'clientnode' / OWN_LIGHTNING_NODES peer), funded 2 BTC each
+    and pre-peered, but NO channels opened. Tests open channels
+    themselves (typically via the function under test) so they can
+    assert on the channel that gets created.
+
+    Same data-dir layout + cleanup pattern as `lnd_pair`."""
+    short = uuid.uuid4().hex[:8]
+    data_dir = DATA_DIR / f"{request.node.name}-{short}"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    pair = event_loop.run_until_complete(
+        _setup_lnd_pair_no_channels_async(data_dir, _fee_url)
+    )
+    try:
+        yield pair
+    finally:
+        event_loop.run_until_complete(
+            _teardown_lnd_pair_no_channels_async(pair)
+        )
+
+
+@pytest.fixture(scope="function")
 def lnd_pair(request, event_loop, _binaries, _fee_url, _wipe_data_dir) -> LndPair:
     """Full per-test setup: bitcoind + 2 LNDs + funding + 0.2 BTC channels
     both ways + 6 confirmation blocks. Fresh ports + a unique data dir per
@@ -1315,7 +1402,7 @@ class LoopRig:
     to A.
 
     Tests interact with this via:
-      - `rig.a.wallet_dict_for_helper()`-style helpers (see fixture body)
+      - Inline wallet dicts (id == `test-wallet-<lnd-name>`); see autoloop_tests.py for the canonical pattern.
       - The pre-constructed `swap_providers.LoopdManager` accessible as
         `rig.loopd_manager` — it has the LoopdInstance for A pre-registered.
     """

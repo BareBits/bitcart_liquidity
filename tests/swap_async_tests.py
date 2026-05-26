@@ -190,5 +190,5 @@ def test_stop_all_awaits_each_instance(tmp_path, event_loop):
     manager.register_existing(inst2)
 
     event_loop.run_until_complete(manager.stop_all())
-    assert set(stopped) == {"test", "test"}   # both stopped (wallet_id is same)
+    assert stopped == ["test", "test"]   # both stop()s were awaited
     assert manager._instances == {}

@@ -10,6 +10,7 @@ Covers:
   - `classes.py` logs now inherit the main logger's handlers (no longer
     an orphan tree).
   - Heartbeat fires every N ticks and not in between.
+  - See async_logging_tests.py for QueueListener-thread routing.
 """
 
 from __future__ import annotations

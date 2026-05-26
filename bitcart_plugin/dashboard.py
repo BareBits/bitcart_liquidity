@@ -7,8 +7,13 @@ what `calculate_fees` is acting on.
 
 Data sources:
   - Revenue / fee breakdown : `new_calc_invoice_stats(api, since_date)`
-                              (already filters by `wallet.name == "liquidityhelper"`,
-                              already walks on-chain + LN histories.)
+                              (counts revenue from ALL wallets but tags
+                              non-`liquidityhelper` wallets via the
+                              ineligible_revenue_*_not_liquidityhelper_*
+                              fields. This module's `compute_dashboard`
+                              applies the wallet-name filter itself before
+                              surfacing per-store stats. Walks on-chain +
+                              LN histories.)
   - USD conversion          : `api.get_btc_usd_rate()`  (Bitcart's
                               /cryptos/rate endpoint; null on failure.)
   - Inbound liquidity       : For btclnd wallets, direct LND ListChannels
@@ -158,6 +163,22 @@ class ChannelClosureRow(BaseModel):
     force_close_initiated: bool      # True if force_close_initiated_at is set
 
 
+class HealthWarning(BaseModel):
+    """One config-sanity or runtime-health warning shown on the
+    dashboard. Each warning has a stable `id` that doubles as the
+    log_decision key, so the same condition can be cross-referenced
+    between the dashboard banner and decisions.log.
+
+    Severity: "HIGH" = funds can be stuck / payments will silently fail;
+    "MEDIUM" = a quieter footgun the operator should know about.
+    """
+    id: str           # stable, kebab-snake_case, used as log_decision key
+    severity: str     # "HIGH" or "MEDIUM"
+    category: str     # "cashout" | "channel" | "reserves" | "loop" | "smtp" | "ln_health"
+    title: str        # short label for the dashboard banner
+    message: str      # longer explanation including offending values
+
+
 class DashboardResponse(BaseModel):
     """Top-level shape returned by GET /dashboard."""
     range: str
@@ -166,6 +187,7 @@ class DashboardResponse(BaseModel):
     stores: List[StoreDashboard]
     summary: Optional[SummaryDashboard]    # None when only one store
     shared_wallet_warning: bool            # True if ≥2 stores share a wallet
+    health_warnings: List[HealthWarning]   # config-sanity + runtime checks
     # Recent activity tables — capped at 100 rows so the response stays
     # small. The UI paginates 10/page client-side. Sorted newest-first.
     recent_fee_payments: List[PaymentRow]
@@ -196,8 +218,9 @@ def _cache_set(range_key: str, value: DashboardResponse) -> None:
 
 
 def invalidate_cache() -> None:
-    """Test-hook + manual-refresh entry point. Called by the UI's
-    refresh button (if we add one) and by tests between assertions."""
+    """Test-hook entry point. The dashboard endpoint's
+    force_refresh=true query param skips (but does not clear) this
+    cache; tests call this between assertions to drop everything."""
     _cache.clear()
 
 
@@ -364,6 +387,7 @@ async def _gather_payment_rows(
     api: Any,
     *,
     labels_to_type: Dict[str, str],
+    method_overrides: Optional[Dict[str, str]] = None,
     usd_rate: Optional[float],
 ) -> List[PaymentRow]:
     """Walk every liquidityhelper wallet's on-chain + LN history and
@@ -374,10 +398,24 @@ async def _gather_payment_rows(
     to the user-visible category (e.g. "developer"). Caller decides
     what set of labels to surface — fee payments table uses dev+hosting,
     cashouts table uses CASHOUT_REASON only.
+
+    `method_overrides`: optional map from the same label key to a
+    method string that overrides the default ("onchain" for on-chain
+    txs / "lightning" for LN payments). Used by the cashouts table to
+    surface CASHOUT_DIRECT_CHANNEL_REASON channel-open txs with
+    method="direct_channel" so the UI can render them distinctly from
+    regular on-chain cashout sweeps.
+
+    Suffix handling: some labels carry an inline `:<suffix>` payload
+    (the direct-channel label embeds the destination peer's pubkey
+    there). We strip the suffix before looking up the label in
+    `labels_to_type`, and surface the suffix as the destination column
+    when present.
     """
     # Lazy import so this module remains importable without engine.
     from ..liquidityhelper import list_onchain_history, list_ln_payments_with_labels
 
+    method_overrides = method_overrides or {}
     rows: List[PaymentRow] = []
     wallets = await api.get_wallets() or []
     for wallet in wallets:
@@ -393,19 +431,29 @@ async def _gather_payment_rows(
             )
             onchain = []
         for tx in onchain:
-            label = (tx.get("label") or "").strip()
-            ftype = labels_to_type.get(label)
+            raw_label = (tx.get("label") or "").strip()
+            # `<base>:<suffix>` labels carry an inline payload (the
+            # direct-channel cashout embeds the peer pubkey there).
+            # Split for lookup; preserve suffix for the destination column.
+            base_label, _, suffix = raw_label.partition(":")
+            ftype = labels_to_type.get(base_label)
             if ftype is None:
                 continue
             if tx.get("incoming"):
                 continue   # only outgoing payments count
+            method = method_overrides.get(base_label, "onchain")
+            destination = (
+                suffix
+                or tx.get("dest_address")
+                or _destination_for_label(base_label)
+            )
             rows.append(_payment_row(
                 timestamp=int(tx.get("timestamp") or 0),
                 amount_sats=int(abs(float(tx.get("amount_sat") or 0))),
                 fee_sats=int(abs(float(tx.get("fee_sat") or 0))),
                 fee_type=ftype,
-                method="onchain",
-                destination=tx.get("dest_address") or _destination_for_label(label),
+                method=method,
+                destination=destination,
                 txid=tx.get("txid") or "",
                 usd_rate=usd_rate,
             ))
@@ -419,20 +467,27 @@ async def _gather_payment_rows(
             )
             ln_rows = []
         for ln in ln_rows:
-            label = (ln.get("label") or "").strip()
-            ftype = labels_to_type.get(label)
+            raw_label = (ln.get("label") or "").strip()
+            # `<base>:<suffix>` labels carry an inline payload. For LN
+            # payments the suffix carries the destination payload
+            # (e.g. peer pubkey on CASHOUT_DIRECT_CHANNEL_REASON rows).
+            # _destination_for_label has no entry for that label, so
+            # suffix is the only source of a destination for those rows.
+            base_label, _, suffix = raw_label.partition(":")
+            ftype = labels_to_type.get(base_label)
             if ftype is None:
                 continue
             amount_msat = int(ln.get("amount_msat") or 0)
             if amount_msat >= 0:
                 continue   # incoming
+            destination = suffix or _destination_for_label(base_label)
             rows.append(_payment_row(
                 timestamp=int(ln.get("timestamp") or 0),
                 amount_sats=abs(amount_msat) // 1000,
                 fee_sats=int(ln.get("fee_msat") or 0) // 1000,
                 fee_type=ftype,
                 method="lightning",
-                destination=_destination_for_label(label),
+                destination=destination,
                 payment_hash=ln.get("payment_hash") or "",
                 usd_rate=usd_rate,
             ))
@@ -461,11 +516,30 @@ async def list_recent_fee_payments(
 async def list_recent_cashouts(
     api: Any, usd_rate: Optional[float],
 ) -> List[PaymentRow]:
-    """Recent cashout payments. Sorted newest first. Capped at 100."""
+    """Recent cashout payments. Sorted newest first. Capped at 100.
+
+    Surfaces two label families:
+      - CASHOUT_REASON ("lnhelper_cashout"): the original cashout
+        rails (LN payment to a Lightning Address or on-chain payment
+        to a Bitcoin address).
+      - CASHOUT_DIRECT_CHANNEL_REASON ("lnhelper_cashout_direct"):
+        PREFER_LN_CASHOUT direct-channel-push cashouts. These are
+        channel-open txs with push_sat set so the cashout amount lands
+        on the operator's own LN node in one atomic op. Method is
+        marked "direct_channel" so the dashboard renders them
+        distinctly from regular on-chain cashouts; the peer pubkey
+        comes from the label's `:<suffix>` payload.
+    """
     import config as _cfg
     return await _gather_payment_rows(
         api,
-        labels_to_type={_cfg.CASHOUT_REASON: "cashout"},
+        labels_to_type={
+            _cfg.CASHOUT_REASON: "cashout",
+            _cfg.CASHOUT_DIRECT_CHANNEL_REASON: "cashout",
+        },
+        method_overrides={
+            _cfg.CASHOUT_DIRECT_CHANNEL_REASON: "direct_channel",
+        },
         usd_rate=usd_rate,
     )
 
@@ -568,9 +642,11 @@ def _add_breakdowns(a: FeeBreakdown, b: FeeBreakdown) -> FeeBreakdown:
 
 
 async def _count_paid_invoices(api: Any, store_id: str, since_date: Optional[datetime.datetime]) -> int:
-    """Count of paid invoices for the store. Walks the same list
-    new_calc_invoice_stats walks but only counts — much faster than
-    re-doing the fee math. Applies the same since_date filter."""
+    """Count of paid invoices for the store. Issues the same
+    `get_invoices(store_id=…)` call new_calc_invoice_stats issues
+    (independently — there's no caching/sharing between them), but
+    only counts the paid ones, which is cheaper than re-running the
+    fee math. Applies the same since_date filter."""
     try:
         invoices = await api.get_invoices(store_id=store_id)
     except Exception as e:
@@ -652,9 +728,11 @@ async def compute_dashboard(api: Any, range_key: str) -> DashboardResponse:
     shared_wallet_warning = any(len(ss) > 1 for ss in wallet_to_stores.values())
 
     # Build per-store payloads — only for stores using a wallet named
-    # "liquidityhelper". The same exclusion applied inside
-    # new_calc_invoice_stats's revenue eligibility math; we now apply
-    # it to the dashboard surface too.
+    # "liquidityhelper". This is the SAME wallet-name attribution
+    # new_calc_invoice_stats uses to mark non-`liquidityhelper`
+    # revenue as ineligible-for-fees, applied here as a hard filter
+    # so the dashboard only surfaces stores the engine treats as
+    # billable.
     stores_out: List[StoreDashboard] = []
     summary_breakdown = FeeBreakdown(
         onchain_payouts=0, onchain_fee_payments=0, onchain_referral_payments=0,
@@ -787,6 +865,18 @@ async def compute_dashboard(api: Any, range_key: str) -> DashboardResponse:
     recent_cashouts = await list_recent_cashouts(api, btc_usd_rate)
     recent_channel_closures = list_recent_channel_closures()
 
+    # Health audit: pure-config checks (cashout/channel/reserve/loop
+    # config sanity) + one dynamic check (LN cashouts stale while LN
+    # balance exists). Emitted to decisions.log via log_decision inside
+    # the audit fn, so the dashboard and the log stream agree.
+    from ..liquidityhelper import collect_health_warnings
+    try:
+        health_warnings_raw = await collect_health_warnings(api)
+    except Exception as e:
+        logger.warning(f"collect_health_warnings raised: {e}")
+        health_warnings_raw = []
+    health_warnings = [HealthWarning(**w) for w in health_warnings_raw]
+
     return DashboardResponse(
         range=range_key,
         btc_usd_rate=btc_usd_rate,
@@ -794,6 +884,7 @@ async def compute_dashboard(api: Any, range_key: str) -> DashboardResponse:
         stores=stores_out,
         summary=summary,
         shared_wallet_warning=shared_wallet_warning,
+        health_warnings=health_warnings,
         recent_fee_payments=recent_fee_payments,
         recent_cashouts=recent_cashouts,
         recent_channel_closures=recent_channel_closures,

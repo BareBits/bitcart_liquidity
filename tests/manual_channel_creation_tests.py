@@ -157,7 +157,7 @@ def test_decide_onchain_to_ln_runs_when_enabled(monkeypatch, event_loop):
 
 
 # ---------------------------------------------------------------------------
-# liquidity_check skips channel-open + Magma when disabled
+# liquidity_check skips channel-open when disabled
 # ---------------------------------------------------------------------------
 
 def test_liquidity_check_skips_open_when_disabled(monkeypatch, event_loop):

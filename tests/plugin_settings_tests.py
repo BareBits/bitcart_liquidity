@@ -24,7 +24,9 @@ import sys
 import pytest
 
 # The schema + bridge are independent of bitcart and importable here.
-from bitcart_plugin.settings_schema import PluginSettings, SETTING_NAMES
+from bitcart_plugin.settings_schema import (
+    PluginSettings, SETTING_NAMES, _EXCLUDED, _OVERRIDES,
+)
 from bitcart_plugin.settings_bridge import apply_settings, merge_with_config
 
 
@@ -76,6 +78,50 @@ def test_schema_does_not_expose_internal_constants():
     }
     overlap = forbidden & SETTING_NAMES
     assert not overlap, f"Internal constants leaked into schema: {overlap}"
+
+
+def test_excluded_and_override_dicts_reference_real_config_names():
+    """Drift detector for the schema-generator curation dicts.
+
+    `_EXCLUDED` and `_OVERRIDES` in settings_schema.py are key-by-name
+    against settings declared in config.py. If config.py renames or
+    deletes a setting, a stale entry in either dict silently no-ops
+    instead of failing loudly — the supposedly-hidden setting could
+    quietly start appearing in the UI, or an override that was
+    customizing a deleted setting just stops doing anything.
+
+    This test asserts every key in both dicts resolves to a real
+    attribute on the live config module. Catches stale entries the
+    moment they happen.
+    """
+    import config
+
+    stale: list[str] = []
+    for name in _EXCLUDED:
+        if not hasattr(config, name):
+            stale.append(f"  _EXCLUDED[{name!r}]: no longer in config.py")
+    for name in _OVERRIDES:
+        if not hasattr(config, name):
+            stale.append(f"  _OVERRIDES[{name!r}]: no longer in config.py")
+
+    assert not stale, (
+        "Stale entries found in settings_schema curation dicts — "
+        "either remove the entry or restore the setting in config.py:\n"
+        + "\n".join(stale)
+    )
+
+
+def test_excluded_and_override_dicts_do_not_overlap():
+    """A name should appear in EITHER _EXCLUDED or _OVERRIDES, not both
+    — _EXCLUDED means "don't generate this field at all", so an entry
+    in _OVERRIDES for the same name is silently dead code (the
+    overridden field never gets built). Catch the conflict early
+    rather than letting the override quietly do nothing."""
+    overlap = set(_EXCLUDED) & set(_OVERRIDES)
+    assert not overlap, (
+        f"These names are in BOTH _EXCLUDED and _OVERRIDES — pick one. "
+        f"_OVERRIDES entries for excluded fields never take effect: {overlap}"
+    )
 
 
 # ---------------------------------------------------------------------------
