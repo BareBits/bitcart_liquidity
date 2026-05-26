@@ -597,15 +597,39 @@ async def _lnd_channel_tx_hashes(api: "BitcartAPI", wallet_id: str) -> Tuple[set
 
 
 async def _lnd_list_onchain_history(api: "BitcartAPI", wallet_id: str) -> List[Dict[str, Any]]:
-    """Normalize Lightning.GetTransactions into Electrum's onchain_history shape.
+    """Normalize Lightning.GetTransactions into the engine's canonical
+    on-chain history shape.
 
-    Each row matches what is_ln_open_transaction / is_ln_close_transaction
-    and new_calc_invoice_stats already consume from Electrum:
-      - txid, incoming, fee_sat, label
+    Important: the engine canonical shape is NOT the same as real
+    Electrum's `onchain_history` output (despite older comments here
+    that said it was). Real Electrum returns rows with `bc_value` as a
+    BTC-decimal STRING ("0.00500000", "2."), `height`, `confirmations`,
+    and no dest_address. The engine's canonical shape (chosen because
+    LND's proto natively gives integer sats, and integer math is
+    unambiguous for accounting) uses:
 
-    For channel-funding txs we inject label="OPEN CHANNEL"; for closing txs
-    label="CLOSE CHANNEL". This keeps the existing label-string-based logic
-    in is_ln_open/close_transaction working unchanged for LND wallets.
+      - txid:               str (lowercase hex)
+      - incoming:           bool (True for received, False for sent)
+      - fee_sat:            int (miner fee in satoshis; 0 if unknown)
+      - label:              str (free-form; may be empty)
+      - amount_sat:         int (signed satoshis; positive for incoming,
+                                  negative for outgoing)
+      - block_height:       int (0 if unconfirmed)
+      - num_confirmations:  int
+      - timestamp:          int (unix seconds; 0 if unconfirmed)
+      - dest_address:       str (first output address; "" if not known)
+
+    Both this helper (LND wire format → canonical) and
+    `_normalize_electrum_onchain_row` (Electrum wire format → canonical)
+    target this shape, so downstream consumers — new_calc_invoice_stats,
+    is_ln_open_transaction / is_ln_close_transaction, the dashboard's
+    Recent Cashouts / Recent Fee Payments tables — can read either
+    wallet's output without branching.
+
+    For channel-funding txs we inject label="OPEN CHANNEL"; for closing
+    txs label="CLOSE CHANNEL". This matches what Electrum auto-writes
+    on its end and keeps is_ln_open/close_transaction working
+    unchanged for both wallet types.
     """
     funding, closing = await _lnd_channel_tx_hashes(api, wallet_id)
     resp = await lnd_rpc(api, wallet_id, "GetTransactions", {}, "Lightning") or {}

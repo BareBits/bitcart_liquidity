@@ -278,12 +278,27 @@ def test_lsp_fees_reduce_remaining_fee_due_under_2pct_cap():
 # ---------------------------------------------------------------------------
 
 def test_lnd_electrum_parity_on_lsp_tx():
-    """A normalized onchain-history row produced by either wallet path
-    yields identical StoreStats. _lnd_list_onchain_history populates
-    txid/incoming/fee_sat/label/amount_sat; the Electrum path returns
-    Bitcart-shape rows that include the same keys. As long as the row
-    shape matches at the dispatcher level, fee accounting is
-    indifferent to the underlying wallet."""
+    """Given canonical-shape input on both sides, the fee-accounting
+    loop produces identical StoreStats.
+
+    Scope caveat: this test only verifies the LOOP is wallet-agnostic.
+    It does NOT verify that the dispatcher's Electrum branch actually
+    produces canonical-shape rows from real Electrum daemon output —
+    that's a separate concern covered by:
+      - test_normalize_electrum_onchain_row_unit (this file): pins the
+        normalizer's bc_value→amount_sat conversion in isolation.
+      - test_list_onchain_history_normalizes_electrum_bc_value (this
+        file): exercises the dispatcher's Electrum branch end-to-end
+        with a mocked electrum_rpc returning real Electrum shape.
+      - test_list_onchain_history_electrum_returns_canonical_shape
+        (electrum_network_tests.py): same, but against a live
+        regtest Electrum daemon.
+
+    The historical bug we missed: this test fed the same canonical
+    dict to both paths and called it 'parity'. Real Electrum daemons
+    return bc_value (BTC string) without amount_sat; consumers
+    silently read 0. The companion tests above pin the missing
+    boundary."""
     canonical_lsp_tx = {
         "label": "lsp_channel_order:identical",
         "incoming": False,
@@ -300,6 +315,209 @@ def test_lnd_electrum_parity_on_lsp_tx():
     assert dataclasses.asdict(lnd_stats) == dataclasses.asdict(electrum_stats)
     assert lnd_stats.onchain_network_fees_paid_for_lsp_orders_in_sats == 175
     assert lnd_stats.onchain_lsp_service_fees_paid_in_sats == 1500
+
+
+# ---------------------------------------------------------------------------
+# Electrum-side dispatcher normalization pin
+# ---------------------------------------------------------------------------
+
+def test_normalize_electrum_onchain_row_unit():
+    """Pure unit test of _normalize_electrum_onchain_row.
+
+    Electrum's daemon returns rows shaped {bc_value: "0.00500000",
+    fee_sat: int|None, height: int, confirmations: int, timestamp: int,
+    incoming: bool, label: str, txid: str, ...}. The engine canonical
+    shape expects {amount_sat: int, block_height: int,
+    num_confirmations: int, timestamp: int, dest_address: str, ...}.
+
+    Pins the conversion math directly: bc_value (BTC-decimal string)
+    × 100_000_000 = amount_sat (int satoshis). Catches any future
+    refactor that breaks the units."""
+    # 500_000 sat = 0.005 BTC. Electrum serializes via format_satoshis
+    # which produces an 8-decimal string with trailing zeros.
+    electrum_row = {
+        "txid": "abc123" * 10 + "abcd",
+        "bc_value": "0.00500000",     # 500_000 sat
+        "bc_balance": "1.50000000",
+        "fee_sat": 250,
+        "height": 102,
+        "confirmations": 16,
+        "timestamp": 1779782161,
+        "monotonic_timestamp": 1779782161,
+        "incoming": True,
+        "label": "OPEN CHANNEL",
+        "date": "2026-05-26 00:56",
+        "txpos_in_block": 2,
+    }
+    out = liquidityhelper._normalize_electrum_onchain_row(electrum_row)
+    assert out["txid"] == electrum_row["txid"].lower()
+    assert out["amount_sat"] == 500_000, (
+        f"expected 500000 sat from bc_value='0.00500000', got {out['amount_sat']}"
+    )
+    assert isinstance(out["amount_sat"], int)
+    assert out["fee_sat"] == 250
+    assert isinstance(out["fee_sat"], int)
+    assert out["incoming"] is True
+    assert out["label"] == "OPEN CHANNEL"
+    assert out["block_height"] == 102
+    assert out["num_confirmations"] == 16
+    assert out["timestamp"] == 1779782161
+    assert out["dest_address"] == ""
+    # Sanity: real Electrum keys must NOT pass through (otherwise
+    # downstream consumers may pick up the wrong shape).
+    assert "bc_value" not in out
+    assert "height" not in out
+    assert "confirmations" not in out
+
+
+def test_normalize_electrum_onchain_row_handles_trailing_dot():
+    """Electrum's format_satoshis produces "2." (with trailing period)
+    for whole-BTC amounts. Decimal parses this correctly; pin it."""
+    row = {
+        "txid": "deadbeef" * 8,
+        "bc_value": "2.",   # 2 BTC = 200_000_000 sat
+        "fee_sat": None,
+        "height": 100,
+        "confirmations": 10,
+        "timestamp": 1700000000,
+        "incoming": True,
+        "label": "",
+    }
+    out = liquidityhelper._normalize_electrum_onchain_row(row)
+    assert out["amount_sat"] == 200_000_000
+    assert out["fee_sat"] == 0   # None → 0
+
+
+def test_normalize_electrum_onchain_row_handles_negative_outgoing():
+    """Outgoing txs have a negative bc_value. Sign must be preserved."""
+    row = {
+        "txid": "cafebabe" * 8,
+        "bc_value": "-0.05000000",   # -5_000_000 sat
+        "fee_sat": 175,
+        "height": 200,
+        "confirmations": 5,
+        "timestamp": 1700000000,
+        "incoming": False,
+        "label": "lsp_channel_order:foo",
+    }
+    out = liquidityhelper._normalize_electrum_onchain_row(row)
+    assert out["amount_sat"] == -5_000_000
+    assert out["incoming"] is False
+
+
+def test_normalize_electrum_onchain_row_handles_missing_or_invalid():
+    """Missing/null/malformed bc_value must default to 0 without
+    raising — the broad except in new_calc_invoice_stats would catch
+    the exception silently and drop the entire invoice from revenue,
+    so we'd rather see a 0 row than lose data."""
+    for bad in (None, "", "not-a-number", "0.0.0"):
+        row = {
+            "txid": "0" * 64,
+            "bc_value": bad,
+            "fee_sat": 0,
+            "height": 0,
+            "confirmations": 0,
+            "timestamp": 0,
+            "incoming": False,
+            "label": "",
+        }
+        out = liquidityhelper._normalize_electrum_onchain_row(row)
+        assert out["amount_sat"] == 0, (
+            f"expected 0 for malformed bc_value={bad!r}, got {out['amount_sat']}"
+        )
+
+
+def test_list_onchain_history_normalizes_electrum_bc_value(monkeypatch):
+    """End-to-end dispatcher test: monkeypatch electrum_rpc to return a
+    real Electrum-shape response (bc_value strings, no amount_sat),
+    then assert list_onchain_history's Electrum branch produces
+    canonical-shape rows that consumers can read.
+
+    Before the dispatcher-level normalization fix, this test would
+    have failed: tx.get("amount_sat") returned None → consumers
+    silently got 0. Uses asyncio.run for compatibility with this
+    repo's no-pytest-asyncio convention (other async tests in the
+    suite drive via asyncio.get_event_loop().run_until_complete or
+    asyncio.run; this matches that pattern)."""
+    import asyncio
+
+    raw_electrum_response = {
+        "result": {
+            "summary": {},
+            "transactions": [
+                # An LSP channel-order payment (outgoing).
+                {
+                    "txid": "1" * 64,
+                    "bc_value": "-0.00150000",   # -150_000 sat
+                    "bc_balance": "0.50000000",
+                    "fee_sat": 175,
+                    "height": 100,
+                    "confirmations": 6,
+                    "timestamp": 1700000000,
+                    "monotonic_timestamp": 1700000000,
+                    "incoming": False,
+                    "label": "lsp_channel_order:abc",
+                    "date": "2026-05-26 00:56",
+                    "txpos_in_block": 1,
+                },
+                # An incoming customer payment.
+                {
+                    "txid": "2" * 64,
+                    "bc_value": "0.00050000",    # 50_000 sat
+                    "bc_balance": "0.50050000",
+                    "fee_sat": 0,
+                    "height": 101,
+                    "confirmations": 5,
+                    "timestamp": 1700000060,
+                    "monotonic_timestamp": 1700000060,
+                    "incoming": True,
+                    "label": "",
+                    "date": "2026-05-26 00:57",
+                    "txpos_in_block": 2,
+                },
+            ],
+        }
+    }
+
+    async def fake_electrum_rpc(method, myxpub, params=None):
+        assert method == "onchain_history"
+        return raw_electrum_response
+
+    monkeypatch.setattr(liquidityhelper, "electrum_rpc", fake_electrum_rpc)
+
+    async def run():
+        rows = await liquidityhelper.list_onchain_history(
+            wallet={"currency": "btc", "xpub": "fakexpub"},
+        )
+        return rows
+
+    rows = asyncio.run(run())
+    assert len(rows) == 2
+
+    # First row: outgoing LSP order.
+    assert rows[0]["txid"] == "1" * 64
+    assert rows[0]["amount_sat"] == -150_000
+    assert rows[0]["fee_sat"] == 175
+    assert rows[0]["incoming"] is False
+    assert rows[0]["label"] == "lsp_channel_order:abc"
+
+    # Second row: incoming customer payment.
+    assert rows[1]["txid"] == "2" * 64
+    assert rows[1]["amount_sat"] == 50_000
+    assert rows[1]["fee_sat"] == 0
+    assert rows[1]["incoming"] is True
+
+    # Plug rows directly into the fee-accounting loop. If
+    # _normalize_electrum_onchain_row didn't fire, amount_sat would be
+    # 0 → onchain_lsp_service_fees_paid_in_sats would be 0 → the dev-
+    # fee math we're protecting would silently zero out.
+    stats = _replay_onchain_fee_loop(rows)
+    assert stats.onchain_network_fees_paid_for_lsp_orders_in_sats == 175
+    assert stats.onchain_lsp_service_fees_paid_in_sats == 150_000, (
+        f"expected 150_000 from the bc_value='-0.00150000' tx; got "
+        f"{stats.onchain_lsp_service_fees_paid_in_sats}. If 0, the "
+        f"dispatcher's Electrum branch is no longer normalizing."
+    )
 
 
 def test_lnd_electrum_parity_mixed_stream():

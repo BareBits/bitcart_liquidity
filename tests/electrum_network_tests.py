@@ -305,6 +305,73 @@ def test_list_onchain_history_electrum(lnd_electrum_pair):
     _run(run())
 
 
+def test_list_onchain_history_electrum_returns_canonical_shape(lnd_electrum_pair):
+    """End-to-end shape pin: real Electrum daemon → list_onchain_history
+    → engine canonical shape with the right types.
+
+    Why this exists: Electrum's daemon returns `bc_value` as a BTC-decimal
+    STRING ("0.00500000", "2.") and has no `amount_sat` key. The engine's
+    canonical shape uses `amount_sat` as an int. Without normalization,
+    consumers like new_calc_invoice_stats and the dashboard's Recent
+    Cashouts table silently read 0 for every Electrum row. Every prior
+    test used pre-normalized synthetic fixtures and therefore couldn't
+    have caught this drift. This test starts from REAL Electrum output
+    and asserts each row has every canonical field with the right type."""
+    ep = lnd_electrum_pair
+
+    async def run():
+        funding_txid = ep.electrum_to_lnd_channel_point.split(":")[0].lower()
+        rows = await liquidityhelper.list_onchain_history(wallet=ELECTRUM_WALLET)
+        assert isinstance(rows, list) and rows, "no on-chain history returned"
+
+        # Every canonical key, every canonical type — for every row. If
+        # this fails, the dispatcher's Electrum branch is no longer
+        # producing the canonical shape consumers depend on.
+        for r in rows:
+            assert isinstance(r.get("txid"), str), f"txid not str: {r!r}"
+            assert isinstance(r.get("incoming"), bool), f"incoming not bool: {r!r}"
+            assert isinstance(r.get("fee_sat"), int), f"fee_sat not int: {r!r}"
+            assert isinstance(r.get("label"), str), f"label not str: {r!r}"
+            assert isinstance(r.get("amount_sat"), int), (
+                f"amount_sat not int: {r!r} — the dispatcher's Electrum "
+                f"branch needs to parse bc_value (BTC string) into sats."
+            )
+            assert isinstance(r.get("block_height"), int), f"block_height not int: {r!r}"
+            assert isinstance(r.get("num_confirmations"), int), f"num_confirmations not int: {r!r}"
+            assert isinstance(r.get("timestamp"), int), f"timestamp not int: {r!r}"
+            assert isinstance(r.get("dest_address"), str), f"dest_address not str: {r!r}"
+            # No leftover Electrum-native keys (would indicate the
+            # normalizer was bypassed for this row).
+            assert "bc_value" not in r, f"raw bc_value leaked through: {r!r}"
+            assert "height" not in r, f"raw electrum 'height' leaked through: {r!r}"
+
+        # Find the channel-funding tx and assert amount_sat is plausible
+        # for a 0.2 BTC channel open. Electrum's bc_value will be slightly
+        # below 20_000_000 sats outgoing (channel-size + miner fee +
+        # any change handling). What matters is: it's a NEGATIVE INT
+        # of meaningful magnitude — not 0 (which is what bc_value-as-string
+        # would silently degrade to before this fix).
+        funding_rows = [
+            r for r in rows
+            if (r.get("txid") or "").lower() == funding_txid
+        ]
+        assert funding_rows, (
+            f"funding tx {funding_txid} not in history at all"
+        )
+        funding = funding_rows[0]
+        # 0.2 BTC channel ≈ -20_000_000 sat amount_sat. Use a generous
+        # tolerance for miner fees and channel-reserve dust.
+        assert funding["amount_sat"] < -10_000_000, (
+            f"funding amount_sat looks wrong for a 0.2 BTC channel open: "
+            f"{funding['amount_sat']} (would be 0 without normalization)"
+        )
+        # Sanity: incoming flag agrees with sign of amount_sat.
+        assert funding["incoming"] is False
+        assert funding["amount_sat"] < 0
+
+    _run(run())
+
+
 # ---------------------------------------------------------------------------
 # list_ln_payments_with_labels  (Electrum dispatch path)
 # ---------------------------------------------------------------------------
