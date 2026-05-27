@@ -571,8 +571,115 @@ def test_router_invalidate_cache_helper(client):
 # Layer 3 — Recent activity tables (fee payments, cashouts, closures)
 # ---------------------------------------------------------------------------
 
+def test_liquidity_stats_sums_per_wallet_inbound_outbound(monkeypatch):
+    """One liquidityhelper wallet with two active channels — totals
+    are sums across the channels. Inbound = remote_balance, Outbound
+    = local_balance. Active-channel count is the row count."""
+    api = FakeBitcartAPI()
+    api.add_wallet("w1", name="liquidityhelper", currency="btc")
+    api.add_store("s1", wallets=["w1"], created="2025-01-01")
+    api.add_channel("w1", local_balance=300_000, remote_balance=200_000, active=True)
+    api.add_channel("w1", local_balance=100_000, remote_balance=400_000, active=True)
+    _setup_engine_dispatch(monkeypatch, api)
+
+    payload = _run(dashboard_mod.compute_dashboard(api, "all"))
+    stats = payload.liquidity_stats
+    assert len(stats.wallets) == 1
+    row = stats.wallets[0]
+    assert row.wallet_id == "w1"
+    assert row.wallet_name == "liquidityhelper"
+    assert row.inbound.sats == 600_000      # 200k + 400k
+    assert row.outbound.sats == 400_000     # 300k + 100k
+    assert row.active_channel_count == 2
+    # Totals mirror the single-wallet figures.
+    assert stats.total_inbound.sats == 600_000
+    assert stats.total_outbound.sats == 400_000
+    assert stats.total_channel_count == 2
+
+
+def test_liquidity_stats_skips_non_liquidityhelper_wallets(monkeypatch):
+    """Wallets not named 'liquidityhelper' are excluded — same filter
+    rule as the rest of the dashboard."""
+    api = FakeBitcartAPI()
+    api.add_wallet("w-other", name="some-other-wallet", currency="btc")
+    api.add_store("s1", wallets=["w-other"], created="2025-01-01")
+    api.add_channel("w-other", local_balance=999_999, remote_balance=999_999, active=True)
+    _setup_engine_dispatch(monkeypatch, api)
+
+    payload = _run(dashboard_mod.compute_dashboard(api, "all"))
+    assert payload.liquidity_stats.wallets == []
+    assert payload.liquidity_stats.total_inbound.sats == 0
+    assert payload.liquidity_stats.total_outbound.sats == 0
+    assert payload.liquidity_stats.total_channel_count == 0
+
+
+def test_liquidity_stats_skips_inactive_channels(monkeypatch):
+    """Channels with active=False are excluded from sums — they don't
+    carry usable liquidity."""
+    api = FakeBitcartAPI()
+    api.add_wallet("w1", name="liquidityhelper", currency="btc")
+    api.add_store("s1", wallets=["w1"], created="2025-01-01")
+    api.add_channel("w1", local_balance=300_000, remote_balance=200_000, active=True)
+    api.add_channel("w1", local_balance=999_999, remote_balance=999_999, active=False)
+    _setup_engine_dispatch(monkeypatch, api)
+
+    payload = _run(dashboard_mod.compute_dashboard(api, "all"))
+    stats = payload.liquidity_stats
+    assert len(stats.wallets) == 1
+    assert stats.wallets[0].inbound.sats == 200_000
+    assert stats.wallets[0].outbound.sats == 300_000
+    assert stats.wallets[0].active_channel_count == 1
+
+
+def test_liquidity_stats_totals_across_multiple_wallets(monkeypatch):
+    """Two liquidityhelper wallets each contribute to the totals row."""
+    api = FakeBitcartAPI()
+    api.add_wallet("w-A", name="liquidityhelper", currency="btc")
+    api.add_wallet("w-B", name="liquidityhelper", currency="btc")
+    api.add_store("s-A", wallets=["w-A"], created="2025-01-01")
+    api.add_store("s-B", wallets=["w-B"], created="2025-01-01")
+    api.add_channel("w-A", local_balance=100_000, remote_balance=200_000, active=True)
+    api.add_channel("w-B", local_balance=500_000, remote_balance=300_000, active=True)
+    _setup_engine_dispatch(monkeypatch, api)
+
+    payload = _run(dashboard_mod.compute_dashboard(api, "all"))
+    stats = payload.liquidity_stats
+    assert {w.wallet_id for w in stats.wallets} == {"w-A", "w-B"}
+    assert stats.total_inbound.sats == 500_000     # 200k + 300k
+    assert stats.total_outbound.sats == 600_000    # 100k + 500k
+    assert stats.total_channel_count == 2
+
+
+def test_liquidity_stats_mode_label_lsp_default(monkeypatch):
+    """Default config (MANUAL_CHANNEL_CREATION_ENABLED=False) →
+    'LSP-managed liquidity'. Operators delegate channel acquisition
+    to an LSP via pick_best_lsp_for_inbound."""
+    import importlib, config
+    importlib.reload(config)
+    monkeypatch.setattr(config, "MANUAL_CHANNEL_CREATION_ENABLED", False, raising=False)
+
+    api = FakeBitcartAPI()
+    _setup_engine_dispatch(monkeypatch, api)
+    payload = _run(dashboard_mod.compute_dashboard(api, "all"))
+    assert payload.liquidity_stats.mode == "LSP-managed liquidity"
+
+
+def test_liquidity_stats_mode_label_manual(monkeypatch):
+    """MANUAL_CHANNEL_CREATION_ENABLED=True → 'Manual channel
+    management' — the engine opens channels itself via
+    pick_best_channel_partners + move_onchain_to_ln."""
+    import importlib, config
+    importlib.reload(config)
+    monkeypatch.setattr(config, "MANUAL_CHANNEL_CREATION_ENABLED", True, raising=False)
+
+    api = FakeBitcartAPI()
+    _setup_engine_dispatch(monkeypatch, api)
+    payload = _run(dashboard_mod.compute_dashboard(api, "all"))
+    assert payload.liquidity_stats.mode == "Manual channel management"
+
+
 def test_recent_tables_empty_when_no_activity(monkeypatch):
-    """No wallets, no closures → all three recent-activity lists empty.
+    """No wallets, no closures → all recent-activity lists empty.
     Pins zero-data safety so a fresh install renders the dashboard
     without crashing on the new sections."""
     api = FakeBitcartAPI()
@@ -582,6 +689,210 @@ def test_recent_tables_empty_when_no_activity(monkeypatch):
     assert payload.recent_fee_payments == []
     assert payload.recent_cashouts == []
     assert payload.recent_channel_closures == []
+    assert payload.recent_network_fees == []
+
+
+def test_recent_network_fees_picks_up_onchain_dev_fee(monkeypatch):
+    """An on-chain FEE_PAYOUT_REASON tx with fee_sat>0 surfaces in
+    recent_network_fees with category='developer_fee' and the txid
+    populated for the mempool.space link."""
+    import config as _cfg
+    api = FakeBitcartAPI()
+    api.add_wallet("w1", name="liquidityhelper")
+    api.add_store("s1", wallets=["w1"], created="2025-01-01")
+    api.add_onchain_tx(
+        "w1", label=_cfg.FEE_PAYOUT_REASON,
+        amount_sat=10_000, fee_sat=500,
+        txid="deadbeef" * 8, timestamp=1700000000, dest_address="bc1qfee",
+    )
+    _setup_engine_dispatch(monkeypatch, api)
+
+    payload = _run(dashboard_mod.compute_dashboard(api, "all"))
+    assert len(payload.recent_network_fees) == 1
+    row = payload.recent_network_fees[0]
+    assert row.category == "developer_fee"
+    assert row.fee_sats == 500
+    assert row.amount_sats == 10_000
+    assert row.method == "onchain"
+    assert row.txid == "deadbeef" * 8
+    assert row.payment_hash == ""
+
+
+def test_recent_network_fees_picks_up_ln_routing_fee(monkeypatch):
+    """An outgoing LN payment with a non-zero fee_msat surfaces with
+    method='lightning' and the payment_hash (no txid)."""
+    import config as _cfg
+    api = FakeBitcartAPI()
+    api.add_wallet("w1", name="liquidityhelper")
+    api.add_store("s1", wallets=["w1"], created="2025-01-01")
+    api.add_ln_tx(
+        "w1", label=_cfg.REFERRAL_PAYOUT_REASON,
+        amount_msat=-5_000_000,    # 5000 sats outgoing
+        fee_msat=20_000,           # 20 sats routing fee
+        payment_hash="abc123", timestamp=1700001000,
+    )
+    _setup_engine_dispatch(monkeypatch, api)
+
+    payload = _run(dashboard_mod.compute_dashboard(api, "all"))
+    assert len(payload.recent_network_fees) == 1
+    row = payload.recent_network_fees[0]
+    assert row.category == "hosting_fee"
+    assert row.fee_sats == 20
+    assert row.amount_sats == 5_000
+    assert row.method == "lightning"
+    assert row.payment_hash == "abc123"
+    assert row.txid == ""
+
+
+def test_recent_network_fees_picks_up_channel_open_and_close(monkeypatch):
+    """OPEN CHANNEL / CLOSE CHANNEL labels both surface, even though
+    close txs are net-inbound — we still paid the miner fee on the
+    close, and that's what this table tracks."""
+    api = FakeBitcartAPI()
+    api.add_wallet("w1", name="liquidityhelper")
+    api.add_store("s1", wallets=["w1"], created="2025-01-01")
+    api.add_onchain_tx(
+        "w1", label="OPEN CHANNEL",
+        amount_sat=1_000_000, fee_sat=300,
+        txid="11" * 32, timestamp=1700000000,
+    )
+    # Inbound close tx: positive amount_sat (funds return to us), but
+    # the close miner fee was still ours to pay.
+    api.add_onchain_tx(
+        "w1", label="CLOSE CHANNEL",
+        amount_sat=900_000, fee_sat=400,
+        txid="22" * 32, timestamp=1700001000, incoming=True,
+    )
+    _setup_engine_dispatch(monkeypatch, api)
+
+    payload = _run(dashboard_mod.compute_dashboard(api, "all"))
+    categories = {r.category for r in payload.recent_network_fees}
+    assert categories == {"channel_open", "channel_close"}
+    closes = [r for r in payload.recent_network_fees if r.category == "channel_close"]
+    assert len(closes) == 1
+    assert closes[0].fee_sats == 400
+
+
+def test_recent_network_fees_picks_up_lsp_order(monkeypatch):
+    """lsp_channel_order:<id> labels surface as category='lsp_order'.
+    The suffix carries the order id; we don't expose it but it must
+    not confuse the label-matcher."""
+    api = FakeBitcartAPI()
+    api.add_wallet("w1", name="liquidityhelper")
+    api.add_store("s1", wallets=["w1"], created="2025-01-01")
+    api.add_onchain_tx(
+        "w1", label="lsp_channel_order:zeus-order-42",
+        amount_sat=200_000, fee_sat=150,
+        txid="33" * 32, timestamp=1700002000, dest_address="bc1qlsp",
+    )
+    _setup_engine_dispatch(monkeypatch, api)
+
+    payload = _run(dashboard_mod.compute_dashboard(api, "all"))
+    assert len(payload.recent_network_fees) == 1
+    row = payload.recent_network_fees[0]
+    assert row.category == "lsp_order"
+    assert row.fee_sats == 150
+    assert row.amount_sats == 200_000
+    assert row.txid == "33" * 32
+
+
+def test_recent_network_fees_skips_zero_fee_rows(monkeypatch):
+    """A tx with fee_sat==0 (or fee_msat==0) is NOT emitted — this
+    table only surfaces actual network-fee events. Pins against a
+    cluttered view of zero-fee free LN payments / accelerated 0-sat
+    closes."""
+    import config as _cfg
+    api = FakeBitcartAPI()
+    api.add_wallet("w1", name="liquidityhelper")
+    api.add_store("s1", wallets=["w1"], created="2025-01-01")
+    api.add_onchain_tx(
+        "w1", label=_cfg.FEE_PAYOUT_REASON,
+        amount_sat=10_000, fee_sat=0,   # zero fee
+        txid="44" * 32, timestamp=1700000000,
+    )
+    api.add_ln_tx(
+        "w1", label=_cfg.FEE_PAYOUT_REASON,
+        amount_msat=-1_000_000, fee_msat=0,   # zero fee
+        payment_hash="zerofee", timestamp=1700001000,
+    )
+    _setup_engine_dispatch(monkeypatch, api)
+
+    payload = _run(dashboard_mod.compute_dashboard(api, "all"))
+    assert payload.recent_network_fees == []
+
+
+def test_recent_network_fees_skips_non_liquidityhelper_wallets(monkeypatch):
+    """Same wallet-name filter as the rest of the dashboard — fees on
+    non-`liquidityhelper` wallets don't surface."""
+    import config as _cfg
+    api = FakeBitcartAPI()
+    api.add_wallet("w-other", name="some-other-wallet")
+    api.add_store("s1", wallets=["w-other"], created="2025-01-01")
+    api.add_onchain_tx(
+        "w-other", label=_cfg.FEE_PAYOUT_REASON,
+        amount_sat=10_000, fee_sat=500,
+        txid="55" * 32, timestamp=1700000000,
+    )
+    _setup_engine_dispatch(monkeypatch, api)
+
+    payload = _run(dashboard_mod.compute_dashboard(api, "all"))
+    assert payload.recent_network_fees == []
+
+
+def test_recent_network_fees_sorted_newest_first(monkeypatch):
+    """Mixed timestamps → newest first."""
+    api = FakeBitcartAPI()
+    api.add_wallet("w1", name="liquidityhelper")
+    api.add_store("s1", wallets=["w1"], created="2025-01-01")
+    api.add_onchain_tx("w1", label="OPEN CHANNEL",
+        amount_sat=100, fee_sat=10, txid="aa" * 32, timestamp=1700000000)
+    api.add_onchain_tx("w1", label="OPEN CHANNEL",
+        amount_sat=200, fee_sat=20, txid="bb" * 32, timestamp=1800000000)
+    api.add_onchain_tx("w1", label="OPEN CHANNEL",
+        amount_sat=300, fee_sat=30, txid="cc" * 32, timestamp=1750000000)
+    _setup_engine_dispatch(monkeypatch, api)
+
+    payload = _run(dashboard_mod.compute_dashboard(api, "all"))
+    timestamps = [r.timestamp for r in payload.recent_network_fees]
+    assert timestamps == sorted(timestamps, reverse=True)
+
+
+def test_recent_network_fees_caps_at_100(monkeypatch):
+    """100-row cap matches the other recent-activity tables. Pins
+    against backend ballooning into a thousand-row response."""
+    api = FakeBitcartAPI()
+    api.add_wallet("w1", name="liquidityhelper")
+    api.add_store("s1", wallets=["w1"], created="2025-01-01")
+    for i in range(150):
+        api.add_onchain_tx("w1", label="OPEN CHANNEL",
+            amount_sat=100, fee_sat=10,
+            txid=f"{i:064x}", timestamp=1700000000 + i)
+    _setup_engine_dispatch(monkeypatch, api)
+
+    payload = _run(dashboard_mod.compute_dashboard(api, "all"))
+    assert len(payload.recent_network_fees) == 100
+
+
+def test_recent_network_fees_usd_conversion(monkeypatch):
+    """USD per fee/amount sat derived from btc_usd_rate, same as the
+    other tables."""
+    import config as _cfg
+    api = FakeBitcartAPI()
+    api.btc_usd_rate = 100_000.0   # $100k/BTC
+    api.add_wallet("w1", name="liquidityhelper")
+    api.add_store("s1", wallets=["w1"], created="2025-01-01")
+    api.add_onchain_tx(
+        "w1", label=_cfg.FEE_PAYOUT_REASON,
+        amount_sat=100_000,    # 0.001 BTC = $100
+        fee_sat=500,           # 0.000005 BTC = $0.50
+        txid="66" * 32, timestamp=1700000000,
+    )
+    _setup_engine_dispatch(monkeypatch, api)
+
+    payload = _run(dashboard_mod.compute_dashboard(api, "all"))
+    row = payload.recent_network_fees[0]
+    assert row.amount_usd == pytest.approx(100.0)
+    assert row.fee_usd == pytest.approx(0.50)
 
 
 def test_recent_fee_payments_picks_up_onchain_dev_fees(monkeypatch):

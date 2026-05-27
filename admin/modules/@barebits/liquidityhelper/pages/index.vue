@@ -182,6 +182,90 @@
                 </v-card-text>
               </v-card>
 
+              <!-- ─── Liquidity stats ─── -->
+              <!-- One row per liquidityhelper-named wallet with its
+                   inbound + outbound balance and active channel count,
+                   plus a totals row at the bottom. Title shows which
+                   liquidity-management mode is configured (LSP-managed
+                   vs Manual) so the operator instantly knows whether
+                   new-channel acquisition is automatic or operator-
+                   driven. Replaces the per-store inbound-liquidity row
+                   that used to live on each StoreCard. -->
+              <v-card v-if="dashboard.liquidity_stats" outlined class="mb-4">
+                <v-card-title>
+                  Liquidity stats
+                  <v-chip
+                    class="ml-3"
+                    small
+                    :color="dashboard.liquidity_stats.mode === 'Manual channel management' ? 'warning' : 'info'"
+                    outlined
+                  >
+                    {{ dashboard.liquidity_stats.mode }}
+                  </v-chip>
+                </v-card-title>
+                <v-card-text>
+                  <p class="text-caption mb-2">
+                    Per-wallet inbound and outbound liquidity (active
+                    channels only). Only wallets named
+                    <code>liquidityhelper</code> are counted — these are
+                    the wallets the engine manages.
+                  </p>
+                  <v-simple-table dense class="elevation-0">
+                    <template #default>
+                      <thead>
+                        <tr>
+                          <th>Wallet</th>
+                          <th class="text-right">Inbound</th>
+                          <th class="text-right">Outbound</th>
+                          <th class="text-right" style="width: 110px;">Channels</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        <tr
+                          v-for="w in dashboard.liquidity_stats.wallets"
+                          :key="w.wallet_id"
+                        >
+                          <td>
+                            {{ w.wallet_name }}
+                            <span class="text-caption grey--text">({{ w.wallet_short }})</span>
+                          </td>
+                          <td class="text-right">
+                            {{ formatBtcSats(w.inbound) }} /
+                            {{ formatUsd(w.inbound) }}
+                          </td>
+                          <td class="text-right">
+                            {{ formatBtcSats(w.outbound) }} /
+                            {{ formatUsd(w.outbound) }}
+                          </td>
+                          <td class="text-right">{{ w.active_channel_count }}</td>
+                        </tr>
+                        <tr v-if="!dashboard.liquidity_stats.wallets.length">
+                          <td colspan="4" class="text-center grey--text">
+                            No <code>liquidityhelper</code> wallets configured.
+                          </td>
+                        </tr>
+                      </tbody>
+                      <tfoot v-if="dashboard.liquidity_stats.wallets.length">
+                        <tr class="totals-row">
+                          <th>Total</th>
+                          <th class="text-right">
+                            {{ formatBtcSats(dashboard.liquidity_stats.total_inbound) }} /
+                            {{ formatUsd(dashboard.liquidity_stats.total_inbound) }}
+                          </th>
+                          <th class="text-right">
+                            {{ formatBtcSats(dashboard.liquidity_stats.total_outbound) }} /
+                            {{ formatUsd(dashboard.liquidity_stats.total_outbound) }}
+                          </th>
+                          <th class="text-right">
+                            {{ dashboard.liquidity_stats.total_channel_count }}
+                          </th>
+                        </tr>
+                      </tfoot>
+                    </template>
+                  </v-simple-table>
+                </v-card-text>
+              </v-card>
+
               <!-- ─── Recent activity tables ─── -->
 
               <v-card outlined class="mb-4">
@@ -455,6 +539,66 @@
                         class="text-caption"
                       >{{ shortTxid(item.refund_txid) }}</a>
                       <span v-else class="text-caption text--disabled">—</span>
+                    </template>
+                  </v-data-table>
+                </v-card-text>
+              </v-card>
+
+              <v-card outlined class="mb-4">
+                <v-card-title>Recent network fees</v-card-title>
+                <v-card-text>
+                  <p class="text-caption mb-2">
+                    Every transaction across all <code>liquidityhelper</code>
+                    wallets that paid an on-chain miner fee or a Lightning
+                    routing fee, newest first (capped at 100 entries).
+                    Includes developer/hosting fee payments, cashouts,
+                    channel opens/closes, and LSP-order on-chain payments —
+                    anything with a non-zero fee.
+                  </p>
+                  <v-data-table
+                    :headers="networkFeeHeaders"
+                    :items="dashboard.recent_network_fees"
+                    :items-per-page="10"
+                    :no-data-text="'No network fees yet.'"
+                    dense
+                    class="elevation-0"
+                  >
+                    <template #item.iso_date="{ item }">
+                      <span class="text-caption">{{ item.iso_date }}</span>
+                    </template>
+                    <template #item.fee_sats="{ item }">
+                      {{ formatNumber(item.fee_sats, 0) }} sats
+                      <span class="kv-meta">
+                        / <span v-if="item.fee_usd !== null">\${{ formatNumber(item.fee_usd, 2) }}</span><span v-else>$—</span>
+                      </span>
+                    </template>
+                    <template #item.amount_sats="{ item }">
+                      {{ formatNumber(item.amount_sats, 0) }} sats
+                      <span class="kv-meta">
+                        / <span v-if="item.amount_usd !== null">\${{ formatNumber(item.amount_usd, 2) }}</span><span v-else>$—</span>
+                      </span>
+                    </template>
+                    <template #item.category="{ item }">
+                      <v-chip x-small :color="networkFeeCategoryColor(item.category)" outlined>
+                        {{ item.category }}
+                      </v-chip>
+                    </template>
+                    <template #item.method="{ item }">
+                      <v-icon small>{{ item.method === 'lightning' ? 'mdi-flash' : 'mdi-link' }}</v-icon>
+                      {{ item.method === 'lightning' ? 'LN' : 'on-chain' }}
+                    </template>
+                    <template #item.txid="{ item }">
+                      <a
+                        v-if="item.txid"
+                        :href="'https://mempool.space/tx/' + item.txid"
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        class="text-caption"
+                      >{{ shortTxid(item.txid) }}</a>
+                      <span v-else-if="item.payment_hash" class="text-caption grey--text">
+                        {{ shortTxid(item.payment_hash) }} (LN)
+                      </span>
+                      <span v-else>—</span>
                     </template>
                   </v-data-table>
                 </v-card-text>
@@ -769,6 +913,15 @@ export default {
         { text: "Funding tx", value: "channel_funding_txid" },
         { text: "Refund tx", value: "refund_txid" },
       ],
+      networkFeeHeaders: [
+        { text: "Date", value: "iso_date", width: 160 },
+        { text: "Category", value: "category", width: 130 },
+        { text: "Fee paid", value: "fee_sats" },
+        { text: "Amount", value: "amount_sats" },
+        { text: "Method", value: "method", width: 110 },
+        { text: "Destination", value: "destination" },
+        { text: "Tx / hash", value: "txid" },
+      ],
 
       // Settings tab state.
       settings: {},
@@ -924,7 +1077,7 @@ export default {
     this.stopAutoRefresh()
   },
   methods: {
-    guessType, formatNumber,
+    guessType, formatNumber, formatBtcSats, formatUsd, formatPct,
     // Abbreviate long txid/payment_hash strings for table display.
     // First 8 + last 8 chars with an ellipsis in the middle is enough
     // to recognize / click the mempool link without breaking the row.
@@ -938,6 +1091,18 @@ export default {
       if (type === "developer") return "primary"
       if (type === "hosting") return "warning"
       if (type === "cashout") return "success"
+      return "default"
+    },
+    // Color for the category chip in the Recent network fees table.
+    // Reuses the fee-payment palette where categories overlap so a
+    // glancing operator builds one mental color→meaning map.
+    networkFeeCategoryColor(cat) {
+      if (cat === "developer_fee") return "primary"
+      if (cat === "hosting_fee") return "warning"
+      if (cat === "cashout") return "success"
+      if (cat === "channel_open") return "info"
+      if (cat === "channel_close") return "error"
+      if (cat === "lsp_order") return "purple"
       return "default"
     },
     // Parse close_reason into {category, reasons[]}. Engine format
@@ -1190,5 +1355,13 @@ export default {
 }
 .audit-reason-list li {
   font-size: 0.85em;
+}
+
+/* Totals row at the bottom of the Liquidity stats table. Bolded
+   `<th>` cells inside `<tfoot>` get a top border so the row is
+   visually separated from the per-wallet rows. */
+.totals-row th {
+  border-top: 1px solid rgba(255, 255, 255, 0.12);
+  font-weight: 600;
 }
 </style>

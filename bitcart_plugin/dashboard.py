@@ -166,6 +166,67 @@ class PaymentRow(BaseModel):
     payment_hash: str          # empty for on-chain
 
 
+class WalletLiquidityRow(BaseModel):
+    """One row in the Liquidity stats table — one per liquidityhelper-
+    named wallet. Inbound = sum of remote_balance on active channels;
+    outbound = sum of local_balance on active channels."""
+    wallet_id: str               # full id; stable React key
+    wallet_short: str            # first 8 chars of wallet_id for display
+    wallet_name: str             # always "liquidityhelper" today (filter)
+    inbound: _Money              # remote_balance sum, in BTC + sats + USD
+    outbound: _Money             # local_balance sum, in BTC + sats + USD
+    active_channel_count: int
+
+
+class LiquidityStats(BaseModel):
+    """Aggregated liquidity-stats section shown above the recent-activity
+    tables. Surfaces per-wallet inbound/outbound balances + channel
+    count, with totals across all liquidityhelper wallets. The `mode`
+    string tells the operator at a glance which liquidity-management
+    strategy is configured."""
+    # Human-readable label of the current liquidity-management mode.
+    # Mirrors the engine gate at liquidityhelper.move_onchain_to_ln:
+    #   MANUAL_CHANNEL_CREATION_ENABLED=True  → "Manual channel management"
+    #   MANUAL_CHANNEL_CREATION_ENABLED=False → "LSP-managed liquidity"
+    # The False default means the engine delegates new-channel acquisition
+    # to an LSP via pick_best_lsp_for_inbound.
+    mode: str
+    wallets: List[WalletLiquidityRow]
+    # Totals across all listed wallets. Computed server-side so the UI
+    # doesn't have to recompute on every render.
+    total_inbound: _Money
+    total_outbound: _Money
+    total_channel_count: int
+
+
+class NetworkFeeRow(BaseModel):
+    """One row in the Recent Network Fees table.
+
+    Surfaces every individual transaction where the engine paid a
+    network fee — on-chain miner fees (txid populated, link to
+    mempool.space in the UI) or Lightning routing fees (payment_hash
+    populated, no on-chain link). `amount_sats` is the principal of
+    the underlying transaction so the operator can see "we sent X
+    sats and paid Y in fees" at a glance.
+
+    Categories include the existing fee-payment / cashout labels plus
+    channel-open, channel-close, and lsp-order labels — anything that
+    incurred a non-zero fee. Channel-close txs are included even though
+    they're net-inbound to the wallet, because we still paid the fee.
+    """
+    timestamp: int             # unix seconds; 0 if unknown
+    iso_date: str              # ISO string for UI display
+    category: str              # see _label_to_network_fee_category()
+    fee_sats: int              # the network/routing fee we paid
+    fee_usd: Optional[float]
+    amount_sats: int           # principal of the underlying tx (positive)
+    amount_usd: Optional[float]
+    method: str                # "onchain" | "lightning"
+    txid: str                  # empty for LN
+    payment_hash: str          # empty for on-chain
+    destination: str           # peer / address from the tx label or current config
+
+
 class ChannelClosureRow(BaseModel):
     """One row in the Recent Channel Closures table."""
     timestamp: int             # unix seconds of last_close_attempt_at or closed_at
@@ -241,10 +302,12 @@ class DashboardResponse(BaseModel):
     health_warnings: List[HealthWarning]   # config-sanity + runtime checks
     # Recent activity tables — capped at 100 rows so the response stays
     # small. The UI paginates 10/page client-side. Sorted newest-first.
+    liquidity_stats: LiquidityStats
     recent_fee_payments: List[PaymentRow]
     recent_cashouts: List[PaymentRow]
     recent_channel_closures: List[ChannelClosureRow]
     recent_lsp_orders: List[LspOrderRow]
+    recent_network_fees: List[NetworkFeeRow]
 
 
 # ---------------------------------------------------------------------------
@@ -309,8 +372,10 @@ def _safe_pct(numerator: int, denominator: int) -> Optional[float]:
 # Inbound liquidity — per-wallet
 # ---------------------------------------------------------------------------
 
-async def _get_inbound_liquidity(wallet: Dict[str, Any], api: Any) -> Tuple[int, int]:
-    """Return (inbound_sats, active_channel_count) for `wallet`.
+async def _get_wallet_liquidity_stats(
+    wallet: Dict[str, Any], api: Any,
+) -> Tuple[int, int, int]:
+    """Return (inbound_sats, outbound_sats, active_channel_count) for `wallet`.
 
     For btclnd wallets we go straight to LND's `Lightning.ListChannels`
     via `lnd_rpc` — Bitcart's btclnd channel proxy doesn't always pass
@@ -318,9 +383,9 @@ async def _get_inbound_liquidity(wallet: Dict[str, Any], api: Any) -> Tuple[int,
     For Electrum wallets we have no alternative and use Bitcart's
     `get_wallet_ln_channels`.
 
-    Failure is silent: returns (0, 0) on any error. The UI shows a 0
-    rather than an error banner — the dashboard should still render
-    if one wallet's LND is briefly unreachable.
+    Failure is silent: returns (0, 0, 0) on any error. The UI shows
+    zeros rather than an error banner — the dashboard should still
+    render if one wallet's LND is briefly unreachable.
     """
     wallet_id = wallet.get("id")
     currency = wallet.get("currency")
@@ -329,8 +394,9 @@ async def _get_inbound_liquidity(wallet: Dict[str, Any], api: Any) -> Tuple[int,
             from liquidityhelper import lnd_rpc
             resp = await lnd_rpc(api, wallet_id, "ListChannels", {}, "Lightning")
             if not isinstance(resp, dict):
-                return (0, 0)
+                return (0, 0, 0)
             inbound = 0
+            outbound = 0
             count = 0
             for c in (resp.get("channels") or []):
                 # `active` is a bool from LND. Treat missing as inactive
@@ -338,24 +404,35 @@ async def _get_inbound_liquidity(wallet: Dict[str, Any], api: Any) -> Tuple[int,
                 if not c.get("active"):
                     continue
                 inbound += int(c.get("remote_balance") or 0)
+                outbound += int(c.get("local_balance") or 0)
                 count += 1
-            return (inbound, count)
+            return (inbound, outbound, count)
         # Electrum / btc path — Bitcart's API is the only source.
         channels = await api.get_wallet_ln_channels(
             wallet_id, active_only=True, online_only=False,
         )
         if not channels:
-            return (0, 0)
+            return (0, 0, 0)
         inbound = 0
+        outbound = 0
         for c in channels:
             inbound += int(float(c.get("remote_balance") or 0))
-        return (inbound, len(channels))
+            outbound += int(float(c.get("local_balance") or 0))
+        return (inbound, outbound, len(channels))
     except Exception as e:
         logger.warning(
-            f"inbound-liquidity fetch failed for wallet {wallet_id} "
-            f"(currency={currency}): {e}"
+            f"liquidity-stats fetch failed for wallet {wallet_id} "
+            f"(currency={currency}): {e} {traceback.format_exc()}"
         )
-        return (0, 0)
+        return (0, 0, 0)
+
+
+# Back-compat alias so existing call sites (StoreCard inbound row,
+# tests) keep working without churn. New code should use the
+# liquidity-stats helper above.
+async def _get_inbound_liquidity(wallet: Dict[str, Any], api: Any) -> Tuple[int, int]:
+    inbound, _outbound, count = await _get_wallet_liquidity_stats(wallet, api)
+    return (inbound, count)
 
 
 # ---------------------------------------------------------------------------
@@ -595,6 +672,222 @@ async def list_recent_cashouts(
         },
         usd_rate=usd_rate,
     )
+
+
+def _liquidity_mode_label() -> str:
+    """Human-readable label for the current liquidity-management mode.
+
+    Reads MANUAL_CHANNEL_CREATION_ENABLED from config. Mirrors the
+    engine gate at liquidityhelper.move_onchain_to_ln (which short-
+    circuits when the flag is False, deferring channel creation to an
+    LSP). Defaults to the LSP label on any config-read failure so the
+    UI still renders.
+    """
+    try:
+        import config as _cfg
+        if bool(getattr(_cfg, "MANUAL_CHANNEL_CREATION_ENABLED", False)):
+            return "Manual channel management"
+        return "LSP-managed liquidity"
+    except Exception as e:
+        logger.warning(f"_liquidity_mode_label: config import failed: {e} {traceback.format_exc()}")
+        return "LSP-managed liquidity"
+
+
+async def build_liquidity_stats(
+    api: Any, btc_usd_rate: Optional[float],
+) -> LiquidityStats:
+    """Walk every liquidityhelper-named wallet, collect per-wallet
+    inbound/outbound/channel-count stats, and sum into the totals row.
+
+    Wallet uniqueness: keys on wallet_id. Sorting: by wallet_id so the
+    order is stable across renders (operators dislike rows reshuffling
+    between refreshes).
+    """
+    mode = _liquidity_mode_label()
+    rows: List[WalletLiquidityRow] = []
+    total_inbound = 0
+    total_outbound = 0
+    total_channels = 0
+
+    try:
+        wallets = await api.get_wallets() or []
+    except Exception as e:
+        logger.warning(
+            f"build_liquidity_stats: get_wallets failed: {e} {traceback.format_exc()}"
+        )
+        wallets = []
+
+    # Filter to liquidityhelper-named wallets only. Same rule the rest
+    # of the dashboard uses to decide what's billable / relevant.
+    lh_wallets = [w for w in wallets if w.get("name") == "liquidityhelper"]
+    # Dedupe by id (defensive — get_wallets shouldn't return dupes but
+    # we don't enforce it).
+    seen: set = set()
+    for w in sorted(lh_wallets, key=lambda x: x.get("id") or ""):
+        wid = w.get("id") or ""
+        if not wid or wid in seen:
+            continue
+        seen.add(wid)
+        inbound, outbound, count = await _get_wallet_liquidity_stats(w, api)
+        rows.append(WalletLiquidityRow(
+            wallet_id=wid,
+            wallet_short=wid[:8],
+            wallet_name=w.get("name") or "",
+            inbound=_money(inbound, btc_usd_rate),
+            outbound=_money(outbound, btc_usd_rate),
+            active_channel_count=count,
+        ))
+        total_inbound += inbound
+        total_outbound += outbound
+        total_channels += count
+
+    return LiquidityStats(
+        mode=mode,
+        wallets=rows,
+        total_inbound=_money(total_inbound, btc_usd_rate),
+        total_outbound=_money(total_outbound, btc_usd_rate),
+        total_channel_count=total_channels,
+    )
+
+
+def _label_to_network_fee_category(label: str) -> Optional[str]:
+    """Map a tx/payment label to the user-visible network-fee category.
+
+    Categories surface what KIND of payment incurred the fee, not the
+    fee itself. None means "ignore this row" — either the label is
+    unrecognized or the tx isn't one we want in this table (e.g. an
+    incoming customer payment with no label).
+    """
+    try:
+        import config as _cfg
+    except Exception as e:
+        logger.warning(f"_label_to_network_fee_category: config import failed: {e} {traceback.format_exc()}")
+        return None
+    name = (label or "").strip()
+    if not name:
+        return None
+    # Labels of the form `<base>:<suffix>` carry an inline payload
+    # (peer pubkey, lsp order id, …). Match on the base.
+    base = name.partition(":")[0]
+    mapping = {
+        _cfg.FEE_PAYOUT_REASON: "developer_fee",
+        _cfg.REFERRAL_PAYOUT_REASON: "hosting_fee",
+        _cfg.CASHOUT_REASON: "cashout",
+        _cfg.CASHOUT_DIRECT_CHANNEL_REASON: "cashout",
+        "OPEN CHANNEL": "channel_open",
+        "CLOSE CHANNEL": "channel_close",
+        "lsp_channel_order": "lsp_order",
+    }
+    return mapping.get(base)
+
+
+async def list_recent_network_fees(
+    api: Any, usd_rate: Optional[float],
+) -> List[NetworkFeeRow]:
+    """Recent network-fee-incurring transactions across all
+    liquidityhelper wallets. Sorted newest first. Capped at 100.
+
+    Includes on-chain miner fees (developer/hosting/cashout/channel
+    opens/closes/LSP orders) and Lightning routing fees (LN payouts,
+    LN fee/referral payments). Rows with fee_sat <= 0 are skipped —
+    the table only surfaces events where we actually paid a fee, so
+    zero-fee txs (free same-bank-day LN payments, accelerated 0-sat
+    closes, etc.) don't clutter the view.
+
+    Channel-close txs ARE included even though they're net-inbound to
+    the wallet (channel balance returns to us). The "outgoing-only"
+    filter the other tables apply doesn't fit here because we still
+    paid the miner fee on the close even when the net was inbound.
+    """
+    from liquidityhelper import list_onchain_history, list_ln_payments_with_labels
+
+    rows: List[NetworkFeeRow] = []
+    wallets = await api.get_wallets() or []
+    for wallet in wallets:
+        if wallet.get("name") != "liquidityhelper":
+            continue
+        # On-chain side. Walk every tx; only emit rows where the label
+        # matches AND fee_sat > 0. We do NOT filter on tx.incoming
+        # because channel-close txs are inbound but still incurred a
+        # miner fee we want to surface.
+        try:
+            onchain = await list_onchain_history(wallet=wallet, api=api)
+        except Exception as e:
+            logger.warning(
+                f"recent network fees: list_onchain_history failed for "
+                f"wallet {wallet.get('id')}: {e} {traceback.format_exc()}"
+            )
+            onchain = []
+        for tx in onchain:
+            raw_label = (tx.get("label") or "").strip()
+            category = _label_to_network_fee_category(raw_label)
+            if category is None:
+                continue
+            fee_sats = int(abs(float(tx.get("fee_sat") or 0)))
+            if fee_sats <= 0:
+                continue
+            base_label, _, suffix = raw_label.partition(":")
+            destination = (
+                suffix
+                or tx.get("dest_address")
+                or _destination_for_label(base_label)
+                or ""
+            )
+            ts = int(tx.get("timestamp") or 0)
+            rows.append(NetworkFeeRow(
+                timestamp=ts,
+                iso_date=_iso(ts),
+                category=category,
+                fee_sats=fee_sats,
+                fee_usd=(fee_sats / _SATS_PER_BTC * usd_rate) if usd_rate else None,
+                amount_sats=int(abs(float(tx.get("amount_sat") or 0))),
+                amount_usd=(int(abs(float(tx.get("amount_sat") or 0))) / _SATS_PER_BTC * usd_rate) if usd_rate else None,
+                method="onchain",
+                txid=tx.get("txid") or "",
+                payment_hash="",
+                destination=destination,
+            ))
+        # LN side. Only outgoing payments incur routing fees from our
+        # side; incoming forwards/receives don't cost us anything.
+        try:
+            ln_rows = await list_ln_payments_with_labels(wallet=wallet, api=api)
+        except Exception as e:
+            logger.warning(
+                f"recent network fees: list_ln_payments_with_labels failed "
+                f"for wallet {wallet.get('id')}: {e} {traceback.format_exc()}"
+            )
+            ln_rows = []
+        for ln in ln_rows:
+            raw_label = (ln.get("label") or "").strip()
+            category = _label_to_network_fee_category(raw_label)
+            if category is None:
+                continue
+            amount_msat = int(ln.get("amount_msat") or 0)
+            if amount_msat >= 0:
+                continue   # incoming forwards/receives don't cost us routing fees
+            fee_msat = int(ln.get("fee_msat") or 0)
+            fee_sats = abs(fee_msat) // 1000
+            if fee_sats <= 0:
+                continue
+            base_label, _, suffix = raw_label.partition(":")
+            amount_sats = abs(amount_msat) // 1000
+            ts = int(ln.get("timestamp") or 0)
+            rows.append(NetworkFeeRow(
+                timestamp=ts,
+                iso_date=_iso(ts),
+                category=category,
+                fee_sats=fee_sats,
+                fee_usd=(fee_sats / _SATS_PER_BTC * usd_rate) if usd_rate else None,
+                amount_sats=amount_sats,
+                amount_usd=(amount_sats / _SATS_PER_BTC * usd_rate) if usd_rate else None,
+                method="lightning",
+                txid="",
+                payment_hash=ln.get("payment_hash") or "",
+                destination=suffix or _destination_for_label(base_label) or "",
+            ))
+
+    rows.sort(key=lambda r: r.timestamp, reverse=True)
+    return rows[:_RECENT_ROW_CAP]
 
 
 def list_recent_channel_closures() -> List[ChannelClosureRow]:
@@ -1035,6 +1328,8 @@ async def compute_dashboard(api: Any, range_key: str) -> DashboardResponse:
     recent_cashouts = await list_recent_cashouts(api, btc_usd_rate)
     recent_channel_closures = list_recent_channel_closures()
     recent_lsp_orders = list_recent_lsp_orders(btc_usd_rate)
+    recent_network_fees = await list_recent_network_fees(api, btc_usd_rate)
+    liquidity_stats = await build_liquidity_stats(api, btc_usd_rate)
 
     # Health audit: pure-config checks (cashout/channel/reserve/loop
     # config sanity) + one dynamic check (LN cashouts stale while LN
@@ -1056,10 +1351,12 @@ async def compute_dashboard(api: Any, range_key: str) -> DashboardResponse:
         summary=summary,
         shared_wallet_warning=shared_wallet_warning,
         health_warnings=health_warnings,
+        liquidity_stats=liquidity_stats,
         recent_fee_payments=recent_fee_payments,
         recent_cashouts=recent_cashouts,
         recent_channel_closures=recent_channel_closures,
         recent_lsp_orders=recent_lsp_orders,
+        recent_network_fees=recent_network_fees,
     )
 
 

@@ -126,19 +126,13 @@
             </div>
           </div>
 
-          <!-- Inbound liquidity — per-store only, omitted in summary.
-               Same font size as savings but in the BareBits brand color
-               (#F9A410). -->
-          <div v-if="includeInbound" class="liquidity-row">
-            <span class="liquidity-label">Inbound liquidity:</span>
-            <span class="liquidity-value">
-              {{ formatBtcSats(store.inbound_liquidity) }} /
-              {{ formatUsd(store.inbound_liquidity) }}
-              <span class="liquidity-meta">
-                ({{ store.active_channel_count }} active channel{{ store.active_channel_count === 1 ? "" : "s" }})
-              </span>
-            </span>
-          </div>
+          <!-- Inbound liquidity moved out of per-store cards into the
+               new Liquidity stats section (one card with per-wallet
+               rows + totals). Two stores sharing a wallet used to
+               each show the same number on their card, which was
+               confusing — the new section is per-wallet, so each
+               figure appears exactly once. -->
+          <!-- (Intentionally empty — see Liquidity stats card.) -->
         </v-col>
 
         <!-- Pie chart column -->
