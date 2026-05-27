@@ -44,6 +44,7 @@ import inspect
 import os
 import re
 import sys
+import traceback
 import typing
 from collections import OrderedDict
 from typing import Any, Optional
@@ -221,7 +222,18 @@ def parse_config_module() -> "OrderedDict[str, SettingDoc]":
     # back to type(value).
     try:
         hints = typing.get_type_hints(config_mod)
-    except Exception:
+    except Exception as e:
+        # Forward references / annotation cycles cause this; we
+        # fall back to per-name type(value) but operators should
+        # know if it happens (config field types may be incomplete).
+        try:
+            import logging as _lg
+            _lg.getLogger("liquidityhelper.config_doc_parser").warning(
+                f"get_type_hints failed; falling back to type(value): "
+                f"{e} {traceback.format_exc()}"
+            )
+        except Exception:
+            pass
         hints = {}
     enriched: "OrderedDict[str, SettingDoc]" = OrderedDict()
     for name, info in parsed.items():

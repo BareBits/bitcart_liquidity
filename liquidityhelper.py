@@ -223,8 +223,8 @@ def stop_log_listener() -> None:
     records."""
     try:
         listener.stop()
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"stop_log_listener: best-effort cleanup failed: {e}")
 
 
 import atexit
@@ -394,7 +394,8 @@ def maybe_attach_pycharm_debugger() -> None:
         logger.warning(
             f"Could not attach to PyCharm debugger at {host}:{port}: "
             f"{e}. Check that PyCharm's debug server is listening and "
-            f"the reverse SSH tunnel + GatewayPorts are configured."
+            f"the reverse SSH tunnel + GatewayPorts are configured. "
+            f"{traceback.format_exc()}"
         )
 
 
@@ -441,7 +442,7 @@ def _load_debug_env_file() -> None:
                     k, _, v = line.partition("=")
                     os.environ.setdefault(k.strip(), v.strip())
         except Exception as e:
-            logger.warning(f"_load_debug_env_file: could not read {path}: {e}")
+            logger.warning(f"_load_debug_env_file: could not read {path}: {e} {traceback.format_exc()}")
         return  # use the first existing file only
 
 
@@ -797,7 +798,7 @@ async def _lnd_list_ln_payments(api: "BitcartAPI", wallet_id: str) -> List[Dict[
         rows = LndPaymentLabel.select().where(LndPaymentLabel.payment_hash.in_(hashes))
         labels_by_hash = {r.payment_hash: r.label for r in rows}
     except Exception as e:
-        logger.warning(f"LndPaymentLabel lookup failed: {e}")
+        logger.warning(f"LndPaymentLabel lookup failed: {e} {traceback.format_exc()}")
     out: List[Dict[str, Any]] = []
     for p in payments:
         # Skip in-flight / failed; only SUCCEEDED corresponds to a settled
@@ -1476,7 +1477,7 @@ async def get_fresh_onchain_address(
         except Exception as e:
             logger.warning(
                 f"get_fresh_onchain_address: LND.NewAddress raised for "
-                f"wallet {wallet.get('id')}: {e}"
+                f"wallet {wallet.get('id')}: {e} {traceback.format_exc()}"
             )
             return None
         if not isinstance(resp, dict):
@@ -1490,7 +1491,7 @@ async def get_fresh_onchain_address(
     except Exception as e:
         logger.warning(
             f"get_fresh_onchain_address: electrum_rpc raised for "
-            f"wallet {wallet.get('id')}: {e}"
+            f"wallet {wallet.get('id')}: {e} {traceback.format_exc()}"
         )
         return None
     if not isinstance(resp, dict):
@@ -1534,7 +1535,7 @@ async def label_onchain_tx(
         except Exception as e:
             logger.warning(
                 f"label_onchain_tx: LabelTransaction failed for "
-                f"wallet {wallet.get('id')} txid {txid}: {e}"
+                f"wallet {wallet.get('id')} txid {txid}: {e} {traceback.format_exc()}"
             )
             return False
     xpub = wallet.get("xpub")
@@ -1546,7 +1547,7 @@ async def label_onchain_tx(
     except Exception as e:
         logger.warning(
             f"label_onchain_tx: setlabel failed for "
-            f"wallet {wallet.get('id')} txid {txid}: {e}"
+            f"wallet {wallet.get('id')} txid {txid}: {e} {traceback.format_exc()}"
         )
         return False
 
@@ -1577,7 +1578,8 @@ async def _lnd_pay_onchain(
         await stub.SendCoins(request, timeout=150.0)
     except _grpc.aio.AioRpcError as e:
         logger.warning(
-            f"LND SendCoins to {dest_addr} for {amount_sat} sat failed: {e.details()}"
+            f"LND SendCoins to {dest_addr} for {amount_sat} sat failed: "
+            f"{e.details()} {traceback.format_exc()}"
         )
         return False
     return True
@@ -1661,7 +1663,7 @@ async def _lnd_pay_ln_invoice(
             ).execute()
         except Exception as e:
             # Label persistence is best-effort — the payment itself succeeded.
-            logger.warning(f"failed to persist LndPaymentLabel: {e}")
+            logger.warning(f"failed to persist LndPaymentLabel: {e} {traceback.format_exc()}")
     return True
 
 
@@ -1740,7 +1742,7 @@ async def _lnd_keysend(
                 label=label,
             ).execute()
         except Exception as e:
-            logger.warning(f"failed to persist LndPaymentLabel for keysend: {e}")
+            logger.warning(f"failed to persist LndPaymentLabel for keysend: {e} {traceback.format_exc()}")
     return True
 
 
@@ -1829,7 +1831,7 @@ async def _lnd_amp_send(
                 label=label,
             ).execute()
         except Exception as e:
-            logger.warning(f"failed to persist LndPaymentLabel for AMP: {e}")
+            logger.warning(f"failed to persist LndPaymentLabel for AMP: {e} {traceback.format_exc()}")
     return True
 
 
@@ -2260,7 +2262,7 @@ async def pick_best_channel_partners(ln_cashout_address: Optional[str] = None) -
             url="https://getbarebits.com/default_channel_partners.json",
         )
     except Exception as e:
-        logger.error(f"Error fetching channel partners from bb: {e}")
+        logger.error(f"Error fetching channel partners from bb: {e} {traceback.format_exc()}")
     else:
         # add found nodes to database if we don't already have them
         for found_partner in bb_partners:
@@ -2272,7 +2274,7 @@ async def pick_best_channel_partners(ln_cashout_address: Optional[str] = None) -
                 try:
                     new_object = node_database.dict_to_node(found_partner)
                 except Exception as e:
-                    logger.error(f"Error turning dict tonode: {e}:{found_partner}")
+                    logger.error(f"Error turning dict tonode: {e}:{found_partner} {traceback.format_exc()}")
                     continue
 
                 if existing_db_object:
@@ -2284,7 +2286,7 @@ async def pick_best_channel_partners(ln_cashout_address: Optional[str] = None) -
                     new_object.save(force_insert=True)
             except Exception as e:
                 logger.error(
-                    f"Error processing partner in partner list: {e}:{found_partner}"
+                    f"Error processing partner in partner list: {e}:{found_partner} {traceback.format_exc()}"
                 )
 
     # add known nodes for strike, coinos, if not blacklisted
@@ -2399,7 +2401,7 @@ async def move_onchain_to_ln(
         try:
             partner_pubkey = partner.lower().split("@")[0]
         except Exception as e:
-            logger.error(f"Error getting pubkey from partner: {e}:{partner}")
+            logger.error(f"Error getting pubkey from partner: {e}:{partner} {traceback.format_exc()}")
             continue
         if DRY_RUN_FUNDS:
             logger.info(
@@ -2480,7 +2482,7 @@ async def our_wallet_exists(api: BitcartAPI, store: dict) -> Optional[dict]:
     try:
         found_wallet = await api.get_best_ln_wallet_for_store(store)
     except Exception as e:
-        logger.error(f"Error in our_wallet_exists: {e}:{found_wallet}")
+        logger.error(f"Error in our_wallet_exists: {e}:{found_wallet} {traceback.format_exc()}")
         return None
     else:
         return found_wallet
@@ -2995,7 +2997,7 @@ async def update_channel_closings(api:BitcartAPI) -> None:
         wallets = await api.get_wallets(limit=200)
     except Exception as e:
         logger.warning(
-            f"update_channel_closings: get_wallets failed: {e}"
+            f"update_channel_closings: get_wallets failed: {e} {traceback.format_exc()}"
         )
         return
     # Aggregate per-peer counts across every LND wallet in one pass.
@@ -3014,7 +3016,7 @@ async def update_channel_closings(api:BitcartAPI) -> None:
         except Exception as e:
             logger.warning(
                 f"update_channel_closings: find_channel_closings "
-                f"failed for {wallet.get('id')}: {e}"
+                f"failed for {wallet.get('id')}: {e} {traceback.format_exc()}"
             )
             continue
         for pubkey, count in wallet_counts.items():
@@ -3458,7 +3460,10 @@ async def _pay_dev_fee_via_ln(
     try:
         wallet_max_payout = int(await api.get_outbound_liquidity(wallet_to_use["id"]))
     except Exception as e:
-        logger.warning(f"Failed to read outbound for LN fee on store {store_id}: {e}")
+        logger.warning(
+            f"Failed to read outbound for LN fee on store {store_id}: "
+            f"{e} {traceback.format_exc()}"
+        )
         return False
     if wallet_max_payout < MIN_FEE_OUT:
         logger.warning(
@@ -3586,7 +3591,8 @@ async def _pay_referral_via_ln(
         wallet_max_payout = int(await api.get_outbound_liquidity(wallet_to_use["id"]))
     except Exception as e:
         logger.warning(
-            f"Failed to read outbound for referral payment on store {store_id}: {e}"
+            f"Failed to read outbound for referral payment on store "
+            f"{store_id}: {e} {traceback.format_exc()}"
         )
         return False
     if wallet_max_payout < MIN_FEE_OUT:
@@ -4035,7 +4041,7 @@ async def drain_ln_to_onchain(
     except Exception as e:
         logger.warning(
             f"drain_ln_to_onchain: get_wallet_ln_channels failed for "
-            f"wallet {wallet_id}: {e}"
+            f"wallet {wallet_id}: {e} {traceback.format_exc()}"
         )
         return False
 
@@ -4091,9 +4097,13 @@ async def drain_ln_to_onchain(
             amount_sat=amount, dest_addr=dest_addr,
         )
     except Exception as e:
+        # Loop-out swap initiation — money-moving (LN → onchain).
+        # Include traceback so an unexpected loopd or LND error path
+        # is debuggable; mirrors the exc_info=True pattern in
+        # initiate_lightning_to_onchain_swap's own outer handler.
         logger.error(
             f"drain_ln_to_onchain: initiate_lightning_to_onchain_swap "
-            f"raised for wallet {wallet_id}: {e}"
+            f"raised for wallet {wallet_id}: {e} {traceback.format_exc()}"
         )
         return False
     if result is None:
@@ -5057,6 +5067,14 @@ async def _attempt_direct_channel_cashout_to_own_node(
                 "private": channel_private,
             }, "Lightning")
         except Exception as e:
+            # OpenChannelSync is money-moving (channel open with
+            # push_sat). Log the full stack so an unexpected error
+            # type is debuggable, in addition to the decision-log
+            # one-liner that the operator-facing UI consumes.
+            logger.warning(
+                f"direct-channel cashout: OpenChannelSync to {uri} for "
+                f"wallet {wallet_id} raised: {e} {traceback.format_exc()}"
+            )
             log_decision(
                 ("direct_channel_cashout_open", wallet_id, pubkey),
                 "failed",
@@ -5094,7 +5112,8 @@ async def _attempt_direct_channel_cashout_to_own_node(
                     f"direct-channel cashout: LabelTransaction "
                     f"failed for {funding_txid}: {e}. Channel opened "
                     f"OK; dashboard will show it as a regular "
-                    f"channel-open rather than a cashout."
+                    f"channel-open rather than a cashout. "
+                    f"{traceback.format_exc()}"
                 )
 
         log_event(
@@ -5277,7 +5296,7 @@ async def calculate_topups(
                 await run_every_x_days(my_func=notifier.notify,days=30,body=body,subject=subject)
             return own_invoice, bb_invoice
         except Exception as e:
-            logger.error(f"Error calculating topups: {e} {store}")
+            logger.error(f"Error calculating topups: {e} {store} {traceback.format_exc()}")
     return None
 
 
@@ -5359,7 +5378,8 @@ async def has_pending_channel_activity(
         except Exception as e:
             logger.warning(
                 f"has_pending_channel_activity: PendingChannels failed for "
-                f"wallet {wallet_id}: {e}; assuming pending activity (safe)"
+                f"wallet {wallet_id}: {e}; assuming pending activity (safe) "
+                f"{traceback.format_exc()}"
             )
             return True
         if resp.get("pending_open_channels"):
@@ -5376,7 +5396,8 @@ async def has_pending_channel_activity(
     except Exception as e:
         logger.warning(
             f"has_pending_channel_activity: get_wallet_ln_channels failed "
-            f"for wallet {wallet_id}: {e}; assuming pending activity (safe)"
+            f"for wallet {wallet_id}: {e}; assuming pending activity (safe) "
+            f"{traceback.format_exc()}"
         )
         return True
     for c in chans or []:
@@ -5475,7 +5496,7 @@ async def setup_notifiers()->List[NotificationProvider]:
         try:
             await my_notifier.test_connection()
         except Exception as e:
-            logger.error(f'Error connecting to SMTP server: {e}')
+            logger.error(f'Error connecting to SMTP server: {e} {traceback.format_exc()}')
         else:
             return_list.append(my_notifier)
     else:
@@ -5563,7 +5584,7 @@ async def pick_best_swap_provider_for_out(
         except TypeError:
             quote = await provider.quote_out(amount_sat)
         except Exception as e:
-            logger.warning(f"swap provider {provider.name} quote_out raised: {e}")
+            logger.warning(f"swap provider {provider.name} quote_out raised: {e} {traceback.format_exc()}")
             continue
         if quote is None:
             continue
@@ -5576,7 +5597,7 @@ async def pick_best_swap_provider_for_out(
                 fee_percent=float(quote.fee_percent),
             )
         except Exception as e:
-            logger.warning(f"could not persist SwapPriceQuote: {e}")
+            logger.warning(f"could not persist SwapPriceQuote: {e} {traceback.format_exc()}")
         if quote.total_fee_sat > MAX_SWAP_FLAT:
             logger.info(
                 f"swap quote rejected ({quote.provider}): "
@@ -5663,7 +5684,7 @@ async def find_loop_out_candidates(api: "BitcartAPI") -> List[Dict[str, Any]]:
     try:
         all_wallets = await api.get_wallets(limit=200)
     except Exception as e:
-        logger.warning(f"find_loop_out_candidates: get_wallets failed: {e}")
+        logger.warning(f"find_loop_out_candidates: get_wallets failed: {e} {traceback.format_exc()}")
         return candidates
     for w in (all_wallets or []):
         if w.get("currency") != "btclnd":
@@ -5673,7 +5694,7 @@ async def find_loop_out_candidates(api: "BitcartAPI") -> List[Dict[str, Any]]:
         except Exception as e:
             logger.warning(
                 f"find_loop_out_candidates: ListChannels failed for "
-                f"wallet {w['id']}: {e}"
+                f"wallet {w['id']}: {e} {traceback.format_exc()}"
             )
             continue
         for c in raw.get("channels") or []:
@@ -5706,7 +5727,7 @@ async def cleanup_old_swap_quotes() -> int:
             )
         return n
     except Exception as e:
-        logger.warning(f"cleanup_old_swap_quotes failed: {e}")
+        logger.warning(f"cleanup_old_swap_quotes failed: {e} {traceback.format_exc()}")
         return 0
 
 
@@ -6053,7 +6074,7 @@ async def pick_best_lsp_for_inbound(
     except Exception as e:
         logger.warning(
             f"pick_best_lsp_for_inbound: get_wallet_ln_node_id failed for "
-            f"wallet {wallet_id}: {e}"
+            f"wallet {wallet_id}: {e} {traceback.format_exc()}"
         )
         return None
 
@@ -6124,7 +6145,7 @@ async def pick_best_lsp_for_inbound(
         except Exception as e:
             logger.warning(
                 f"LSP {provider.name} create_order failed for wallet "
-                f"{wallet_id}: {e}"
+                f"{wallet_id}: {e} {traceback.format_exc()}"
             )
             skip_reasons[provider.name] = f"create_order_error: {e}"
             continue
@@ -6143,7 +6164,10 @@ async def pick_best_lsp_for_inbound(
                 channel_expiry_blocks=int(quote.channel_expiry_blocks),
             )
         except Exception as e:
-            logger.warning(f"could not persist LspPriceQuote: {e}")
+            logger.warning(
+                f"could not persist LspPriceQuote: {e} "
+                f"{traceback.format_exc()}"
+            )
 
         # Fee-percent cap: reject quotes whose fee is more than
         # LSP_MAX_FEE_PERCENT of the channel size. Catches an LSP
@@ -6304,8 +6328,13 @@ async def request_inbound_liquidity_from_lsp(
             wallet=wallet, api=api,
         )
     except Exception as e:
+        # Real on-chain payment to LSP — money-moving. Include the
+        # full traceback so an unexpected RPC error doesn't leave
+        # the operator unable to tell whether the broadcast went out
+        # or not.
         logger.error(
-            f"LSP order {quote.order_id}: on-chain payment raised: {e}"
+            f"LSP order {quote.order_id}: on-chain payment raised: {e} "
+            f"{traceback.format_exc()}"
         )
         payment_ok = False
 
@@ -6372,7 +6401,7 @@ def _lsp_refund_for_tx_label(tx_label: Optional[str]) -> int:
     except Exception as e:
         logger.warning(
             f"_lsp_refund_for_tx_label: DB lookup failed for "
-            f"order_id={order_id}: {e}"
+            f"order_id={order_id}: {e} {traceback.format_exc()}"
         )
         return 0
     if order is None:
@@ -6433,7 +6462,7 @@ async def reconcile_lsp_refunds(api: "BitcartAPI") -> None:
         except Exception as e:
             logger.warning(
                 f"reconcile_lsp_refunds: api.get_wallet({wallet_id}) "
-                f"failed: {e}"
+                f"failed: {e} {traceback.format_exc()}"
             )
             continue
         if not wallet:
@@ -6489,7 +6518,7 @@ async def reconcile_lsp_refunds(api: "BitcartAPI") -> None:
             except Exception as e:
                 logger.warning(
                     f"reconcile_lsp_refunds: labeling refund tx {txid} "
-                    f"for order {row.order_id} failed: {e}"
+                    f"for order {row.order_id} failed: {e} {traceback.format_exc()}"
                 )
 
 
@@ -6689,7 +6718,7 @@ async def refresh_lnd_node_database(api: "BitcartAPI") -> None:
         wallets = await api.get_wallets(limit=200)
     except Exception as e:
         logger.warning(
-            f"refresh_lnd_node_database: get_wallets failed: {e}"
+            f"refresh_lnd_node_database: get_wallets failed: {e} {traceback.format_exc()}"
         )
         return
     lnd_wallets = [w for w in wallets if w.get("currency") == "btclnd"]
@@ -6707,7 +6736,7 @@ async def refresh_lnd_node_database(api: "BitcartAPI") -> None:
     except Exception as e:
         logger.warning(
             f"refresh_lnd_node_database: could not build gRPC stub "
-            f"for wallet {wallet_id}: {e}"
+            f"for wallet {wallet_id}: {e} {traceback.format_exc()}"
         )
         return
     stub = conn["stubs"]["Lightning"]
@@ -6820,7 +6849,7 @@ def _set_last_gossip_pull_success(*, node_count: int) -> None:
         ).execute()
     except Exception as e:
         logger.warning(
-            f"could not persist last-good gossip pull state: {e}"
+            f"could not persist last-good gossip pull state: {e} {traceback.format_exc()}"
         )
 
 
@@ -6834,7 +6863,7 @@ def _get_last_gossip_pull_datetime() -> Optional[datetime.datetime]:
             SimpleVariable.name == _GOSSIP_LAST_PULL_AT_KEY
         )
     except Exception as e:
-        logger.warning(f"could not read last-good gossip pull state: {e}")
+        logger.warning(f"could not read last-good gossip pull state: {e} {traceback.format_exc()}")
         return None
     if row is None or not row.value:
         return None
@@ -6901,7 +6930,7 @@ async def process_pending_closes(api: "BitcartAPI") -> None:
         wallets = await api.get_wallets(limit=200)
     except Exception as e:
         logger.warning(
-            f"process_pending_closes: get_wallets failed: {e}"
+            f"process_pending_closes: get_wallets failed: {e} {traceback.format_exc()}"
         )
         return
 
@@ -6917,7 +6946,7 @@ async def process_pending_closes(api: "BitcartAPI") -> None:
         except Exception as e:
             logger.warning(
                 f"process_pending_closes: get_wallet_ln_channels "
-                f"failed for {wallet['id']}: {e}"
+                f"failed for {wallet['id']}: {e} {traceback.format_exc()}"
             )
             continue
         for ch in channels or []:
@@ -7156,7 +7185,8 @@ async def process_pending_closes(api: "BitcartAPI") -> None:
         except Exception as e:
             logger.warning(
                 f"process_pending_closes: coop retry failed for "
-                f"{cp}: {e} (will try again next hour)"
+                f"{cp}: {e} (will try again next hour) "
+                f"{traceback.format_exc()}"
             )
 
 
@@ -7204,7 +7234,7 @@ async def audit_existing_channels(api: "BitcartAPI") -> None:
     try:
         wallets = await api.get_wallets(limit=200)
     except Exception as e:
-        logger.warning(f"audit_existing_channels: get_wallets failed: {e}")
+        logger.warning(f"audit_existing_channels: get_wallets failed: {e} {traceback.format_exc()}")
         return
 
     closes_today = 0
@@ -7225,7 +7255,7 @@ async def audit_existing_channels(api: "BitcartAPI") -> None:
         except Exception as e:
             logger.warning(
                 f"audit_existing_channels: get_wallet_ln_channels "
-                f"failed for {wallet_id}: {e}"
+                f"failed for {wallet_id}: {e} {traceback.format_exc()}"
             )
             continue
         own_pubkeys = own_node_pubkeys()
@@ -7641,14 +7671,24 @@ async def _check_ln_cashout_health(api: "BitcartAPI") -> List[Dict[str, str]]:
     # would false-positive.
     try:
         stores = await api.get_stores()
-    except Exception:
+    except Exception as e:
+        logger.warning(
+            f"_check_ln_cashout_health: get_stores failed; cannot "
+            f"compute eligible LN balance, skipping health check this "
+            f"tick: {e} {traceback.format_exc()}"
+        )
         return out
     eligible_sats = 0
     seen_wallets: Set[str] = set()
     for store in stores or []:
         try:
             wallet = await api.get_best_ln_wallet_for_store(store)
-        except Exception:
+        except Exception as e:
+            logger.warning(
+                f"_check_ln_cashout_health: get_best_ln_wallet_for_store "
+                f"failed for store {store.get('id')}: {e} "
+                f"{traceback.format_exc()}"
+            )
             continue
         wid = wallet.get("id") if wallet else None
         if not wid or wid in seen_wallets:
@@ -7658,12 +7698,24 @@ async def _check_ln_cashout_health(api: "BitcartAPI") -> List[Dict[str, str]]:
             channels = await api.get_wallet_ln_channels(
                 wid, active_only=True, online_only=True,
             )
-        except Exception:
+        except Exception as e:
+            logger.warning(
+                f"_check_ln_cashout_health: get_wallet_ln_channels failed "
+                f"for wallet {wid}: {e} {traceback.format_exc()}"
+            )
             continue
         for ch in channels or []:
             try:
                 eligible_sats += int(ch.get("local_balance") or 0)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError) as e:
+                # Bad channel payload (string-typed balance from an
+                # older API, or null). Skip the channel but log so an
+                # operator can see whether the count is missing data.
+                logger.warning(
+                    f"_check_ln_cashout_health: malformed local_balance "
+                    f"on channel for wallet {wid}: {e} "
+                    f"(raw={ch.get('local_balance')!r})"
+                )
                 continue
     if eligible_sats >= MIN_LN_CASHOUT_IN_SATS:
         out.append(_warn(
@@ -7704,7 +7756,7 @@ async def collect_health_warnings(
         try:
             active.extend(await _check_ln_cashout_health(api))
         except Exception as e:
-            logger.warning(f"_check_ln_cashout_health raised: {e}")
+            logger.warning(f"_check_ln_cashout_health raised: {e} {traceback.format_exc()}")
 
     # Build the active-id set so we can fire CLEARED transitions for
     # every known ID that isn't currently in `active`. log_decision is
@@ -7765,7 +7817,7 @@ async def audit_lsp_network_compatibility(api: "BitcartAPI") -> None:
         wallets = await api.get_wallets()
     except Exception as e:
         logger.warning(
-            f"audit_lsp_network_compatibility: get_wallets failed: {e}"
+            f"audit_lsp_network_compatibility: get_wallets failed: {e} {traceback.format_exc()}"
         )
         return
     if not wallets:
@@ -7841,7 +7893,7 @@ async def ensure_lnd_wallets_peered_with_lsps(api: "BitcartAPI") -> None:
         wallets = await api.get_wallets(limit=200)
     except Exception as e:
         logger.warning(
-            f"ensure_lnd_wallets_peered_with_lsps: get_wallets failed: {e}"
+            f"ensure_lnd_wallets_peered_with_lsps: get_wallets failed: {e} {traceback.format_exc()}"
         )
         return
 
@@ -7881,7 +7933,8 @@ async def ensure_lnd_wallets_peered_with_lsps(api: "BitcartAPI") -> None:
             except Exception as e:
                 logger.warning(
                     f"ensure_lnd_wallets_peered_with_lsps: "
-                    f"could not get peer URIs from {provider.name}: {e}"
+                    f"could not get peer URIs from {provider.name}: {e} "
+                    f"{traceback.format_exc()}"
                 )
                 continue
             if not peer_uris:
@@ -8002,7 +8055,7 @@ async def cleanup_old_lsp_quotes() -> int:
             )
         return n
     except Exception as e:
-        logger.warning(f"cleanup_old_lsp_quotes failed: {e}")
+        logger.warning(f"cleanup_old_lsp_quotes failed: {e} {traceback.format_exc()}")
         return 0
 
 
@@ -8220,7 +8273,7 @@ async def main():
         if len(NOTIFICATION_PROVIDERS)==0:
             NOTIFICATION_PROVIDERS=await run_every_x_hours(my_func=setup_notifiers,hours=6)
     except Exception as e:
-        logger.error(f'Not able to setup notifications, please see logs! {e}')
+        logger.error(f'Not able to setup notifications, please see logs! {e} {traceback.format_exc()}')
     # init Bitcart API.
     #
     # The shared tick API is rebuilt only when URL or token changes
@@ -8303,8 +8356,12 @@ async def main():
         if DEBUG_STEPS:
             breakpoint()
         topup_answer = await calculate_topups(api)
-    except Exception as e:
-        logger.error("Error calculating top-ups")
+    except Exception:
+        # Previously this captured `e` but never wrote it — fully silent
+        # failure. Topup is the user-notification path for low liquidity;
+        # operators were blind to regressions here. `exception` includes
+        # the traceback automatically.
+        logger.exception("Error calculating top-ups")
     # check available inbound liquidity
     liquidity_check_response = None
     if START_TIME > (datetime.datetime.now() - datetime.timedelta(seconds=30)) and not SKIP_WALLET_DELAY:
@@ -8491,11 +8548,11 @@ async def main():
     try:
         await run_every_x_days(my_func=cleanup_old_swap_quotes, days=1)
     except Exception as e:
-        logger.error(f"Error in cleanup_old_swap_quotes scheduling: {e}")
+        logger.error(f"Error in cleanup_old_swap_quotes scheduling: {e} {traceback.format_exc()}")
     try:
         await run_every_x_days(my_func=cleanup_old_lsp_quotes, days=1)
     except Exception as e:
-        logger.error(f"Error in cleanup_old_lsp_quotes scheduling: {e}")
+        logger.error(f"Error in cleanup_old_lsp_quotes scheduling: {e} {traceback.format_exc()}")
 
     # Calculate and send cashouts, should basically be the same code as calculating fees
     cashout_response = None
@@ -8693,8 +8750,8 @@ def _maybe_register_rig_teardown_hook() -> None:
             # process exit indefinitely. 15s is generous; the
             # stop_electrum.sh helper completes in ~3s normally.
             subprocess.run([script], check=False, timeout=15)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"rig teardown script: best-effort cleanup failed: {e}")
 
     atexit.register(_teardown)
 

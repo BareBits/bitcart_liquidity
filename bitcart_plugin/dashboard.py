@@ -38,6 +38,7 @@ from __future__ import annotations
 import datetime
 import logging
 import time
+import traceback
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, HTTPException, Query, Security
@@ -377,7 +378,8 @@ def _destination_for_label(label: str) -> str:
     # Lazy import: config is heavy and we only need it on demand.
     try:
         import config as _cfg
-    except Exception:
+    except Exception as e:
+        logger.warning(f"_destination_for_label: config import failed: {e} {traceback.format_exc()}")
         return ""
     # Note: config knobs can be None (unset) — `getattr(default)` only
     # fires when the attr is MISSING, not None. Wrap each lookup with
@@ -466,7 +468,7 @@ async def _gather_payment_rows(
         except Exception as e:
             logger.warning(
                 f"recent payments: list_onchain_history failed for "
-                f"wallet {wallet.get('id')}: {e}"
+                f"wallet {wallet.get('id')}: {e} {traceback.format_exc()}"
             )
             onchain = []
         for tx in onchain:
@@ -502,7 +504,7 @@ async def _gather_payment_rows(
         except Exception as e:
             logger.warning(
                 f"recent payments: list_ln_payments_with_labels failed "
-                f"for wallet {wallet.get('id')}: {e}"
+                f"for wallet {wallet.get('id')}: {e} {traceback.format_exc()}"
             )
             ln_rows = []
         for ln in ln_rows:
@@ -619,7 +621,7 @@ def list_recent_channel_closures() -> List[ChannelClosureRow]:
                 force_close_initiated=(r.force_close_initiated_at is not None),
             ))
     except Exception as e:
-        logger.warning(f"list_recent_channel_closures query failed: {e}")
+        logger.warning(f"list_recent_channel_closures query failed: {e} {traceback.format_exc()}")
         return []
     rows.sort(key=lambda r: r.timestamp, reverse=True)
     return rows[:_RECENT_ROW_CAP]
@@ -699,7 +701,7 @@ def list_recent_lsp_orders(usd_rate: Optional[float]) -> List[LspOrderRow]:
                 age_hours=int(age_hours),
             ))
     except Exception as e:
-        logger.warning(f"list_recent_lsp_orders query failed: {e}")
+        logger.warning(f"list_recent_lsp_orders query failed: {e} {traceback.format_exc()}")
         return []
     rows.sort(key=lambda r: r.timestamp, reverse=True)
     return rows[:_RECENT_ROW_CAP]
@@ -769,7 +771,7 @@ async def _count_paid_invoices(api: Any, store_id: str, since_date: Optional[dat
     try:
         invoices = await api.get_invoices(store_id=store_id)
     except Exception as e:
-        logger.warning(f"get_invoices failed for store {store_id}: {e}")
+        logger.warning(f"get_invoices failed for store {store_id}: {e} {traceback.format_exc()}")
         return 0
     if not invoices:
         return 0
@@ -784,7 +786,11 @@ async def _count_paid_invoices(api: Any, store_id: str, since_date: Optional[dat
             # Use the paid_date timestamp; that's when revenue was recognized.
             try:
                 paid_at = dateutil.parser.parse(inv["paid_date"])
-            except Exception:
+            except Exception as e:
+                logger.warning(
+                    f"compute_dashboard: malformed paid_date on invoice "
+                    f"{inv.get('id', '?')}: {inv.get('paid_date')!r}: {e}"
+                )
                 continue
             if paid_at < since_date:
                 continue
@@ -835,7 +841,7 @@ async def compute_dashboard(api: Any, range_key: str) -> DashboardResponse:
         try:
             full_wallet = await api.get_best_ln_wallet_for_store(store)
         except Exception as e:
-            logger.warning(f"get_best_ln_wallet_for_store failed for store {store.get('id')}: {e}")
+            logger.warning(f"get_best_ln_wallet_for_store failed for store {store.get('id')}: {e} {traceback.format_exc()}")
             continue
         if not full_wallet:
             continue
@@ -993,7 +999,7 @@ async def compute_dashboard(api: Any, range_key: str) -> DashboardResponse:
     try:
         health_warnings_raw = await collect_health_warnings(api)
     except Exception as e:
-        logger.warning(f"collect_health_warnings raised: {e}")
+        logger.warning(f"collect_health_warnings raised: {e} {traceback.format_exc()}")
         health_warnings_raw = []
     health_warnings = [HealthWarning(**w) for w in health_warnings_raw]
 
@@ -1064,8 +1070,8 @@ def build_router(auth_dependency: Any | None = None) -> APIRouter:
             # the dashboard fires at most once per ~60s.
             try:
                 await api.close()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"dashboard endpoint: api.close() best-effort cleanup failed: {e}")
         _cache_set(range, payload)
         return payload
 

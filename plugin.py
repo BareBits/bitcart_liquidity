@@ -355,8 +355,10 @@ class Plugin(BasePlugin):
                 self._loop_task.cancel()
                 try:
                     await self._loop_task
-                except (asyncio.CancelledError, Exception):
+                except asyncio.CancelledError:
                     pass
+                except Exception as e:
+                    logger.debug(f"plugin tick-loop task raised on cancellation: {e}")
         # Drain engine resources before the log listener stops so any
         # errors during teardown still get logged. Three sources of
         # leaks across plugin reloads:
@@ -384,8 +386,8 @@ class Plugin(BasePlugin):
         try:
             from liquidityhelper import stop_log_listener
             stop_log_listener()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"plugin shutdown: stop_log_listener best-effort cleanup failed: {e}")
 
     async def worker_setup(self) -> None:
         _ensure_engine_importable()
@@ -521,7 +523,8 @@ class Plugin(BasePlugin):
         try:
             import liquidityhelper as _engine
             debug_was_on = bool(getattr(_engine, "DEBUG_MODE", False))
-        except Exception:
+        except Exception as e:
+            logger.debug(f"_on_settings_changed: pre-apply DEBUG_MODE read failed: {e}")
             debug_was_on = False
 
         applied = apply_settings(merged)

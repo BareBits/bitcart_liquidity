@@ -59,8 +59,8 @@ class EmailNotificationProvider(NotificationProvider):
         finally:
             try:
                 await server.quit()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"test_connection: SMTP quit best-effort cleanup failed: {e}")
         return True
 
     async def send_email(
@@ -144,52 +144,52 @@ class EmailNotificationProvider(NotificationProvider):
             finally:
                 try:
                     await server.quit()
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug(f"send_email: SMTP quit best-effort cleanup failed: {e}")
             return True
 
         except aiosmtplib.SMTPAuthenticationError as e:
-            logger.error(f"Authentication failed: {e}")
+            logger.error(f"Authentication failed: {e} {traceback.format_exc()}")
             return False
 
         except aiosmtplib.SMTPConnectError as e:
-            logger.error(f"Failed to connect to SMTP server: {e}")
+            logger.error(f"Failed to connect to SMTP server: {e} {traceback.format_exc()}")
             return False
 
         except aiosmtplib.SMTPServerDisconnected as e:
-            logger.error(f"Server disconnected unexpectedly: {e}")
+            logger.error(f"Server disconnected unexpectedly: {e} {traceback.format_exc()}")
             return False
 
         except aiosmtplib.SMTPRecipientsRefused as e:
-            logger.error(f"Recipient address refused: {e}")
+            logger.error(f"Recipient address refused: {e} {traceback.format_exc()}")
             return False
 
         except aiosmtplib.SMTPSenderRefused as e:
-            logger.error(f"Sender address refused: {e}")
+            logger.error(f"Sender address refused: {e} {traceback.format_exc()}")
             return False
 
         except aiosmtplib.SMTPDataError as e:
-            logger.error(f"SMTP data error: {e}")
+            logger.error(f"SMTP data error: {e} {traceback.format_exc()}")
             return False
 
         except aiosmtplib.SMTPHeloError as e:
-            logger.error(f"SMTP HELO error: {e}")
+            logger.error(f"SMTP HELO error: {e} {traceback.format_exc()}")
             return False
 
         except aiosmtplib.SMTPException as e:
-            logger.error(f"SMTP error occurred: {e}")
+            logger.error(f"SMTP error occurred: {e} {traceback.format_exc()}")
             return False
 
         except ssl.SSLError as e:
-            logger.error(f"SSL/TLS error: {e}")
+            logger.error(f"SSL/TLS error: {e} {traceback.format_exc()}")
             return False
 
         except TimeoutError as e:
-            logger.error(f"Connection timed out: {e}")
+            logger.error(f"Connection timed out: {e} {traceback.format_exc()}")
             return False
 
         except OSError as e:
-            logger.error(f"Network error: {e}")
+            logger.error(f"Network error: {e} {traceback.format_exc()}")
             return False
 
         except Exception as e:

@@ -45,6 +45,7 @@ import socket
 import subprocess
 import tarfile
 import time
+import traceback
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
@@ -333,8 +334,8 @@ class LoopdInstance:
                         writer.close()
                         try:
                             await writer.wait_closed()
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            logger.debug(f"loopd {self.wallet_id} readiness probe: writer.wait_closed best-effort cleanup failed: {e}")
                         return
                 if self.proc.returncode is not None:
                     raise RuntimeError(
@@ -384,8 +385,8 @@ class LoopdInstance:
                 pass
             try:
                 await self.proc.wait()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"loopd subprocess wait after kill: best-effort cleanup failed: {e}")
 
     def grpc_swap_stub(self) -> client_pb2_grpc.SwapClientStub:
         if self._swap_stub is not None:
@@ -536,7 +537,7 @@ class LoopProvider(SwapProvider):
         try:
             resp = await stub.LoopOutQuote(req, timeout=15.0)
         except grpc.aio.AioRpcError as e:
-            logger.warning(f"loop quote_out failed: {e.details()}")
+            logger.warning(f"loop quote_out failed: {e.details()} {traceback.format_exc()}")
             return None
         swap_fee = int(resp.swap_fee_sat) if resp.swap_fee_sat else 0
         miner_fee = int(resp.htlc_sweep_fee_sat) if resp.htlc_sweep_fee_sat else 0
@@ -565,7 +566,7 @@ class LoopProvider(SwapProvider):
         try:
             q = await stub.LoopOutQuote(client_pb2.QuoteRequest(amt=amount_sat), timeout=15.0)
         except grpc.aio.AioRpcError as e:
-            logger.warning(f"loop pre-initiate quote failed: {e.details()}")
+            logger.warning(f"loop pre-initiate quote failed: {e.details()} {traceback.format_exc()}")
             return None
 
         request = client_pb2.LoopOutRequest(
@@ -581,7 +582,12 @@ class LoopProvider(SwapProvider):
         try:
             resp = await stub.LoopOut(request, timeout=60.0)
         except grpc.aio.AioRpcError as e:
-            logger.warning(f"loop initiate_out failed: {e.details()}")
+            # Real Loop swap initiation — money-out. Use logger.exception
+            # so the full stack + gRPC status code lands in the log
+            # (e.details() alone only gives the server's message).
+            logger.exception(
+                f"loop initiate_out gRPC failure: {e.details()}"
+            )
             return None
         swap_id_hex = bytes(resp.id_bytes).hex()
         return SwapResult(
@@ -610,6 +616,6 @@ class LoopProvider(SwapProvider):
             return True
         except grpc.aio.AioRpcError as e:
             logger.warning(
-                f"autoloop config rejected for wallet {wallet['id']}: {e.details()}"
+                f"autoloop config rejected for wallet {wallet['id']}: {e.details()} {traceback.format_exc()}"
             )
             return False

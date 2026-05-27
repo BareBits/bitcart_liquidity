@@ -41,6 +41,7 @@ import datetime
 import logging
 import re
 import time
+import traceback
 from dataclasses import dataclass
 from typing import Iterable, Iterator, Optional, Tuple
 
@@ -378,7 +379,8 @@ def evaluate_gossip_readiness(
     try:
         if info.chains:
             network = (info.chains[0].network or "").lower()
-    except Exception:
+    except Exception as e:
+        logger.debug(f"evaluate_gossip_readiness: failed to read info.chains[0].network: {e}")
         network = ""
 
     node_count = len(graph.nodes)
@@ -1113,8 +1115,8 @@ async def pull_and_upsert(
         info = await fetch_get_info(stub)
     except grpc.RpcError as e:
         logger.error(
-            "GetInfo failed during gossip pre-flight: %s",
-            _safe_error_msg(e),
+            "GetInfo failed during gossip pre-flight: %s %s",
+            _safe_error_msg(e), traceback.format_exc(),
         )
         stats["skipped"] = True
         stats["skip_reason"] = "GetInfo failed during pre-flight"
@@ -1122,7 +1124,7 @@ async def pull_and_upsert(
     try:
         graph = await fetch_channel_graph(stub)
     except grpc.RpcError as e:
-        logger.error("DescribeGraph failed: %s", _safe_error_msg(e))
+        logger.error("DescribeGraph failed: %s %s", _safe_error_msg(e), traceback.format_exc())
         stats["skipped"] = True
         stats["skip_reason"] = "DescribeGraph failed"
         return stats

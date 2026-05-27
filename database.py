@@ -3,6 +3,7 @@ from peewee import *
 from datetime import datetime,timedelta
 import logging
 import os
+import traceback
 from typing import Optional,List,Dict,Set,Iterable,Tuple,Any
 import os as _os
 
@@ -193,7 +194,7 @@ def _migrate_simpledatetimefield_uniqueness(_db=db) -> None:
         # Failure here shouldn't crash startup — the feature degrades
         # gracefully (duplicates linger but get_last_date still returns
         # the most-recent row via order_by(date.desc())).
-        logger.warning(f"SimpleDateTimeField migration skipped: {e}")
+        logger.warning(f"SimpleDateTimeField migration skipped: {e} {traceback.format_exc()}")
 
 
 _migrate_simpledatetimefield_uniqueness()
