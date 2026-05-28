@@ -70,3 +70,32 @@ You are free to use and modify this script as you wish provided you do not remov
 
 BareBits is self-hosted payment processing software. You may download, deploy, and modify it on your own infrastructure (subject to applicable open-source and third-party licenses). You are solely responsible for configuration, security hardening, key custody, compliance, and any transactions processed through your instance. To the maximum extent permitted by law, BareBits disclaims liability for your deployment, modifications, integrations, and downstream use, and provides the Software “as is” with no warranties. BareBits does not provide a hosted service unless you have a separate written Service Agreement.
 
+## Testnet support
+
+Which Bitcoin networks each component will function on. ✅ = works against a public production endpoint, ⚠️ = works but requires extra configuration, ❌ = no support / will fail at startup.
+
+| Component                              | mainnet | testnet3 | testnet4 | signet (official) | Mutinynet (signet variant) | regtest |
+|----------------------------------------|:-------:|:--------:|:--------:|:-----------------:|:--------------------------:|:-------:|
+| Manual channel management (LND-only)¹  |   ✅    |    ✅    |    ✅    |        ✅         |             ✅             |   ✅²   |
+| Loop (Lightning Labs `loopd` LoopOut)  |   ✅    |    ✅    |    ❌    |        ✅         |             ❌             |   ⚠️³   |
+| LSP mode — Zeus (`lnolymp.us`)         |   ✅    |    ✅    |    ❌⁴   |        ❌⁵        |             ✅             |   ❌    |
+| LSP mode — Megalithic (`megalithic.me`)|   ✅    |    ❌    |    ❌    |        ❌⁵        |             ✅             |   ❌    |
+
+Notes:
+
+¹ Manual channel management uses an LND-gossip-derived candidate DB to pick peers; Electrum wallets are not supported on this path. Whatever network your LND node speaks, this component speaks. (Electrum wallets can use LSP mode where available, but cannot purchase from LSPs today due to an Electrum bug paying LSP invoices.)
+
+² On regtest you supply the peer set yourself — there is no public gossip to enumerate.
+
+³ Lightning Labs runs no public swap server for regtest/simnet. Set `LOOPD_SERVER_HOST` (and `LOOPD_SERVER_NOTLS=true` if your local `loopserver` is plaintext) to point at your own instance. See `config.py` (`LOOPD_NETWORK`, `LOOPD_SERVER_HOST`, `LOOPD_SERVER_NOTLS`) for the knobs.
+
+⁴ Zeus serves testnet3 at `testnet-lsps1.lnolymp.us`; there is no testnet4 endpoint. A wallet on testnet4 will receive chain-hash mismatches because the LSP is on testnet3. The engine emits a warning decision-log entry when it detects a testnet4 wallet attempting to use Zeus.
+
+⁵ Mutinynet is a fast-block variant of signet, NOT the official slow-block Bitcoin signet. Both Zeus and Megalithic serve Mutinynet but neither runs a public endpoint on official signet. Wallets on official signet attempting to use these providers will get chain-hash mismatches at the LSP side.
+
+Provider URLs in use (defined in `lsp_providers.py`; verified against [Zeus LSPS1 docs](https://docs.zeusln.app/lsp/services/lsps1) and [Megalithic LSP1 docs](https://docs.megalithic.me/lightning-services/lsp1-get-inbound-liquidity-for-mobile-clients/)):
+
+- Zeus: `lsps1.lnolymp.us` (mainnet), `testnet-lsps1.lnolymp.us` (testnet3), `mutinynet-lsps1.lnolymp.us` (Mutinynet).
+- Megalithic: `megalithic.me/api/lsps1/v1` (mainnet), `lsp1.mutiny.megalith-node.com/api/lsps1/v1` (Mutinynet).
+- Loop: built-in Lightning Labs defaults per `LOOPD_NETWORK` — `swap.lightning.today:11010` (mainnet), `test.swap.lightning.today:11010` (testnet3), `signet.swap.lightning.today:11010` (signet).
+
