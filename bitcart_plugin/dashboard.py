@@ -310,6 +310,18 @@ class DashboardResponse(BaseModel):
     # Empty string means we couldn't determine — UI then renders
     # txids/addresses as plain text without a link.
     bitcoin_network: str
+    # LND readiness probe. False means at least one btclnd-backed
+    # liquidityhelper wallet's LND daemon isn't responding to
+    # /wallets/{id}/lndinfo yet (typical during the 5-10s window after
+    # a bitcart container restart / rebuild). When False, the rest of
+    # the payload is the empty skeleton — UI shows a "waiting for LND"
+    # banner and auto-refreshes every 5s until lnd_ready flips True.
+    # Always True for Electrum-only deployments (no LND to wait for).
+    lnd_ready: bool = True
+    # Short ids of the btclnd wallets whose LND wasn't reachable. Only
+    # populated when lnd_ready is False. Lets the UI tell the operator
+    # which wallets are still spinning up rather than a generic message.
+    lnd_not_ready_wallets: List[str] = []
     stores: List[StoreDashboard]
     summary: Optional[SummaryDashboard]    # None when only one store
     shared_wallet_warning: bool            # True if ≥2 stores share a wallet
@@ -686,6 +698,53 @@ async def list_recent_cashouts(
         },
         usd_rate=usd_rate,
     )
+
+
+async def _check_lnd_ready(api: Any) -> Tuple[bool, List[str]]:
+    """Probe each btclnd-backed liquidityhelper wallet's lndinfo
+    endpoint. Returns (ready, list_of_wallet_short_ids_not_ready).
+
+    Called early in compute_dashboard so a freshly-restarted bitcart
+    container (LND daemon still spinning up, ~5-10s window after a
+    restart) doesn't 500 the entire dashboard endpoint. When at least
+    one btclnd wallet's LND is unreachable we return a "not ready"
+    skeleton; the UI shows a banner and auto-refreshes every 5s.
+
+    Electrum-only deployments (no btclnd wallets) trivially return
+    ready=True — nothing to wait for.
+
+    Defensive: any unexpected exception during the probe is treated
+    as not-ready (better to show a banner than to 500). The probe
+    itself is cheap — get_lnd_info is cached per BitcartAPI instance,
+    so subsequent calls in the same compute_dashboard invocation hit
+    the cache.
+    """
+    not_ready: List[str] = []
+    try:
+        wallets = await api.get_wallets() or []
+    except Exception as e:
+        logger.warning(
+            f"_check_lnd_ready: get_wallets failed: {e} {traceback.format_exc()}"
+        )
+        return (False, ["<wallet list unavailable>"])
+    for w in wallets:
+        if w.get("name") != "liquidityhelper":
+            continue
+        if w.get("currency") != "btclnd":
+            continue
+        wid = w.get("id") or ""
+        try:
+            info = await api.get_lnd_info(wid)
+        except Exception as e:
+            logger.warning(
+                f"_check_lnd_ready: get_lnd_info raised for wallet {wid}: "
+                f"{e} {traceback.format_exc()}"
+            )
+            not_ready.append(wid[:8] or "<unknown>")
+            continue
+        if not info:
+            not_ready.append(wid[:8] or "<unknown>")
+    return (len(not_ready) == 0, not_ready)
 
 
 async def _detect_bitcoin_network(api: Any) -> str:
@@ -1194,6 +1253,43 @@ async def compute_dashboard(api: Any, range_key: str) -> DashboardResponse:
     # USD rate — None on failure; downstream renders as '—'.
     btc_usd_rate = await api.get_btc_usd_rate()
 
+    # LND readiness gate. new_calc_invoice_stats walks
+    # list_onchain_history which calls into LND via lnd_rpc; if any
+    # btclnd wallet's LND isn't responding yet (typical for the first
+    # ~5-10s after a bitcart container restart), that path raises
+    # RuntimeError("Could not fetch LND info ...") and the whole
+    # dashboard endpoint 500s. Probe up front and return a "not ready"
+    # skeleton instead — the UI shows a banner and auto-refreshes
+    # every 5s until ready. Cheap because get_lnd_info is per-instance
+    # cached; subsequent calls in this same compute_dashboard hit the
+    # cache.
+    lnd_ready, lnd_not_ready_wallets = await _check_lnd_ready(api)
+    if not lnd_ready:
+        return DashboardResponse(
+            range=range_key,
+            btc_usd_rate=btc_usd_rate,
+            cc_baseline_pct=CREDIT_CARD_BASELINE_PCT,
+            bitcoin_network="",
+            lnd_ready=False,
+            lnd_not_ready_wallets=lnd_not_ready_wallets,
+            stores=[],
+            summary=None,
+            shared_wallet_warning=False,
+            health_warnings=[],
+            liquidity_stats=LiquidityStats(
+                mode=_liquidity_mode_label(),
+                wallets=[],
+                total_inbound=_money(0, btc_usd_rate),
+                total_outbound=_money(0, btc_usd_rate),
+                total_channel_count=0,
+            ),
+            recent_fee_payments=[],
+            recent_cashouts=[],
+            recent_channel_closures=[],
+            recent_lsp_orders=[],
+            recent_network_fees=[],
+        )
+
     # Walk every store + classify by wallet name. We can't filter at
     # the stats step because new_calc_invoice_stats processes ALL
     # stores; we filter the OUTPUT.
@@ -1414,6 +1510,8 @@ async def compute_dashboard(api: Any, range_key: str) -> DashboardResponse:
         btc_usd_rate=btc_usd_rate,
         cc_baseline_pct=CREDIT_CARD_BASELINE_PCT,
         bitcoin_network=bitcoin_network,
+        lnd_ready=True,
+        lnd_not_ready_wallets=[],
         stores=stores_out,
         summary=summary,
         shared_wallet_warning=shared_wallet_warning,
@@ -1481,7 +1579,11 @@ def build_router(auth_dependency: Any | None = None) -> APIRouter:
                 await api.close()
             except Exception as e:
                 logger.debug(f"dashboard endpoint: api.close() best-effort cleanup failed: {e}")
-        _cache_set(range, payload)
+        # Don't cache a "not ready" skeleton — LND comes online within
+        # seconds and the operator's auto-refresh poll would keep
+        # serving the cached not-ready response for 60s otherwise.
+        if payload.lnd_ready:
+            _cache_set(range, payload)
         return payload
 
     return router

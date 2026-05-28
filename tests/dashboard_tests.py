@@ -796,6 +796,65 @@ def test_recent_network_fees_picks_up_lsp_order(monkeypatch):
     assert row.txid == "33" * 32
 
 
+def test_dashboard_lnd_not_ready_returns_skeleton(monkeypatch):
+    """When at least one btclnd liquidityhelper wallet's lndinfo
+    endpoint returns None (typical for the first ~5-10s after a
+    bitcart container restart while LND is still spinning up), the
+    dashboard must return a `lnd_ready=false` skeleton response
+    instead of letting the downstream new_calc_invoice_stats walk
+    raise RuntimeError and 500 the endpoint.
+
+    Pins the contract: lnd_ready=false, stores=[], recent-tables=[],
+    and the offending wallet ids surfaced in lnd_not_ready_wallets
+    so the UI can tell the operator which wallet is still spinning."""
+    api = FakeBitcartAPI()
+    api.add_wallet("w1-spinningup", name="liquidityhelper", currency="btclnd")
+    api.add_store("s1", wallets=["w1-spinningup"], created="2025-01-01")
+    async def fake_get_lnd_info(wallet_id):
+        return None   # simulate LND not responding yet
+    api.get_lnd_info = fake_get_lnd_info
+    _setup_engine_dispatch(monkeypatch, api)
+
+    payload = _run(dashboard_mod.compute_dashboard(api, "all"))
+    assert payload.lnd_ready is False
+    assert "w1-spinn" in payload.lnd_not_ready_wallets[0]
+    # Skeleton response: empty everywhere, no 500.
+    assert payload.stores == []
+    assert payload.recent_fee_payments == []
+    assert payload.recent_cashouts == []
+    assert payload.recent_network_fees == []
+    assert payload.recent_lsp_orders == []
+    assert payload.liquidity_stats.wallets == []
+
+
+def test_dashboard_lnd_ready_true_when_get_lnd_info_succeeds(monkeypatch):
+    """Healthy LND → lnd_ready=true, lnd_not_ready_wallets=[]."""
+    api = FakeBitcartAPI()
+    api.add_wallet("w1", name="liquidityhelper", currency="btclnd")
+    api.add_store("s1", wallets=["w1"], created="2025-01-01")
+    async def fake_get_lnd_info(wallet_id):
+        return {"network": "regtest", "host": "127.0.0.1"}
+    api.get_lnd_info = fake_get_lnd_info
+    _setup_engine_dispatch(monkeypatch, api)
+
+    payload = _run(dashboard_mod.compute_dashboard(api, "all"))
+    assert payload.lnd_ready is True
+    assert payload.lnd_not_ready_wallets == []
+
+
+def test_dashboard_lnd_ready_trivially_true_for_electrum_only(monkeypatch):
+    """Electrum-only deployment has no LND to wait for — lnd_ready
+    must be true so the dashboard renders normally."""
+    api = FakeBitcartAPI()
+    api.add_wallet("w1", name="liquidityhelper", currency="btc")
+    api.add_store("s1", wallets=["w1"], created="2025-01-01")
+    _setup_engine_dispatch(monkeypatch, api)
+
+    payload = _run(dashboard_mod.compute_dashboard(api, "all"))
+    assert payload.lnd_ready is True
+    assert payload.lnd_not_ready_wallets == []
+
+
 def test_dashboard_bitcoin_network_from_lnd_info(monkeypatch):
     """bitcoin_network is populated from the first btclnd liquidityhelper
     wallet's GetInfo. Used by the UI to construct mempool.space URLs

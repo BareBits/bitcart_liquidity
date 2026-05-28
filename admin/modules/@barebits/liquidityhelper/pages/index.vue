@@ -151,11 +151,50 @@
               {{ dashboardError }}
             </v-alert>
 
+            <!-- LND-not-ready banner. Shown when at least one
+                 btclnd-backed liquidityhelper wallet's LND daemon
+                 isn't responding yet (typical for the first ~5-10s
+                 after a bitcart container restart). Auto-refreshes
+                 every 5s — the interval is set up in
+                 startLndReadyPollIfNeeded / cleared in
+                 stopLndReadyPoll, both wired to the dashboard
+                 watcher below. -->
+            <v-alert
+              v-if="dashboard && !dashboard.lnd_ready"
+              type="info"
+              prominent
+              text
+              class="mb-2"
+            >
+              <div class="d-flex align-center">
+                <v-progress-circular
+                  indeterminate
+                  size="20"
+                  width="2"
+                  class="mr-3"
+                />
+                <div>
+                  <strong>Waiting for LND wallets to come online…</strong>
+                  <div class="text-caption mt-1">
+                    The dashboard will refresh automatically every 5
+                    seconds until ready. Wallet IDs still spinning up:
+                    <code
+                      v-for="wid in dashboard.lnd_not_ready_wallets"
+                      :key="wid"
+                      class="mx-1"
+                    >{{ wid }}</code>
+                  </div>
+                </div>
+              </div>
+            </v-alert>
+
             <!-- Empty-state when no liquidityhelper wallets are
                  configured. Renders BEFORE the loading spinner check
-                 only when we've successfully fetched and got nothing. -->
+                 only when we've successfully fetched and got nothing.
+                 Suppressed during lnd-not-ready since the stores list
+                 is empty as a side effect of the skeleton response. -->
             <v-alert
-              v-if="dashboard && dashboard.stores.length === 0 && !loadingDashboard"
+              v-if="dashboard && dashboard.lnd_ready && dashboard.stores.length === 0 && !loadingDashboard"
               type="info"
               text
               dense
@@ -171,8 +210,10 @@
               indeterminate
             />
 
-            <!-- Per-store cards -->
-            <div v-if="dashboard">
+            <!-- Per-store cards. Suppressed during lnd-not-ready
+                 (the skeleton response has empty stores and would
+                 just render a row of empty cards behind the banner). -->
+            <div v-if="dashboard && dashboard.lnd_ready">
               <StoreCard
                 v-for="store in dashboard.stores"
                 :key="store.store_id"
@@ -293,7 +334,7 @@
                     and may differ from where the payment actually went historically.</em>
                   </p>
                   <v-data-table
-                    :headers="paymentHeaders"
+                    :headers="feePaymentHeaders"
                     :items="dashboard.recent_fee_payments"
                     :items-per-page="10"
                     :no-data-text="'No fee payments yet.'"
@@ -347,6 +388,13 @@
                       <span v-else>—</span>
                     </template>
                   </v-data-table>
+                  <div
+                    v-if="dashboard.recent_fee_payments.length"
+                    class="totals-line text-right text-caption mt-2"
+                  >
+                    Total fees paid:
+                    <strong>{{ formatAmountFromSats(feePaymentsTotal.sats, feePaymentsTotal.usd, displayUnit) }}</strong>
+                  </div>
                 </v-card-text>
               </v-card>
 
@@ -412,6 +460,13 @@
                       <span v-else>—</span>
                     </template>
                   </v-data-table>
+                  <div
+                    v-if="dashboard.recent_cashouts.length"
+                    class="totals-line text-right text-caption mt-2"
+                  >
+                    Total cashouts:
+                    <strong>{{ formatAmountFromSats(cashoutsTotal.sats, cashoutsTotal.usd, displayUnit) }}</strong>
+                  </div>
                 </v-card-text>
               </v-card>
 
@@ -648,6 +703,13 @@
                       <span v-else>—</span>
                     </template>
                   </v-data-table>
+                  <div
+                    v-if="dashboard.recent_network_fees.length"
+                    class="totals-line text-right text-caption mt-2"
+                  >
+                    Total network fees:
+                    <strong>{{ formatAmountFromSats(networkFeesTotal.sats, networkFeesTotal.usd, displayUnit) }}</strong>
+                  </div>
                 </v-card-text>
               </v-card>
             </div>
@@ -951,13 +1013,36 @@ export default {
       // reload. USD continues to render in parentheses regardless of
       // the selected unit — the toggle only controls the main unit.
       displayUnit: _loadDisplayUnit(),
+      // setInterval handle for the LND-not-ready auto-refresh poll.
+      // Set when the dashboard returns lnd_ready=false, cleared as
+      // soon as it flips true (or on unmount). 5s cadence per the
+      // banner copy — long enough to avoid hammering the backend
+      // while LND finishes spinning up, short enough that the
+      // operator's first refresh after LND comes online is fast.
+      lndReadyPollHandle: null,
       // Static column definitions for the recent-activity v-data-tables.
       // Defined in data() (not as a computed) so Vuetify gets a stable
       // reference and doesn't re-create header cells on every re-render.
+      // Used by the Recent cashouts table — keeps the "Fee paid"
+      // column because for cashouts the fee is a meaningful overhead
+      // distinct from the cashout amount.
       paymentHeaders: [
         { text: "Date", value: "iso_date", width: 160 },
         { text: "Amount", value: "amount" },
         { text: "Fee paid", value: "fee_sats" },
+        { text: "Type", value: "fee_type", width: 110 },
+        { text: "Method", value: "method", width: 110 },
+        { text: "Destination", value: "destination" },
+        { text: "Tx / hash", value: "txid" },
+      ],
+      // Used by the Recent fee payments table — no "Fee paid" column
+      // because for dev/hosting-fee sends the operator's focus is the
+      // amount delivered to the destination; the network fee for
+      // sending it is a small overhead that already appears in the
+      // Recent network fees table.
+      feePaymentHeaders: [
+        { text: "Date", value: "iso_date", width: 160 },
+        { text: "Amount", value: "amount" },
         { text: "Type", value: "fee_type", width: 110 },
         { text: "Method", value: "method", width: 110 },
         { text: "Destination", value: "destination" },
@@ -985,7 +1070,6 @@ export default {
         { text: "Date", value: "iso_date", width: 160 },
         { text: "Category", value: "category", width: 130 },
         { text: "Fee paid", value: "fee_sats" },
-        { text: "Amount", value: "amount_sats" },
         { text: "Method", value: "method", width: 110 },
         { text: "Destination", value: "destination" },
         { text: "Tx / hash", value: "txid" },
@@ -1043,6 +1127,24 @@ export default {
     isAdmin() {
       return Boolean(this.$auth.user && this.$auth.user.is_superuser)
     },
+    // Per-table totals shown under each recent-activity v-data-table.
+    // Totals are over ALL rows in the response (capped at 100 by the
+    // backend), not just the visible 10-per-page page — that's the
+    // "total over this time range" semantic operators expect.
+    //
+    // USD is summed only over rows where amount_usd / fee_usd is
+    // non-null. When ANY row has a usd value we surface the partial
+    // sum so the operator sees the dollar magnitude; when ALL are
+    // null we propagate null so formatAmountFromSats renders "$—".
+    feePaymentsTotal() {
+      return this._sumRowsField(this.dashboard?.recent_fee_payments || [], "amount")
+    },
+    cashoutsTotal() {
+      return this._sumRowsField(this.dashboard?.recent_cashouts || [], "amount")
+    },
+    networkFeesTotal() {
+      return this._sumRowsField(this.dashboard?.recent_network_fees || [], "fee")
+    },
     streamItems() {
       // Vuetify select items: [{ text, value }]. The text shows the
       // friendly name plus a hint about empty state so the operator
@@ -1096,6 +1198,21 @@ export default {
       if (on) this.startAutoRefresh()
       else this.stopAutoRefresh()
     },
+    // Bind the LND-readiness auto-refresh poll to the dashboard's
+    // lnd_ready flag. Each new dashboard payload triggers this; we
+    // start the 5s poll on the first not-ready response and stop it
+    // as soon as the engine reports ready (or the dashboard reloads
+    // without a payload).
+    "dashboard.lnd_ready": {
+      immediate: true,
+      handler(ready) {
+        if (this.dashboard && ready === false) {
+          this.startLndReadyPoll()
+        } else {
+          this.stopLndReadyPoll()
+        }
+      },
+    },
   },
   async mounted() {
     // Flip the SSR-skip flag so the real template branch renders.
@@ -1143,6 +1260,7 @@ export default {
   },
   beforeDestroy() {
     this.stopAutoRefresh()
+    this.stopLndReadyPoll()
   },
   methods: {
     guessType, formatNumber, formatBtcSats, formatUsd, formatPct,
@@ -1152,6 +1270,44 @@ export default {
       try {
         window.localStorage.setItem(DISPLAY_UNIT_STORAGE_KEY, this.displayUnit)
       } catch (_) { /* ignore */ }
+    },
+    // Sum a row collection across the `<field>_sats` and `<field>_usd`
+    // columns. `field` is either "amount" or "fee" — payment-row
+    // tables surface both. Returns {sats, usd}. USD is null only when
+    // every row's <field>_usd is null/undefined.
+    _sumRowsField(rows, field) {
+      let sats = 0
+      let usd = 0
+      let anyUsd = false
+      const satsKey = `${field}_sats`
+      const usdKey = `${field}_usd`
+      for (const r of rows) {
+        sats += Number(r[satsKey]) || 0
+        const u = r[usdKey]
+        if (u !== null && u !== undefined) {
+          usd += Number(u)
+          anyUsd = true
+        }
+      }
+      return { sats, usd: anyUsd ? usd : null }
+    },
+    // LND-not-ready auto-refresh. Polls reloadDashboard(force=true)
+    // every 5 seconds until the backend reports lnd_ready=true.
+    // Idempotent — calling start when already running is a no-op.
+    startLndReadyPoll() {
+      if (this.lndReadyPollHandle) return
+      this.lndReadyPollHandle = setInterval(() => {
+        // force-refresh to bypass the 60s cache; the backend also
+        // refuses to cache not-ready responses but a stale cached
+        // not-ready from before this check is no longer possible.
+        this.reloadDashboard(true)
+      }, 5000)
+    },
+    stopLndReadyPoll() {
+      if (this.lndReadyPollHandle) {
+        clearInterval(this.lndReadyPollHandle)
+        this.lndReadyPollHandle = null
+      }
     },
     // Abbreviate long txid/payment_hash strings for table display.
     // First 8 + last 8 chars with an ellipsis in the middle is enough
@@ -1495,5 +1651,12 @@ export default {
 .totals-row th {
   border-top: 1px solid rgba(255, 255, 255, 0.12);
   font-weight: 600;
+}
+
+/* Per-table totals line under each recent-activity v-data-table.
+   Right-aligned, slight top border to separate from the data rows. */
+.totals-line {
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  padding-top: 6px;
 }
 </style>
