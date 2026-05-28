@@ -44,12 +44,19 @@ def _mine_and_wait(lnd_electrum_pair, blocks: int = 1, sleep_s: float = 1.0):
     return asyncio.sleep(sleep_s)
 
 
+# Engine DB-state cleanup between tests. Keeps DB row state from
+# previous tests (LightningNode samples, LspChannelOrder rows) from
+# leaking into the next.
+pytestmark = pytest.mark.usefixtures("reset_engine_db_state")
+
+
 # ---------------------------------------------------------------------------
 # Sanity smoke test (sets up + tears down the full fixture, no business logic).
 # ---------------------------------------------------------------------------
 
 
-def test_lnd_electrum_pair_fixture_smoke(lnd_electrum_pair):
+def test_lnd_electrum_pair_fixture_smoke(lnd_electrum_pair_shared):
+    lnd_electrum_pair = lnd_electrum_pair_shared
     async def run():
         chans = await lnd_electrum_pair.lnd.list_channels()
         electrum_pk = lnd_electrum_pair.electrum.identity_pubkey
@@ -168,14 +175,17 @@ def test_find_offline_channels_records_electrum(lnd_electrum_pair):
 # ---------------------------------------------------------------------------
 
 
-def test_find_channel_closings_electrum_always_empty(lnd_electrum_pair):
+def test_find_channel_closings_electrum_always_empty(lnd_electrum_pair_shared):
     """find_channel_closings (Electrum dispatch path) deliberately returns
     {} for ALL Electrum wallets — Electrum's list_channels doesn't expose
     close_initiator, so we'd misattribute operator-initiated closes as
     remote-closes and self-trigger the REMOTE_CLOSE_COUNT blacklist (see
     find_channel_closings docstring). This test pins that intentional
     behavior: even after a coop close that actually completes, the
-    function still returns {} for an Electrum wallet."""
+    function still returns {} for an Electrum wallet.
+
+    Read-only against the rig — uses shared module fixture."""
+    lnd_electrum_pair = lnd_electrum_pair_shared
     ep = lnd_electrum_pair
 
     async def run():
@@ -278,11 +288,13 @@ def test_electrum_pay_onchain_electrum(lnd_electrum_pair):
 # ---------------------------------------------------------------------------
 
 
-def test_list_onchain_history_electrum(lnd_electrum_pair):
+def test_list_onchain_history_electrum(lnd_electrum_pair_shared):
     """Electrum's on-chain history surfaces the channel funding tx with the
     'OPEN CHANNEL' label (Electrum auto-labels these), which is what
-    is_ln_open_transaction in liquidityhelper looks for to attribute fees."""
-    ep = lnd_electrum_pair
+    is_ln_open_transaction in liquidityhelper looks for to attribute fees.
+
+    Read-only against the rig — uses shared module fixture."""
+    ep = lnd_electrum_pair_shared
 
     async def run():
         funding_txid = ep.electrum_to_lnd_channel_point.split(":")[0].lower()
@@ -305,7 +317,7 @@ def test_list_onchain_history_electrum(lnd_electrum_pair):
     _run(run())
 
 
-def test_list_onchain_history_electrum_returns_canonical_shape(lnd_electrum_pair):
+def test_list_onchain_history_electrum_returns_canonical_shape(lnd_electrum_pair_shared):
     """End-to-end shape pin: real Electrum daemon → list_onchain_history
     → engine canonical shape with the right types.
 
@@ -316,8 +328,10 @@ def test_list_onchain_history_electrum_returns_canonical_shape(lnd_electrum_pair
     Cashouts table silently read 0 for every Electrum row. Every prior
     test used pre-normalized synthetic fixtures and therefore couldn't
     have caught this drift. This test starts from REAL Electrum output
-    and asserts each row has every canonical field with the right type."""
-    ep = lnd_electrum_pair
+    and asserts each row has every canonical field with the right type.
+
+    Read-only against the rig — uses shared module fixture."""
+    ep = lnd_electrum_pair_shared
 
     async def run():
         funding_txid = ep.electrum_to_lnd_channel_point.split(":")[0].lower()

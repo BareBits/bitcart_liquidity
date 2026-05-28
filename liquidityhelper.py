@@ -1115,19 +1115,26 @@ async def electrum_rpc(method, myxpub: str, params: Dict[str, str] = None):
     route+HTLC settlement, and in plugin mode a sync `requests.post`
     here would hang every other Bitcart HTTP request served by the
     same worker for the duration.
+
+    URL override: reads `LIQUIDITYHELPER_ELECTRUM_RPC_URL` from the env
+    if set. Defaults to `http://localhost:5000` (the canonical Bitcart
+    Electrum proxy). Tests use the override to point at a per-worker
+    Electrum on a dynamic port, which is what lets pytest-xdist run
+    Electrum-using tests in parallel without binding the same port
+    on every worker.
     """
     import httpx
+    import os as _os
     if not params:
         params = {}
     params["xpub"] = myxpub
     payload = {"jsonrpc": "2.0", "method": method, "params": params, "id": 0}
     timeout_s = 129 if method == "lnpay" else 60
+    url = _os.environ.get("LIQUIDITYHELPER_ELECTRUM_RPC_URL", "http://localhost:5000")
     async with httpx.AsyncClient(
         timeout=timeout_s, auth=("electrum", "electrumz"),
     ) as client:
-        response = await client.post(
-            "http://localhost:5000", json=payload,
-        )
+        response = await client.post(url, json=payload)
         return response.json()
 
 
@@ -7747,21 +7754,19 @@ async def _check_ln_cashout_health(api: "BitcartAPI") -> List[Dict[str, str]]:
     return out
 
 
-async def collect_health_warnings(
+async def compute_health_warnings(
     api: Optional["BitcartAPI"] = None,
 ) -> List[Dict[str, str]]:
     """Run every config-sanity check + the LN-cashout-staleness check.
 
-    Returns a list of warning dicts shaped for the HealthWarning
-    Pydantic model in dashboard.py. Emits a log_decision for every
-    known warning ID — present-now warnings transition True, cleared
-    warnings transition False. The decision-log stream and the
-    dashboard banner thus stay in sync.
+    PURE — returns the active warning dicts shaped for the
+    HealthWarning Pydantic model in dashboard.py. Does NOT log
+    anything. Safe to call from any webserver worker (dashboard
+    endpoint) without polluting decisions.log.
 
-    The dashboard payload calls this on every (cache-miss) render; the
-    main tick also schedules it periodically (run_every_x_minutes)
-    so decisions.log gets the transitions even when nobody is looking
-    at the dashboard.
+    The tick loop calls collect_health_warnings (below) instead,
+    which compose this with emit_health_warning_transitions to keep
+    the decisions stream up to date.
     """
     active: List[Dict[str, str]] = []
     active.extend(_check_cashout_config())
@@ -7772,13 +7777,32 @@ async def collect_health_warnings(
             active.extend(await _check_ln_cashout_health(api))
         except Exception as e:
             logger.warning(f"_check_ln_cashout_health raised: {e} {traceback.format_exc()}")
+    return active
 
-    # Build the active-id set so we can fire CLEARED transitions for
-    # every known ID that isn't currently in `active`. log_decision is
-    # state-deduped, so calling it with the same (key, value) every
-    # tick is a no-op after the first emit.
+
+def emit_health_warning_transitions(active: List[Dict[str, str]]) -> None:
+    """Emit decisions-log entries for warning state transitions only.
+
+    Only called from the tick loop (NOT from the dashboard endpoint),
+    so the dedupe state in `_last_decision_state` reflects a single
+    process and the multi-worker race that produced duplicate
+    "cleared" lines at identical timestamps no longer applies.
+
+    Two rules to suppress noise:
+      - Active warnings: log via log_decision at WARNING (HIGH) or
+        INFO (MEDIUM). Dedupes — only the True→False or False→True
+        transition emits.
+      - Cleared warnings: emit ONLY when the previous state was
+        active (True). The "never-been-active → still-not-active"
+        case (the bulk of decisions.log noise) is skipped silently.
+        When a real True→False transition does fire, the line is
+        emitted at DEBUG to the operational logger — it lands in
+        liquidityhelper.log for audit but stays out of
+        decisions.log, which operators read for active problems.
+    """
     active_by_id = {w["id"]: w for w in active}
     for known_id in _HEALTH_WARNING_IDS:
+        key = ("health_warning", known_id)
         warning = active_by_id.get(known_id)
         if warning is not None:
             level = (
@@ -7787,17 +7811,36 @@ async def collect_health_warnings(
                 else logging.INFO
             )
             log_decision(
-                ("health_warning", known_id), True,
+                key, True,
                 "Health warning %s [%s]: %s — %s",
                 known_id, warning["severity"],
                 warning["title"], warning["message"],
                 level=level,
             )
         else:
-            log_decision(
-                ("health_warning", known_id), False,
-                "Health warning %s: cleared.", known_id,
-            )
+            # Skip "still not active" — only emit on a real
+            # True→False transition. Bulk of decisions.log noise
+            # came from emitting "cleared" for warnings that were
+            # never active in this process.
+            if _last_decision_state.get(key) is not True:
+                _last_decision_state[key] = False
+                continue
+            _last_decision_state[key] = False
+            # Real transition — emit at DEBUG to the operational
+            # log only, keeping decisions.log focused on active
+            # warnings the operator should act on.
+            logger.debug("Health warning %s: cleared.", known_id)
+
+
+async def collect_health_warnings(
+    api: Optional["BitcartAPI"] = None,
+) -> List[Dict[str, str]]:
+    """Compute + emit transitions in one call. Kept as a thin wrapper
+    so the tick loop call site doesn't need to change. New callers
+    that don't want log emission (the dashboard endpoint) should call
+    compute_health_warnings directly instead."""
+    active = await compute_health_warnings(api)
+    emit_health_warning_transitions(active)
     return active
 
 

@@ -1497,11 +1497,18 @@ async def compute_dashboard(api: Any, range_key: str) -> DashboardResponse:
     # config sanity) + one dynamic check (LN cashouts stale while LN
     # balance exists). Emitted to decisions.log via log_decision inside
     # the audit fn, so the dashboard and the log stream agree.
-    from liquidityhelper import collect_health_warnings
+    # Use the PURE compute_health_warnings — the dashboard endpoint
+    # may run in any of N gunicorn workers, and emitting log_decision
+    # transitions from a worker without persistent dedupe state was
+    # the dominant source of decisions.log spam (one cleared line per
+    # warning ID × per worker × per cache-miss). The tick loop runs
+    # in a single process and is the sole authoritative source for
+    # transition emissions; the dashboard just reads the state.
+    from liquidityhelper import compute_health_warnings
     try:
-        health_warnings_raw = await collect_health_warnings(api)
+        health_warnings_raw = await compute_health_warnings(api)
     except Exception as e:
-        logger.warning(f"collect_health_warnings raised: {e} {traceback.format_exc()}")
+        logger.warning(f"compute_health_warnings raised: {e} {traceback.format_exc()}")
         health_warnings_raw = []
     health_warnings = [HealthWarning(**w) for w in health_warnings_raw]
 

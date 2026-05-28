@@ -42,6 +42,22 @@ import lnd_graph_pull
 from lnd_proto import lightning_pb2
 
 
+# Every test in this file is read-only against the LND rig — they only
+# query GetInfo / DescribeGraph / GetNodeInfo and never close channels
+# or shift balances. The engine-side LightningNode DB rows ARE
+# mutated, but those reset cleanly between tests via the
+# `reset_engine_db_state` autouse below. Sharing one rig per module
+# turns 6 × ~30s setup into 1 × ~30s setup — about 150 seconds saved.
+pytestmark = pytest.mark.usefixtures("reset_engine_db_state")
+
+
+@pytest.fixture(scope="module")
+def lnd_pair(lnd_pair_shared):
+    """Alias the shared module-scoped rig under the same name every
+    test in this file already expects, so test bodies don't change."""
+    return lnd_pair_shared
+
+
 # ---------------------------------------------------------------------------
 # Proto-shape assertion: the fields the readiness gate reads must exist on
 # a REAL LND response. Catches proto staleness as soon as it'd cause a

@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Thread
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import grpc
 import pytest
@@ -198,10 +198,72 @@ def _ensure_electrum_installed() -> None:
 # ---------------------------------------------------------------------------
 
 
+# Per-process set of ports we've already handed out, so successive
+# _free_port() calls within the same worker don't hand out the same
+# port even before the subprocess that uses it has bound to it. Combined
+# with worker-partitioned ranges below, this also prevents the
+# "another worker grabbed our port between close-and-subprocess-bind"
+# OSError [Errno 98] that wrecked xdist parallel runs.
+_alloc_ports: set = set()
+
+
+def _worker_port_range() -> Tuple[int, int]:
+    """Return (low_inclusive, high_exclusive) port range for this xdist
+    worker, or a wide default for non-xdist runs.
+
+    Each xdist worker gets a disjoint 3000-port slice so concurrent
+    `_free_port()` calls in different workers can never return the
+    same port. Without this partition, the classic "bind 0 → close →
+    return port" pattern raced badly under -n auto on 8-core hosts:
+    worker A would close its probe socket, worker B's next probe
+    would land on the same port, and one of them would lose the
+    bind race during subprocess startup with `OSError: [Errno 98]
+    Address already in use`."""
+    import os as _os
+    worker = _os.environ.get("PYTEST_XDIST_WORKER", "")
+    # Non-xdist: full ephemeral range above 20000 avoids the kernel's
+    # default ephemeral range (32768-60999 on Linux) where unrelated
+    # outgoing connections live.
+    if not worker.startswith("gw"):
+        return (20000, 60000)
+    try:
+        n = int(worker[2:])
+    except ValueError:
+        return (20000, 60000)
+    # 16 workers × 3000 ports each → range 20000-68000.
+    low = 20000 + (n * 3000)
+    return (low, low + 3000)
+
+
 def _free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+    """Allocate a free TCP port on 127.0.0.1.
+
+    Picks at random from this worker's partition (see
+    `_worker_port_range`). Verifies the port can be bound at probe
+    time AND records it in `_alloc_ports` so the same worker doesn't
+    hand the same port to two callers before either subprocess has
+    grabbed it.
+
+    Up to 200 retries before giving up — even a saturated 3000-port
+    slice should find a free port within the first few tries.
+    """
+    import random as _random
+    low, high = _worker_port_range()
+    for _ in range(200):
+        port = _random.randrange(low, high)
+        if port in _alloc_ports:
+            continue
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s.bind(("127.0.0.1", port))
+        except OSError:
+            continue
+        _alloc_ports.add(port)
+        return port
+    raise RuntimeError(
+        f"could not allocate a free port in range {low}-{high} after 200 attempts"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -517,7 +579,7 @@ class LndNode:
             info = await self._stub.GetInfo(lightning_pb2.GetInfoRequest())
             if info.synced_to_chain:
                 return
-            await asyncio.sleep(1.0)
+            await asyncio.sleep(0.1)
         raise RuntimeError(f"lnd {self.name} did not reach synced_to_chain")
 
     async def new_address(self) -> str:
@@ -680,7 +742,12 @@ class ElectrumDaemon:
     bin_dir: Path  # unused for Electrum itself (pip-installed) but kept for symmetry
     data_dir: Path
     fulcrum_tcp_port: int
-    rpc_port: int = 5000
+    # Dynamic port (was hardcoded to 5000). With pytest-xdist multiple
+    # workers each spin up their own Electrum daemon — sharing port
+    # 5000 made parallel runs flake out with OSError [Errno 98].
+    # Tests now set LIQUIDITYHELPER_ELECTRUM_RPC_URL pointing at this
+    # port; liquidityhelper.electrum_rpc reads it.
+    rpc_port: int = field(default_factory=_free_port)
     rpc_user: str = "electrum"
     rpc_password: str = "electrumz"
     lightning_p2p_port: int = field(default_factory=_free_port)
@@ -965,11 +1032,14 @@ async def _setup_test_env_async(data_dir: Path, fee_url: str) -> LndPair:
     btc.send(await a.new_address(), 2.0)
     btc.send(await b.new_address(), 2.0)
     btc.mine_to_self(6)
+    # 60s deadline, polled at 100ms — regtest normally confirms in
+    # 100-500ms; the prior 1s cadence wasted ~1s per fixture on this
+    # one wait alone.
     for n in (a, b):
-        for _ in range(60):
+        for _ in range(600):
             if await n.wallet_balance_sats() >= int(2 * 100_000_000 * 0.99):
                 break
-            await asyncio.sleep(1.0)
+            await asyncio.sleep(0.1)
         else:
             raise RuntimeError(f"lnd {n.name} never saw confirmed funds")
 
@@ -986,16 +1056,20 @@ async def _setup_test_env_async(data_dir: Path, fee_url: str) -> LndPair:
     # cheapest reliable fix.
     btc.mine_to_self(10)
 
-    # Wait for A to see both as active.
-    for _ in range(60):
+    # Wait for A to see both as active. 100ms cadence.
+    for _ in range(600):
         chans = await a.list_channels()
         cps = {c.get("channel_point"): c.get("active") for c in chans}
         if cps.get(a_to_b_cp) is True and cps.get(b_to_a_cp) is True:
             break
-        await asyncio.sleep(1.0)
-    # Give gossip a moment to propagate channel_update messages so the
-    # path-finder has the policy info it needs to route through these channels.
-    await asyncio.sleep(3.0)
+        await asyncio.sleep(0.1)
+    # Settle wait for channel_update gossip propagation between the
+    # two LNDs. 2.0s (was 3.0s) — shorter than the original for
+    # serial-test speedup, but long enough that pytest-xdist 8-way
+    # parallel runs don't see path-finder "insufficient_balance"
+    # failures from the channel_update message arriving after a
+    # test's first SendPayment attempt under heavy CPU contention.
+    await asyncio.sleep(2.0)
 
     return LndPair(
         bitcoind=btc, a=a, b=b,
@@ -1067,11 +1141,12 @@ async def _setup_lnd_pair_no_channels_async(
     btc.send(await a.new_address(), 2.0)
     btc.send(await b.new_address(), 2.0)
     btc.mine_to_self(6)
+    # 60s deadline at 100ms cadence (was 1s; regtest confirms <500ms).
     for n in (a, b):
-        for _ in range(60):
+        for _ in range(600):
             if await n.wallet_balance_sats() >= int(2 * 100_000_000 * 0.99):
                 break
-            await asyncio.sleep(1.0)
+            await asyncio.sleep(0.1)
         else:
             raise RuntimeError(f"lnd {n.name} never saw confirmed funds")
 
@@ -1109,10 +1184,25 @@ def event_loop():
 @pytest.fixture(scope="session", autouse=True)
 def _wipe_data_dir():
     """Wipe tests/_data/ at the start of the session so old per-test dirs
-    don't accumulate forever. (Each test creates its own subdir below.)"""
-    if DATA_DIR.exists():
-        shutil.rmtree(DATA_DIR)
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    don't accumulate forever. (Each test creates its own subdir below.)
+
+    xdist-safe: when running under pytest-xdist, every worker thinks
+    it has its own "session" but they all share the host filesystem.
+    If each worker wipes, worker B's wipe nukes the test dirs worker
+    A just created → FileNotFoundError on subsequent tests. Under
+    xdist we just ensure the dir exists and skip the wipe (the
+    operator can clean up manually between runs; per-test dirs carry
+    UUIDs so they don't collide). The non-xdist path keeps the
+    automatic wipe so the serial workflow stays clean.
+    """
+    import os as _os
+    is_xdist_worker = bool(_os.environ.get("PYTEST_XDIST_WORKER"))
+    if is_xdist_worker:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+    else:
+        if DATA_DIR.exists():
+            shutil.rmtree(DATA_DIR)
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
     yield
 
 
@@ -1240,16 +1330,17 @@ async def _setup_lnd_electrum_pair_async(data_dir: Path, fee_url: str) -> LndEle
     btc.send(await lnd.new_address(), 2.0)
     btc.send(electrum.getunusedaddress(), 2.0)
     btc.mine_to_self(6)
-    for _ in range(60):
+    # 60s deadline, polled at 100ms (regtest confirms within ~500ms).
+    for _ in range(600):
         if await lnd.wallet_balance_sats() >= int(2 * 100_000_000 * 0.99):
             break
-        await asyncio.sleep(1.0)
+        await asyncio.sleep(0.1)
     else:
         raise RuntimeError("LND never saw confirmed funds")
-    for _ in range(60):
+    for _ in range(600):
         if electrum.getbalance_btc() >= 2.0 * 0.99:
             break
-        await asyncio.sleep(1.0)
+        await asyncio.sleep(0.1)
     else:
         raise RuntimeError("Electrum never saw confirmed funds")
 
@@ -1270,15 +1361,22 @@ async def _setup_lnd_electrum_pair_async(data_dir: Path, fee_url: str) -> LndEle
     # Mine extra blocks past channel-ready so gossip can disseminate
     # channel_update messages before any test tries to route over them.
     btc.mine_to_self(10)
-    await asyncio.sleep(3.0)
 
-    # Wait for LND to see both channels active.
-    for _ in range(60):
+    # Wait for LND to see both channels active. 100ms cadence; gossip
+    # settle is folded into the active poll (no separate sleep needed —
+    # by the time active=True on both, channel_update has been heard).
+    for _ in range(600):
         chans = await lnd.list_channels()
         cps = {c.get("channel_point"): c.get("active") for c in chans}
         if cps.get(electrum_to_lnd_cp) is True and cps.get(lnd_to_electrum_cp) is True:
             break
-        await asyncio.sleep(1.0)
+        await asyncio.sleep(0.1)
+    # Settle so a path-finding test that hits these channels
+    # immediately after the fixture returns isn't racing the very
+    # first channel_update broadcast. 2.0s — shorter than the
+    # original 3.0s but long enough under xdist's parallel CPU
+    # load to avoid path-finder "insufficient_balance" races.
+    await asyncio.sleep(2.0)
 
     return LndElectrumPair(
         bitcoind=btc, fulcrum=fulcrum, lnd=lnd, electrum=electrum,
@@ -1296,6 +1394,61 @@ async def _teardown_lnd_electrum_pair_async(pair: LndElectrumPair) -> None:
     pair.bitcoind.stop()
 
 
+_ELECTRUM_RPC_URL_ENV = "LIQUIDITYHELPER_ELECTRUM_RPC_URL"
+
+
+def _point_engine_at(pair: LndElectrumPair) -> Optional[str]:
+    """Set the engine's electrum_rpc URL env var to this rig's
+    Electrum port, returning the prior value (for restore at
+    teardown).
+
+    Required because module-scope and function-scope Electrum
+    fixtures can coexist within the same module — a function-scope
+    rig overriding the env var must restore the module rig's URL
+    on teardown, not blanket-delete it.
+    """
+    prior = os.environ.get(_ELECTRUM_RPC_URL_ENV)
+    os.environ[_ELECTRUM_RPC_URL_ENV] = f"http://localhost:{pair.electrum.rpc_port}"
+    return prior
+
+
+def _restore_engine_url(prior: Optional[str]) -> None:
+    """Counterpart to _point_engine_at."""
+    if prior is None:
+        os.environ.pop(_ELECTRUM_RPC_URL_ENV, None)
+    else:
+        os.environ[_ELECTRUM_RPC_URL_ENV] = prior
+
+
+@pytest.fixture(scope="module")
+def lnd_electrum_pair_shared(request, event_loop, _binaries, _fee_url, _wipe_data_dir) -> LndElectrumPair:
+    """Module-scoped sibling of `lnd_electrum_pair` — same bitcoind +
+    Fulcrum + LND + Electrum + 2 channels rig, but the ~36s setup
+    pays once per module instead of once per test. Read-only tests
+    (history queries, fixture-smoke checks) opt into this fixture
+    for the savings; mutating tests (channel close, payment sends)
+    keep `lnd_electrum_pair` for fresh rigs.
+
+    Sets LIQUIDITYHELPER_ELECTRUM_RPC_URL to its dynamic port for
+    the duration of the module — the engine's electrum_rpc bridge
+    reads that env var. Function-scope `lnd_electrum_pair` rigs in
+    the same module save/restore around their own override so this
+    fixture's URL is preserved across mutating-test setups.
+    """
+    short = uuid.uuid4().hex[:8]
+    module_name = getattr(request.node, "module", None)
+    module_id = getattr(module_name, "__name__", "shared").rsplit(".", 1)[-1]
+    data_dir = DATA_DIR / f"{module_id}-shared-electrum-{short}"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    pair = event_loop.run_until_complete(_setup_lnd_electrum_pair_async(data_dir, _fee_url))
+    prior_url = _point_engine_at(pair)
+    try:
+        yield pair
+    finally:
+        _restore_engine_url(prior_url)
+        event_loop.run_until_complete(_teardown_lnd_electrum_pair_async(pair))
+
+
 @pytest.fixture(scope="function")
 def lnd_electrum_pair(request, event_loop, _binaries, _fee_url, _wipe_data_dir) -> LndElectrumPair:
     """Full per-test setup for the Electrum dispatch tests."""
@@ -1303,9 +1456,11 @@ def lnd_electrum_pair(request, event_loop, _binaries, _fee_url, _wipe_data_dir) 
     data_dir = DATA_DIR / f"{request.node.name}-{short}"
     data_dir.mkdir(parents=True, exist_ok=True)
     pair = event_loop.run_until_complete(_setup_lnd_electrum_pair_async(data_dir, _fee_url))
+    prior_url = _point_engine_at(pair)
     try:
         yield pair
     finally:
+        _restore_engine_url(prior_url)
         event_loop.run_until_complete(_teardown_lnd_electrum_pair_async(pair))
 
 
@@ -1357,6 +1512,72 @@ def lnd_pair_no_channels(
         event_loop.run_until_complete(
             _teardown_lnd_pair_no_channels_async(pair)
         )
+
+
+@pytest.fixture(scope="module")
+def lnd_pair_shared(request, event_loop, _binaries, _fee_url, _wipe_data_dir) -> LndPair:
+    """Module-scoped sibling of `lnd_pair` — same bitcoind + 2 LNDs +
+    2 channels rig, but the setup pays for itself ONCE per test
+    module rather than once per test. Test files that fit this
+    fixture (i.e. their tests are read-only against the LND rig OR
+    they cooperate via the `_reset_engine_db_state` autouse below)
+    save ~30 seconds per test.
+
+    Mutating tests — those that close channels, send LN payments
+    that materially shift balance, or change peer connection state —
+    should keep using the function-scoped `lnd_pair` so they get a
+    fresh rig.
+    """
+    short = uuid.uuid4().hex[:8]
+    # The data dir is keyed by the MODULE (request.node.parent.name)
+    # so all tests in the same file share one rig but parallel
+    # module runs get distinct dirs.
+    module_name = getattr(request.node, "module", None)
+    module_id = getattr(module_name, "__name__", "shared").rsplit(".", 1)[-1]
+    data_dir = DATA_DIR / f"{module_id}-shared-{short}"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    pair = event_loop.run_until_complete(_setup_test_env_async(data_dir, _fee_url))
+    try:
+        yield pair
+    finally:
+        event_loop.run_until_complete(_teardown_test_env_async(pair))
+
+
+@pytest.fixture
+def reset_engine_db_state():
+    """Function-scope helper that test files using shared rigs can
+    `autouse=True` to keep cross-test DB state from leaking.
+
+    Clears the engine-side rows that tests commonly mutate:
+      - LightningNode (gossip-pull state, peer-uptime samples)
+      - LspChannelOrder (LSP order tracking)
+      - In-memory caches in liquidityhelper (_LND_CONNECTIONS,
+        _last_decision_state) so a test's connection cache doesn't
+        bleed into the next test.
+
+    Defensive: every clear is wrapped in try/except so a sqlite
+    test environment that hasn't initialized a particular table
+    doesn't crash the autouse hook.
+    """
+    try:
+        from node_database import LightningNode, LspChannelOrder
+        try:
+            LightningNode.delete().execute()
+        except Exception:
+            pass
+        try:
+            LspChannelOrder.delete().execute()
+        except Exception:
+            pass
+    except Exception:
+        pass
+    try:
+        import liquidityhelper
+        liquidityhelper._LND_CONNECTIONS.clear()
+        liquidityhelper._last_decision_state.clear()
+    except Exception:
+        pass
+    yield
 
 
 @pytest.fixture(scope="function")
@@ -1493,11 +1714,12 @@ async def _setup_loop_rig_async(data_dir: Path, fee_url: str) -> LoopRig:
     btc.send(await a.new_address(), 2.0)
     btc.send(await s.new_address(), 2.0)
     btc.mine_to_self(6)
+    # 60s deadline at 100ms cadence (was 1s; regtest confirms <500ms).
     for n in (a, s):
-        for _ in range(60):
+        for _ in range(600):
             if await n.wallet_balance_sats() >= int(2 * 100_000_000 * 0.99):
                 break
-            await asyncio.sleep(1.0)
+            await asyncio.sleep(0.1)
         else:
             raise RuntimeError(f"lnd {n.name} never saw confirmed funds")
 
@@ -1505,13 +1727,15 @@ async def _setup_loop_rig_async(data_dir: Path, fee_url: str) -> LoopRig:
     await a.connect_peer(s.identity_pubkey, "127.0.0.1", s.p2p_port)
     a_to_s_cp = await a.open_channel_sync(s.identity_pubkey, int(0.2 * 100_000_000))
     btc.mine_to_self(10)
-    for _ in range(60):
+    for _ in range(600):
         chans = await a.list_channels()
         cps = {c.get("channel_point"): c.get("active") for c in chans}
         if cps.get(a_to_s_cp) is True:
             break
-        await asyncio.sleep(1.0)
-    await asyncio.sleep(3.0)  # gossip settle for channel_update
+        await asyncio.sleep(0.1)
+    # Short settle for the first channel_update broadcast — was 3s
+    # unconditional, 0.5s is enough on a same-host regtest pair.
+    await asyncio.sleep(0.5)
 
     # Stand up loopserver in a container. The image expects:
     #   - an LND backend exposed via gRPC + macaroon  (we mount tls/macaroon)
