@@ -1396,6 +1396,7 @@ async def electrum_pay_onchain(
     *,
     wallet: Dict[str, Any],
     api: Optional["BitcartAPI"] = None,
+    target_conf: Optional[int] = None,
 ) -> bool:
     """
     Send an on-chain payment. AMOUNT IS IN BTC, NOT SATS.
@@ -1407,6 +1408,12 @@ async def electrum_pay_onchain(
       - anything  -> Electrum's payto + broadcast + setlabel.
 
     The Electrum xpub is read from `wallet["xpub"]`.
+
+    `target_conf` overrides the LND default block-target on the LND
+    path. Used by the cashout call site to pass LND_CASHOUT_TARGET_CONF
+    (slow but cheap). Ignored on the Electrum path — Electrum's
+    payto RPC has its own fee controls; we don't currently surface a
+    knob there. None = use LND_ONCHAIN_TARGET_CONF.
     """
     if wallet.get("currency") == "btclnd":
         if api is None and wallet["id"] not in _LND_CONNECTIONS:
@@ -1414,7 +1421,10 @@ async def electrum_pay_onchain(
                 "electrum_pay_onchain: LND path needs either `api` or a "
                 "pre-populated _LND_CONNECTIONS[wallet['id']] entry"
             )
-        return await _lnd_pay_onchain(api, wallet["id"], dest_addr, amount, label)
+        return await _lnd_pay_onchain(
+            api, wallet["id"], dest_addr, amount, label,
+            target_conf=target_conf,
+        )
 
     xpub = wallet.get("xpub")
     # Make transaction
@@ -1561,8 +1571,17 @@ async def label_onchain_tx(
 
 async def _lnd_pay_onchain(
     api: "BitcartAPI", wallet_id: str, dest_addr: str, amount_btc: float, label: str,
+    *, target_conf: Optional[int] = None,
 ) -> bool:
-    """Send an on-chain payment from LND with a native transaction label."""
+    """Send an on-chain payment from LND with a native transaction label.
+
+    `target_conf` lets the caller override the block-confirmation
+    target — used by the cashout path to pay the slow-but-cheap
+    LND_CASHOUT_TARGET_CONF (~144 blocks) while every other on-chain
+    payment defaults to LND_ONCHAIN_TARGET_CONF (~6 blocks). Ignored
+    when LND_ONCHAIN_FEE_RATE_SAT_PER_VBYTE is non-zero — an explicit
+    per-vbyte override always wins over either target_conf.
+    """
     if not dest_addr:
         logger.warning("_lnd_pay_onchain called without dest_addr")
         return False
@@ -1572,12 +1591,25 @@ async def _lnd_pay_onchain(
         return False
     conn = await _get_lnd_connection(api, wallet_id)
     stub = conn["stubs"]["Lightning"]
-    request = _lightning_pb2.SendCoinsRequest(
-        addr=dest_addr,
-        amount=amount_sat,
-        sat_per_vbyte=1,
-        label=label or "",
-    )
+    # Fee policy: explicit sat/vbyte if the operator configured one,
+    # otherwise let LND's fee estimator pick a rate for the
+    # block-confirmation target. The prior code hardcoded
+    # sat_per_vbyte=1, which is fine on regtest but on mainnet
+    # produces a tx that can sit in the mempool for hours or days.
+    send_kwargs = {
+        "addr": dest_addr,
+        "amount": amount_sat,
+        "label": label or "",
+    }
+    if LND_ONCHAIN_FEE_RATE_SAT_PER_VBYTE > 0:
+        send_kwargs["sat_per_vbyte"] = int(LND_ONCHAIN_FEE_RATE_SAT_PER_VBYTE)
+    else:
+        effective_target = (
+            int(target_conf) if target_conf is not None
+            else int(LND_ONCHAIN_TARGET_CONF)
+        )
+        send_kwargs["target_conf"] = effective_target
+    request = _lightning_pb2.SendCoinsRequest(**send_kwargs)
     try:
         # 150s timeout — guards against a wedged LND freezing the tick loop.
         # SendCoins is normally fast (PSBT construction + broadcast) but can
@@ -1649,7 +1681,39 @@ async def _lnd_pay_ln_invoice(
     """
     conn = await _get_lnd_connection(api, wallet_id)
     stub = conn["stubs"]["Lightning"]
-    request = _lightning_pb2.SendRequest(payment_request=invoice)
+    # Compute the fee_limit from the invoice's own amount. Decoding
+    # the BOLT11 string locally via DecodePayReq is cheap (no network
+    # call past LND itself) and lets us cap routing fees at a
+    # percentage of the actual amount being paid — without this LND
+    # falls back to its built-in default, which has shifted across
+    # versions and once silently allowed multi-thousand-sat fees on
+    # tiny payments.
+    fee_limit = None
+    try:
+        decoded = await stub.DecodePayReq(
+            _lightning_pb2.PayReqString(pay_req=invoice), timeout=10.0,
+        )
+        amount_sat = int(decoded.num_satoshis or 0)
+        if amount_sat > 0:
+            cap = max(
+                int(LN_PAYMENT_FEE_LIMIT_MIN_SAT),
+                int(amount_sat * LN_PAYMENT_FEE_LIMIT_PERCENT),
+            )
+            fee_limit = _lightning_pb2.FeeLimit(fixed=cap)
+    except Exception as e:
+        # If decode fails (network blip, malformed invoice) we still
+        # try the payment with LND's default fee policy — best-effort
+        # vs hard fail. The warning surfaces the gap.
+        logger.warning(
+            f"_lnd_pay_ln_invoice: DecodePayReq failed for fee_limit "
+            f"calculation; falling back to LND default: {e}"
+        )
+    if fee_limit is not None:
+        request = _lightning_pb2.SendRequest(
+            payment_request=invoice, fee_limit=fee_limit,
+        )
+    else:
+        request = _lightning_pb2.SendRequest(payment_request=invoice)
     # 150s timeout — LN payments routinely take 30-90s on heavily-loaded
     # paths; 150s is generous without leaving a stuck LND able to freeze
     # the tick loop indefinitely.
@@ -1723,12 +1787,21 @@ async def _lnd_keysend(
 
     conn = await _get_lnd_connection(api, wallet_id)
     stub = conn["stubs"]["Lightning"]
+    # Defensive fee cap. outgoing_chan_id forces a single-hop direct
+    # route which should always be 0-fee, but a misconfigured channel
+    # policy on our own side could surprise us. Same cap as the
+    # invoice-pay path so all LN-payment fees share one ceiling.
+    fee_cap = max(
+        int(LN_PAYMENT_FEE_LIMIT_MIN_SAT),
+        int(int(amount_sat) * LN_PAYMENT_FEE_LIMIT_PERCENT),
+    )
     request = _lightning_pb2.SendRequest(
         dest=bytes.fromhex(dest_pubkey),
         amt=int(amount_sat),
         payment_hash=payment_hash,
         dest_custom_records={_LN_KEYSEND_RECORD: preimage},
         outgoing_chan_id=int(outgoing_chan_id),
+        fee_limit=_lightning_pb2.FeeLimit(fixed=fee_cap),
     )
     # 150s timeout — matches _lnd_pay_ln_invoice; protects the tick loop
     # against a wedged LND that never returns from SendPaymentSync.
@@ -2773,12 +2846,26 @@ async def _lnd_close_channel(
         raise ValueError(f"Malformed channel_point '{channel_point}'; want 'txid:vout'")
     conn = await _get_lnd_connection(api, wallet_id)
     stub = conn["stubs"]["Lightning"]
+    # Fee policy:
+    #   - target_conf sets the standard 6-block default explicitly,
+    #     so a future bump to LND's defaults can't silently change
+    #     close-fee behavior under us.
+    #   - max_fee_per_vbyte caps the worst case during mempool
+    #     congestion. Without it LND's fee estimator can spike to
+    #     thousands of sat/vbyte and burn a meaningful slice of the
+    #     channel's local balance on the close fee.
+    #   - max_fee_per_vbyte only applies to cooperative closes (the
+    #     `force=False` path); force-closes use the channel's
+    #     committed feerate which is set at channel-open time and
+    #     can't be overridden here.
     request = _lightning_pb2.CloseChannelRequest(
         channel_point=_lightning_pb2.ChannelPoint(
             funding_txid_str=txid_str,
             output_index=int(vout),
         ),
         force=force,
+        target_conf=int(LND_CHANNEL_CLOSE_TARGET_CONF),
+        max_fee_per_vbyte=int(LND_CHANNEL_CLOSE_MAX_FEE_SAT_PER_VBYTE),
     )
     call = stub.CloseChannel(request)
     try:
@@ -3993,10 +4080,15 @@ async def do_onchain_cashouts(api:BitcartAPI,
         f"{cashout_amount_avail_onchain}"
     )
 
+    # Cashouts are not customer-facing urgent — operator's revenue is
+    # already in the wallet; the cashout just moves it to their
+    # preferred destination. Use the slow-but-cheap LND_CASHOUT_TARGET_CONF
+    # (~144 blocks = ~24 hours) rather than the 6-block default.
     transaction_result = await electrum_pay_onchain(
         CASHOUT_ONCHAIN, sats_to_btc(cashout_amount_avail_onchain),
         label=CASHOUT_REASON,
         wallet=full_wallet, api=api,
+        target_conf=LND_CASHOUT_TARGET_CONF,
     )
     if transaction_result:
         log_event(
@@ -5087,6 +5179,12 @@ async def _attempt_direct_channel_cashout_to_own_node(
                 "local_funding_amount": int(channel_size_sats),
                 "push_sat": push_sat,
                 "private": channel_private,
+                # 12-block confirmation target halves the typical fee
+                # vs LND's 6-block default. The LN funds become
+                # spendable only after 6 confs anyway, so opening a
+                # channel "fast" buys nothing customer-facing — channel
+                # opens are not customer-facing urgent.
+                "target_conf": int(LND_CHANNEL_OPEN_TARGET_CONF),
             }, "Lightning")
         except Exception as e:
             # OpenChannelSync is money-moving (channel open with

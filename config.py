@@ -484,6 +484,87 @@ MANUAL_RESERVE_SAFETY_SAT: int = 1_000
 
 
 # =============================================================================
+# === LND fee controls ===
+# =============================================================================
+#
+# Per-tx miner-fee + per-payment routing-fee knobs for the LND-direct
+# paths (SendCoins, SendPaymentSync, OpenChannelSync, CloseChannel).
+# All paths previously inherited LND's hardcoded defaults or used
+# placeholder values that were fine for regtest but wrong on mainnet.
+#
+# Defaults below are tuned for mainnet at typical congestion. The
+# direct-channel cashout path uses a higher (cheaper) target_conf
+# because channel opens are less urgent than payouts; cooperative
+# closes use the standard 6-block target with a hard ceiling so a
+# fee-estimator spike can't burn the channel's local balance.
+
+# Block-confirmation target for on-chain SendCoins payments OTHER
+# than cashouts (developer fee, referral fee, LSP order payment, etc).
+# LND queries its fee estimator for the sat/vbyte rate that targets
+# confirmation within N blocks. 6 = LND's own internal default
+# (~30-60 min on mainnet); raise for cheaper but slower confirmation,
+# lower for faster but more expensive. Cashouts use their own
+# (slower, cheaper) target via LND_CASHOUT_TARGET_CONF below.
+LND_ONCHAIN_TARGET_CONF: int = 6
+
+# Block-confirmation target for on-chain cashout payments
+# (CASHOUT_ONCHAIN sends labeled `lnhelper_cashout`). Set high
+# because cashouts are not customer-facing urgent — the operator's
+# revenue is already sitting in the wallet and the cashout just
+# moves it to their preferred destination. A 144-block (~24-hour)
+# target typically pays the very lowest sat/vbyte rate LND's fee
+# estimator advertises, saving ~5-10x vs the 6-block default during
+# normal mainnet conditions and ~20-50x during congestion. The
+# trade-off is that the cashout may sit unconfirmed for up to a
+# day, which is fine for routine wallet-drain operations.
+LND_CASHOUT_TARGET_CONF: int = 144
+
+# Explicit sat/vbyte override for on-chain SendCoins payments. When
+# non-zero this wins over LND_ONCHAIN_TARGET_CONF. Use only when you
+# need to force a specific feerate (e.g. operator manually picked a
+# rate from mempool.space during a congestion spike). 0 = let
+# LND_ONCHAIN_TARGET_CONF + LND's fee estimator decide.
+LND_ONCHAIN_FEE_RATE_SAT_PER_VBYTE: int = 0
+
+# Block-confirmation target for direct-channel cashouts
+# (OpenChannelSync with push_sat). Channel opens are less urgent than
+# regular payouts — a 12-block target halves the typical fee vs the
+# 6-block default at the cost of one extra hour to confirmation,
+# which doesn't matter because the LN funds become spendable only
+# after 6 confs anyway.
+LND_CHANNEL_OPEN_TARGET_CONF: int = 12
+
+# Block-confirmation target for cooperative channel closes.
+# Cooperative closes typically settle within hours; we want them
+# confirmed promptly so the local balance becomes spendable, but
+# they're not customer-facing urgent.
+LND_CHANNEL_CLOSE_TARGET_CONF: int = 6
+
+# Hard ceiling on the close tx's per-vbyte feerate. LND's fee
+# estimator can spike during mempool congestion (multi-thousand
+# sat/vbyte during 2024 inscription seasons); without a ceiling a
+# close fee could eat a meaningful fraction of the channel's local
+# balance. 50 sat/vbyte is plenty for "fast" under typical mainnet
+# conditions and caps the worst case at ~25k sats per close on a
+# 500 vbyte tx.
+LND_CHANNEL_CLOSE_MAX_FEE_SAT_PER_VBYTE: int = 50
+
+# Maximum LN routing fee (as a fraction of the payment amount) for
+# every outgoing LN payment except the AMP fallback (which has its
+# own cap baked in). Defends against a poorly-routed payment paying
+# surprising fees — without this, LND's default fee_limit applies,
+# which has shifted across LND versions.
+# 0.02 = 2%, matches the engine's developer fee rate so a worst-case
+# fee payment can't itself cost more than the fee being paid.
+LN_PAYMENT_FEE_LIMIT_PERCENT: float = 0.02
+
+# Absolute floor for the LN routing-fee cap. Used when a payment is
+# so small that PCT × amount rounds to 0 (which LND's path-finder
+# rejects). 50 sats covers a 5-hop route at 10 sat/hop.
+LN_PAYMENT_FEE_LIMIT_MIN_SAT: int = 50
+
+
+# =============================================================================
 # === Submarine swaps (LN → on-chain) ===
 # =============================================================================
 #
