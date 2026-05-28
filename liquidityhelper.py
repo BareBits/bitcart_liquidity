@@ -2936,12 +2936,67 @@ async def move_onchain_to_ln(
                 partner, fmt_btc_sats(amount_sats),
                 wallet_short(wallet_id),
             )
-            move_response = await api.open_ln_channel(wallet_id, partner, amount_sats)
+            # Direct LND gRPC path (was: api.open_ln_channel via the
+            # Bitcart HTTP endpoint → btclnd daemon → LND). Going
+            # direct lets us pass LND fee + CSV controls
+            # (target_conf, max_local_csv, remote_csv_delay) that the
+            # Bitcart daemon's open_channel doesn't currently accept.
+            # The Electrum guard above (currency != btclnd → return
+            # False) means this path only ever runs against an LND
+            # wallet; Electrum-hosted channels would still need to
+            # use Bitcart's API path (not currently implemented).
+            host_port = ""
+            if "@" in partner:
+                _, _, host_port = partner.partition("@")
+            # Best-effort peer connection. LND.ConnectPeer is
+            # idempotent — returns success when already connected,
+            # an error otherwise. Errors are swallowed because
+            # OpenChannelSync will surface the underlying problem
+            # more concretely if the peer truly isn't reachable.
+            if host_port:
+                try:
+                    await lnd_rpc(api, wallet_id, "ConnectPeer", {
+                        "addr": {"pubkey": partner_pubkey, "host": host_port},
+                        "perm": False,
+                    }, "Lightning")
+                except Exception as e:
+                    logger.debug(
+                        f"move_onchain_to_ln: ConnectPeer to {partner} "
+                        f"failed (will still try OpenChannelSync, peer "
+                        f"may already be in LND's peer list): {e}"
+                    )
+            open_kwargs: Dict[str, Any] = {
+                "node_pubkey_string": partner_pubkey,
+                "local_funding_amount": int(amount_sats),
+                # Public channel by default — these are operator-
+                # picked routing partners, not OWN_LIGHTNING_NODES
+                # entries. Operators wanting private channels here
+                # would need a separate knob (not currently exposed
+                # because the manual-channel-creation path is
+                # specifically for building routing capacity).
+                "private": False,
+                "target_conf": int(LND_CHANNEL_OPEN_TARGET_CONF),
+                "max_local_csv": int(LND_MAX_LOCAL_CSV_BLOCKS),
+            }
+            if LND_REMOTE_CSV_DELAY_BLOCKS > 0:
+                open_kwargs["remote_csv_delay"] = int(LND_REMOTE_CSV_DELAY_BLOCKS)
+            try:
+                move_response = await lnd_rpc(
+                    api, wallet_id, "OpenChannelSync", open_kwargs, "Lightning",
+                )
+            except Exception as e:
+                logger.warning(
+                    f"move_onchain_to_ln: OpenChannelSync to {partner} for "
+                    f"wallet {wallet_short(wallet_id)} raised: {e} "
+                    f"{traceback.format_exc()}"
+                )
+                continue
             if move_response:  # channel opened successfully
-                # move_response is a daemon-shaped dict (LND: funding_txid +
-                # output_index; Electrum: similar). Include the amount and
-                # peer explicitly alongside so the operator doesn't have to
-                # parse the daemon blob to know what just happened.
+                # move_response is a daemon-shaped dict (LND:
+                # funding_txid_str / funding_txid_bytes + output_index).
+                # Include the amount and peer explicitly alongside so
+                # the operator doesn't have to parse the daemon blob
+                # to know what just happened.
                 log_event(
                     "Channel opened to %s for %s (wallet …%s); daemon response: %s",
                     partner, fmt_btc_sats(amount_sats),
@@ -5576,19 +5631,29 @@ async def _attempt_direct_channel_cashout_to_own_node(
         # set OWN_LIGHTNING_NODES_ANNOUNCE_CHANNELS=True to override
         # if their peer is reliably always online.
         channel_private = not OWN_LIGHTNING_NODES_ANNOUNCE_CHANNELS
+        open_kwargs: Dict[str, Any] = {
+            "node_pubkey_string": pubkey,
+            "local_funding_amount": int(channel_size_sats),
+            "push_sat": push_sat,
+            "private": channel_private,
+            # 12-block confirmation target halves the typical fee
+            # vs LND's 6-block default. The LN funds become
+            # spendable only after 6 confs anyway, so opening a
+            # channel "fast" buys nothing customer-facing — channel
+            # opens are not customer-facing urgent.
+            "target_conf": int(LND_CHANNEL_OPEN_TARGET_CONF),
+            # Cap on the CSV delay the peer can impose on our
+            # `to_local` output. Lower = faster recovery if we
+            # force-close. See config.py LND_MAX_LOCAL_CSV_BLOCKS
+            # for the trade-off discussion.
+            "max_local_csv": int(LND_MAX_LOCAL_CSV_BLOCKS),
+        }
+        if LND_REMOTE_CSV_DELAY_BLOCKS > 0:
+            # 0 = let LND auto-scale by channel size (the default).
+            # Operators usually leave this on auto.
+            open_kwargs["remote_csv_delay"] = int(LND_REMOTE_CSV_DELAY_BLOCKS)
         try:
-            open_resp = await lnd_rpc(api, wallet_id, "OpenChannelSync", {
-                "node_pubkey_string": pubkey,
-                "local_funding_amount": int(channel_size_sats),
-                "push_sat": push_sat,
-                "private": channel_private,
-                # 12-block confirmation target halves the typical fee
-                # vs LND's 6-block default. The LN funds become
-                # spendable only after 6 confs anyway, so opening a
-                # channel "fast" buys nothing customer-facing — channel
-                # opens are not customer-facing urgent.
-                "target_conf": int(LND_CHANNEL_OPEN_TARGET_CONF),
-            }, "Lightning")
+            open_resp = await lnd_rpc(api, wallet_id, "OpenChannelSync", open_kwargs, "Lightning")
         except Exception as e:
             # OpenChannelSync is money-moving (channel open with
             # push_sat). Log the full stack so an unexpected error

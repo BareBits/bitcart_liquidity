@@ -305,6 +305,178 @@ def test_lnd_keysend_sets_fee_limit_from_amount(monkeypatch):
 # CloseChannel
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# OpenChannelSync — CSV wiring (path 2: direct-channel cashout, path 3:
+# move_onchain_to_ln). Both paths now go DIRECTLY to LND via lnd_rpc
+# (move_onchain_to_ln used to go through Bitcart's api.open_ln_channel
+# — that path doesn't accept CSV params, so we switched to direct).
+# ---------------------------------------------------------------------------
+
+def test_move_onchain_to_ln_uses_direct_lnd_rpc_with_csv_params(monkeypatch, event_loop):
+    """move_onchain_to_ln now bypasses api.open_ln_channel and calls
+    lnd_rpc directly so it can set max_local_csv (the cap on OUR CSV
+    delay if we force-close). Pin both the bypass AND the CSV param.
+    """
+    import liquidityhelper as lh
+    from node_database import LightningNode
+    monkeypatch.setattr(lh, "MANUAL_CHANNEL_CREATION_ENABLED", True, raising=False)
+    monkeypatch.setattr(lh, "LND_MAX_LOCAL_CSV_BLOCKS", 144, raising=False)
+    monkeypatch.setattr(lh, "LND_REMOTE_CSV_DELAY_BLOCKS", 0, raising=False)
+    monkeypatch.setattr(lh, "LND_CHANNEL_OPEN_TARGET_CONF", 12, raising=False)
+    monkeypatch.setattr(lh, "DRY_RUN_FUNDS", False, raising=False)
+    lh._last_decision_state.clear()
+
+    # A peer in the candidate DB (else move_onchain_to_ln skips it).
+    LightningNode.delete().execute()
+    LightningNode.create(
+        node_address="ab" * 33,
+        alias="test-peer",
+        ipv4_address="1.2.3.4:9735",
+        total_capacity=10_000_000,
+        channel_count=10,
+        median_outbound_fee_rate_ppm=1,
+        effective_degree=20,
+        two_hop_reach=100,
+        last_updated=lh.utcnow_naive(),
+    )
+    monkeypatch.setattr(lh, "is_node_blacklisted", lambda n: (False, None))
+
+    # Fake pick_best_channel_partners → return our test peer URI.
+    peer_uri = "ab" * 33 + "@1.2.3.4:9735"
+    async def fake_pick(*a, **kw):
+        return [peer_uri]
+    monkeypatch.setattr(lh, "pick_best_channel_partners", fake_pick)
+
+    # Track the lnd_rpc call so we can inspect args.
+    lnd_calls: list = []
+    async def fake_lnd_rpc(api_obj, wallet_id, method, params, service):
+        lnd_calls.append((method, params))
+        if method == "OpenChannelSync":
+            return {"funding_txid_str": "aa" * 32, "output_index": 0}
+        return {}
+    monkeypatch.setattr(lh, "lnd_rpc", fake_lnd_rpc)
+
+    class _FakeAPI:
+        async def get_wallet(self, wid):
+            return {"id": wid, "currency": "btclnd"}
+        async def get_wallet_ln_channels(self, *a, **kw):
+            return []
+        # Should NEVER be called — the refactor must NOT route through
+        # the Bitcart HTTP open_ln_channel endpoint.
+        called_open_ln_channel = False
+        async def open_ln_channel(self, *a, **kw):
+            type(self).called_open_ln_channel = True
+            raise AssertionError(
+                "move_onchain_to_ln must use lnd_rpc directly, NOT "
+                "api.open_ln_channel — Bitcart's open_channel endpoint "
+                "doesn't accept CSV params"
+            )
+
+    ok = event_loop.run_until_complete(
+        lh.move_onchain_to_ln(wallet_id="w1", amount_sats=200_000, api=_FakeAPI()),
+    )
+    assert ok is True, "happy path should return True"
+    # OpenChannelSync was called with our CSV + fee knobs.
+    open_calls = [p for m, p in lnd_calls if m == "OpenChannelSync"]
+    assert len(open_calls) == 1, f"expected 1 OpenChannelSync; got {len(open_calls)}"
+    params = open_calls[0]
+    assert params["node_pubkey_string"] == "ab" * 33
+    assert params["local_funding_amount"] == 200_000
+    assert params["max_local_csv"] == 144, (
+        f"max_local_csv must be threaded from config; got {params.get('max_local_csv')}"
+    )
+    assert params["target_conf"] == 12
+    # remote_csv_delay omitted when config is 0 (let LND auto-scale).
+    assert "remote_csv_delay" not in params, (
+        "remote_csv_delay=0 should mean 'let LND auto-scale' — don't "
+        "send the field explicitly"
+    )
+    # ConnectPeer was called first.
+    assert any(m == "ConnectPeer" for m, p in lnd_calls), (
+        "must ConnectPeer before OpenChannelSync — the Bitcart daemon "
+        "auto-connected; doing it ourselves now"
+    )
+    assert _FakeAPI.called_open_ln_channel is False
+    LightningNode.delete().execute()
+
+
+def test_direct_channel_cashout_threads_csv_to_open_channel_sync(monkeypatch, event_loop):
+    """The PREFER_LN_CASHOUT direct-channel cashout path (path 2)
+    also threads max_local_csv. Pin the wiring at that site too —
+    duplicate of the move_onchain_to_ln test for the other channel-
+    open site so a future regression on either is caught."""
+    import liquidityhelper as lh
+    monkeypatch.setattr(lh, "LND_MAX_LOCAL_CSV_BLOCKS", 144, raising=False)
+    monkeypatch.setattr(lh, "LND_REMOTE_CSV_DELAY_BLOCKS", 0, raising=False)
+    monkeypatch.setattr(lh, "LND_CHANNEL_OPEN_TARGET_CONF", 12, raising=False)
+    monkeypatch.setattr(lh, "OWN_LIGHTNING_NODES", ["ef" * 33 + "@1.2.3.4:9735"], raising=False)
+    monkeypatch.setattr(lh, "OWN_LIGHTNING_NODES_ANNOUNCE_CHANNELS", False, raising=False)
+    monkeypatch.setattr(lh, "DRY_RUN_FUNDS", False, raising=False)
+    lh._last_decision_state.clear()
+
+    captured: dict = {}
+    async def fake_lnd_rpc(api_obj, wallet_id, method, params, service):
+        if method == "OpenChannelSync":
+            captured.update(params)
+            return {"funding_txid_str": "ee" * 32, "output_index": 0}
+        return {}
+    monkeypatch.setattr(lh, "lnd_rpc", fake_lnd_rpc)
+    # LabelTransaction best-effort; let it noop.
+    async def fake_label(*a, **kw):
+        return None
+    monkeypatch.setattr(lh, "label_onchain_tx", fake_label)
+    event_loop.run_until_complete(
+        lh._attempt_direct_channel_cashout_to_own_node(
+            api=None, wallet_id="w1", channel_size_sats=200_000,
+        ),
+    )
+    assert captured.get("max_local_csv") == 144
+    assert captured.get("target_conf") == 12
+    assert "remote_csv_delay" not in captured
+    """When LND_REMOTE_CSV_DELAY_BLOCKS > 0, that value is passed to
+    OpenChannelSync. When 0, the field is omitted (LND auto-scales)."""
+    import liquidityhelper as lh
+    from node_database import LightningNode
+    monkeypatch.setattr(lh, "MANUAL_CHANNEL_CREATION_ENABLED", True, raising=False)
+    monkeypatch.setattr(lh, "LND_MAX_LOCAL_CSV_BLOCKS", 144, raising=False)
+    monkeypatch.setattr(lh, "LND_REMOTE_CSV_DELAY_BLOCKS", 288, raising=False)
+    monkeypatch.setattr(lh, "DRY_RUN_FUNDS", False, raising=False)
+    lh._last_decision_state.clear()
+    LightningNode.delete().execute()
+    LightningNode.create(
+        node_address="cd" * 33, alias="test-peer",
+        ipv4_address="1.2.3.4:9735",
+        total_capacity=10_000_000, channel_count=10,
+        median_outbound_fee_rate_ppm=1,
+        effective_degree=20, two_hop_reach=100,
+        last_updated=lh.utcnow_naive(),
+    )
+    monkeypatch.setattr(lh, "is_node_blacklisted", lambda n: (False, None))
+    async def fake_pick(*a, **kw):
+        return ["cd" * 33 + "@1.2.3.4:9735"]
+    monkeypatch.setattr(lh, "pick_best_channel_partners", fake_pick)
+    captured: dict = {}
+    async def fake_lnd_rpc(api_obj, wallet_id, method, params, service):
+        if method == "OpenChannelSync":
+            captured.update(params)
+            return {"funding_txid_str": "bb" * 32, "output_index": 0}
+        return {}
+    monkeypatch.setattr(lh, "lnd_rpc", fake_lnd_rpc)
+    class _FakeAPI:
+        async def get_wallet(self, wid):
+            return {"id": wid, "currency": "btclnd"}
+        async def get_wallet_ln_channels(self, *a, **kw):
+            return []
+    event_loop.run_until_complete(
+        lh.move_onchain_to_ln(wallet_id="w1", amount_sats=100_000, api=_FakeAPI()),
+    )
+    assert captured.get("remote_csv_delay") == 288, (
+        f"remote_csv_delay must be threaded from config when > 0; got "
+        f"{captured.get('remote_csv_delay')}"
+    )
+    LightningNode.delete().execute()
+
+
 def test_close_channel_passes_target_conf_and_max_fee(monkeypatch):
     """Cooperative close must set both target_conf (predictable
     timing) and max_fee_per_vbyte (caps mempool-spike damage)."""

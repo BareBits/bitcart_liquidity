@@ -549,6 +549,35 @@ LND_CHANNEL_CLOSE_TARGET_CONF: int = 6
 # 500 vbyte tx.
 LND_CHANNEL_CLOSE_MAX_FEE_SAT_PER_VBYTE: int = 50
 
+# Maximum CSV delay (in blocks) we'll allow on OUR local commitment
+# output when opening a new channel. If WE force-close the channel,
+# our `to_local` funds are CSV-locked by this many blocks before we
+# can spend them. The peer can negotiate something HIGHER at channel
+# open; we refuse and the open fails. Lower = faster recovery on
+# force-close. Trade-off: lower CSV = less protection against a
+# revoked-state attack (an attacker who steals our state during the
+# CSV window could publish it). With anchor channels + a watchtower
+# this risk is mitigated, so 144 blocks (~1 day) is a reasonable
+# default vs LND's stock 2016 (~14 days).
+#
+# Only applies to channels OPENED BY US — peer-funded channels and
+# LSP-funded inbound channels are negotiated by the other side and
+# inherit their CSV policy. See move_onchain_to_ln and
+# _attempt_direct_channel_cashout_to_own_node for the wire-through.
+LND_MAX_LOCAL_CSV_BLOCKS: int = 144
+
+# CSV delay (in blocks) WE impose on the REMOTE peer's `to_local`
+# output. If THEY force-close, their funds are CSV-locked by this
+# many blocks before they can spend them. Higher = more protection
+# for us against the peer publishing a revoked state.
+#
+# 0 = let LND auto-scale by channel size (LND's default behavior;
+# typically 144-2016 blocks depending on size). Operators usually
+# leave this at 0 — lowering it weakens our cheating-protection
+# without gaining us anything (the peer's funds being locked
+# doesn't speed up our wallet recovery).
+LND_REMOTE_CSV_DELAY_BLOCKS: int = 0
+
 # Maximum LN routing fee (as a fraction of the payment amount) for
 # every outgoing LN payment except the AMP fallback (which has its
 # own cap baked in). Defends against a poorly-routed payment paying
