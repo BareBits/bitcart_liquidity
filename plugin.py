@@ -43,6 +43,7 @@ from .bitcart_plugin.log_endpoints import (
     build_router, install_plugin_log_sinks, build_debug_router,
 )
 from .bitcart_plugin.dashboard import build_router as build_dashboard_router
+from .bitcart_plugin.wallet_debug import build_wallet_debug_router
 
 
 def _build_schema_router(auth_dependency: Any | None = None):
@@ -277,6 +278,7 @@ class Plugin(BasePlugin):
         app.include_router(_build_schema_router(AuthDependency()))
         app.include_router(build_dashboard_router(AuthDependency()))
         app.include_router(build_debug_router(AuthDependency()))
+        app.include_router(build_wallet_debug_router(AuthDependency()))
 
     async def startup(self) -> None:
         # Registering the schema (built from config.py at import time)

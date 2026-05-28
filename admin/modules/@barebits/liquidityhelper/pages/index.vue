@@ -54,6 +54,7 @@
     <div v-if="isAdmin"><v-tabs v-model="tab" background-color="primary" dark>
       <v-tab>Dashboard</v-tab>
       <v-tab>Settings</v-tab>
+      <v-tab>Debug</v-tab>
       <v-tab>Logs</v-tab>
     </v-tabs>
 
@@ -797,6 +798,103 @@
         </v-card>
       </v-tab-item>
 
+      <!-- ──────────── Debug tab ──────────── -->
+      <!-- Wallet-by-wallet diagnostic surface: lists every
+           liquidityhelper-named wallet with its store associations,
+           the timestamp of the latest tx, and per-wallet Export-CSV
+           and Backup action buttons. Both actions trigger a
+           confirmation modal first — the backup zip in particular
+           contains the seed phrase in plaintext, so we want the
+           operator to explicitly acknowledge before downloading. -->
+      <v-tab-item>
+        <v-card flat>
+          <v-card-text>
+            <p class="text-body-2 mb-3">
+              Per-wallet diagnostics for every wallet named
+              <code>liquidityhelper</code>. Export CSV produces a
+              complete transaction history (on-chain + Lightning);
+              Backup produces a zip containing the seed phrase and
+              the channel-backup files required for disaster recovery.
+            </p>
+
+            <v-alert
+              v-if="debugError"
+              type="error"
+              text
+              dense
+              class="mb-3"
+            >
+              {{ debugError }}
+            </v-alert>
+
+            <v-data-table
+              :headers="debugWalletHeaders"
+              :items="debugWallets"
+              :items-per-page="20"
+              :no-data-text="loadingDebugWallets ? 'Loading…' : 'No liquidityhelper wallets configured.'"
+              :loading="loadingDebugWallets"
+              dense
+              class="elevation-0"
+            >
+              <template #item.wallet_id="{ item }">
+                <span class="text-caption">
+                  {{ item.wallet_name }}
+                  <span class="grey--text">({{ item.wallet_short }})</span>
+                </span>
+              </template>
+              <template #item.currency="{ item }">
+                <v-chip x-small outlined :color="item.currency === 'btclnd' ? 'info' : 'success'">
+                  {{ item.currency }}
+                </v-chip>
+              </template>
+              <template #item.stores="{ item }">
+                <span class="text-caption">
+                  <span v-if="item.stores.length === 0" class="grey--text">— (no stores)</span>
+                  <span v-else>{{ item.stores.join(', ') }}</span>
+                </span>
+              </template>
+              <template #item.last_tx_iso="{ item }">
+                <span class="text-caption">{{ item.last_tx_iso }}</span>
+              </template>
+              <template #item.actions="{ item }">
+                <v-btn
+                  x-small
+                  outlined
+                  color="primary"
+                  class="mr-1"
+                  :disabled="debugActionInFlight"
+                  @click="confirmDebugAction('csv', item)"
+                >
+                  <v-icon left x-small>mdi-download</v-icon>
+                  Export CSV
+                </v-btn>
+                <v-btn
+                  x-small
+                  outlined
+                  color="error"
+                  :disabled="debugActionInFlight"
+                  @click="confirmDebugAction('backup', item)"
+                >
+                  <v-icon left x-small>mdi-shield-key</v-icon>
+                  Backup
+                </v-btn>
+              </template>
+            </v-data-table>
+
+            <v-btn
+              small
+              outlined
+              class="mt-3"
+              :loading="loadingDebugWallets"
+              @click="loadDebugWallets"
+            >
+              <v-icon left small>mdi-refresh</v-icon>
+              Refresh
+            </v-btn>
+          </v-card-text>
+        </v-card>
+      </v-tab-item>
+
       <!-- ──────────── Logs tab ──────────── -->
       <v-tab-item>
         <v-card flat>
@@ -940,6 +1038,42 @@
         </v-card>
       </v-tab-item>
     </v-tabs-items>
+
+    <!-- Confirmation modal shared between Export CSV and Backup
+         actions. Backup in particular contains a plaintext seed
+         phrase, so we want a deliberate confirmation step every
+         time — accidental clicks shouldn't leak the seed via the
+         operator's browser history / downloads folder. -->
+    <v-dialog v-model="debugDialogOpen" max-width="540">
+      <v-card>
+        <v-card-title class="text-h6">
+          {{ debugDialogConfig.title }}
+        </v-card-title>
+        <v-card-text>
+          <p>{{ debugDialogConfig.body }}</p>
+          <v-alert
+            v-if="debugDialogConfig.warning"
+            type="warning"
+            dense
+            text
+            class="mb-0 mt-3"
+          >
+            {{ debugDialogConfig.warning }}
+          </v-alert>
+        </v-card-text>
+        <v-card-actions>
+          <v-spacer />
+          <v-btn text @click="debugDialogOpen = false">Cancel</v-btn>
+          <v-btn
+            :color="debugDialogConfig.confirmColor || 'primary'"
+            :loading="debugActionInFlight"
+            @click="executeDebugAction"
+          >
+            {{ debugDialogConfig.confirmLabel || 'Continue' }}
+          </v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
     </div>
   </v-container>
 </template>
@@ -1074,6 +1208,29 @@ export default {
         { text: "Destination", value: "destination" },
         { text: "Tx / hash", value: "txid" },
       ],
+
+      // Debug tab — per-wallet diagnostic table.
+      debugWalletHeaders: [
+        { text: "Wallet", value: "wallet_id" },
+        { text: "Currency", value: "currency", width: 110 },
+        { text: "Store(s)", value: "stores" },
+        { text: "Last tx", value: "last_tx_iso", width: 200 },
+        { text: "Actions", value: "actions", width: 240, sortable: false },
+      ],
+      debugWallets: [],
+      loadingDebugWallets: false,
+      debugError: null,
+      // Confirmation-modal state. `debugDialogConfig` is populated
+      // by confirmDebugAction with the title/body/warning text for
+      // the chosen action; `debugPendingAction` carries the action
+      // type + target wallet so executeDebugAction can dispatch.
+      debugDialogOpen: false,
+      debugDialogConfig: {
+        title: "", body: "", warning: "",
+        confirmLabel: "", confirmColor: "primary",
+      },
+      debugPendingAction: null,  // { kind: 'csv'|'backup', wallet: { ... } }
+      debugActionInFlight: false,
 
       // Settings tab state.
       settings: {},
@@ -1213,6 +1370,16 @@ export default {
         }
       },
     },
+    // Lazy-load the Debug tab on first open. Tab index 2 = Debug
+    // (after Dashboard, Settings). Loading on every switch would be
+    // redundant; loading only when the list is empty saves a request
+    // per tab-flip but keeps an explicit Refresh button available
+    // for re-fetching.
+    tab(newTab) {
+      if (newTab === 2 && this.debugWallets.length === 0 && !this.loadingDebugWallets) {
+        this.loadDebugWallets()
+      }
+    },
   },
   async mounted() {
     // Flip the SSR-skip flag so the real template branch renders.
@@ -1307,6 +1474,99 @@ export default {
       if (this.lndReadyPollHandle) {
         clearInterval(this.lndReadyPollHandle)
         this.lndReadyPollHandle = null
+      }
+    },
+
+    // ─── Debug tab ─────────────────────────────────────────────────
+    async loadDebugWallets() {
+      this.loadingDebugWallets = true
+      this.debugError = null
+      try {
+        const resp = await this.$axios.get(
+          "/plugins/liquidityhelper/wallet_debug/wallets",
+        )
+        this.debugWallets = (resp.data && resp.data.wallets) || []
+      } catch (e) {
+        console.error("failed to load debug wallets", e)
+        this.debugError = "Failed to load wallets: " + (e?.message || e)
+        this.debugWallets = []
+      } finally {
+        this.loadingDebugWallets = false
+      }
+    },
+    // Open the confirmation modal with action-appropriate copy.
+    // The modal's Continue button calls executeDebugAction below.
+    confirmDebugAction(kind, wallet) {
+      this.debugPendingAction = { kind, wallet }
+      if (kind === "csv") {
+        this.debugDialogConfig = {
+          title: `Export CSV for ${wallet.wallet_name} (${wallet.wallet_short})?`,
+          body:
+            "This will download a CSV containing every on-chain and Lightning transaction for this wallet. " +
+            "The file may be large for high-activity wallets.",
+          warning: "",
+          confirmLabel: "Download CSV",
+          confirmColor: "primary",
+        }
+      } else if (kind === "backup") {
+        const isLnd = wallet.currency === "btclnd"
+        this.debugDialogConfig = {
+          title: `Back up ${wallet.wallet_name} (${wallet.wallet_short})?`,
+          body: isLnd
+            ? "This will download a zip containing the wallet seed (seed.txt) AND the LND Static Channel Backup (channel.backup). Together they are sufficient to recover both on-chain funds and Lightning channels."
+            : "This will download a zip containing the wallet seed (seed.txt), per-channel Electrum SCB entries (channel_backups.json), and wallet metadata (wallet_info.json).",
+          warning:
+            "The zip contains your seed phrase in PLAINTEXT. Anyone with the file can spend your funds. " +
+            "Save it to encrypted storage immediately and delete the original download.",
+          confirmLabel: "I understand — download backup",
+          confirmColor: "error",
+        }
+      }
+      this.debugDialogOpen = true
+    },
+    async executeDebugAction() {
+      if (!this.debugPendingAction) return
+      const { kind, wallet } = this.debugPendingAction
+      this.debugActionInFlight = true
+      try {
+        const path = kind === "csv"
+          ? `/plugins/liquidityhelper/wallet_debug/wallet/${wallet.wallet_id}/csv`
+          : `/plugins/liquidityhelper/wallet_debug/wallet/${wallet.wallet_id}/backup`
+        // Fetch as a Blob so we can pass auth via $axios (a plain
+        // <a href> wouldn't include the bearer token), then trigger
+        // a download via a synthetic <a> click.
+        const resp = await this.$axios.get(path, { responseType: "blob" })
+        const blob = resp.data
+        // Filename comes from Content-Disposition when the server set
+        // one — otherwise fall back to a sensible default.
+        let filename =
+          kind === "csv"
+            ? `liquidityhelper-${wallet.wallet_short}-transactions.csv`
+            : `liquidityhelper-${wallet.wallet_short}-backup.zip`
+        const cd = resp.headers && (resp.headers["content-disposition"] || resp.headers["Content-Disposition"])
+        if (cd) {
+          const m = /filename="?([^"]+)"?/.exec(cd)
+          if (m) filename = m[1]
+        }
+        const url = window.URL.createObjectURL(blob)
+        const a = document.createElement("a")
+        a.href = url
+        a.download = filename
+        document.body.appendChild(a)
+        a.click()
+        document.body.removeChild(a)
+        // Free the blob URL after the click — browsers won't reuse
+        // it but releasing avoids holding a reference to a large
+        // CSV/zip in memory longer than needed.
+        window.URL.revokeObjectURL(url)
+        this.debugDialogOpen = false
+      } catch (e) {
+        console.error(`failed to ${kind} for wallet ${wallet.wallet_id}`, e)
+        this.debugError = `Failed to ${kind}: ` + (e?.message || e)
+        this.debugDialogOpen = false
+      } finally {
+        this.debugActionInFlight = false
+        this.debugPendingAction = null
       }
     },
     // Abbreviate long txid/payment_hash strings for table display.
