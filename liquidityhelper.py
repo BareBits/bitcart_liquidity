@@ -3747,8 +3747,13 @@ async def get_most_recent_channel_close(api:BitcartAPI,wallet_id:str)->Optional[
 
     Channel-state vocabulary spans both Electrum and LND:
       - Electrum: OPEN, OPENING, FUNDED, CLOSING, FORCE_CLOSING, CLOSED, REDEEMED
-      - LND-via-Bitcart-proxy: OPEN, PENDING_OPEN, PENDING_CLOSE,
-        PENDING_FORCE_CLOSE, WAITING_CLOSE, FORCE_CLOSING, CLOSED
+      - LND-via-Bitcart-proxy: OPEN, DISCONNECTED, PENDING_OPEN,
+        PENDING_CLOSE, PENDING_FORCE_CLOSE, WAITING_CLOSE,
+        FORCE_CLOSING, CLOSED. DISCONNECTED is a BareBits-fork
+        convention emitted by bitcart_fork/daemons/btclnd.py for
+        channels whose peer is offline — the channel is still
+        nominally open on our side, just unreachable; it is NOT a
+        close-in-progress.
     We treat any "still settling" state as a candidate for a recent
     close attempt.
     """
@@ -3767,6 +3772,13 @@ async def get_most_recent_channel_close(api:BitcartAPI,wallet_id:str)->Optional[
         'OPEN', 'REDEEMED', 'CLOSED',
         # LND additions
         'OPENING', 'PENDING_OPEN', 'FUNDED',
+        # BareBits-fork's btclnd.py reports peer-offline channels as
+        # state=DISCONNECTED (see daemons/btclnd.py:2209). Treat it
+        # as an OPEN channel for this lookup's purposes — the peer
+        # being unreachable doesn't make the channel a close
+        # candidate, and emitting a warning every tick for an
+        # offline peer floods the log.
+        'DISCONNECTED',
     }
     channels = await api.get_wallet_ln_channels(wallet_id) or []
     found_closes = []
