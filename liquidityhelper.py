@@ -3198,13 +3198,22 @@ async def _detect_preferred_wallet_currency(api: BitcartAPI) -> str:
         )
         return 'btc'
     if 'btclnd' in supported:
-        logger.info(
-            "Bitcart supports LND wallets — creating wallet with currency='btclnd'."
+        # Quiet detection — callers were emitting an "info: creating
+        # wallet with currency='btclnd'" log every tick from
+        # wallet_creation()'s up-front detect-once, even when no
+        # wallet was actually being created. Operators saw it as
+        # spurious activity claiming a wallet was being made. Log at
+        # debug so it's still grep-able from the operational log
+        # without flooding the human-facing decisions stream.
+        logger.debug(
+            "Bitcart supports LND wallets — will use currency='btclnd' "
+            "for any wallets created this tick."
         )
         return 'btclnd'
-    logger.info(
+    logger.debug(
         "Bitcart does not advertise btclnd support; falling back to "
-        "Electrum (currency='btc'). Supported codes: %s",
+        "Electrum (currency='btc') for any wallets created this tick. "
+        "Supported codes: %s",
         sorted(supported),
     )
     return 'btc'
