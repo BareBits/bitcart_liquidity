@@ -36,7 +36,14 @@ export function formatUsd(money) {
 // pairs the abbreviated render with a `title` attribute carrying the
 // full text. 1 million chosen because below that the comma-formatted
 // number is still a reasonable column width.
-export const SATS_ABBREVIATE_THRESHOLD = 1_000_000
+// Note: written as 1000000 (no `1_000_000` numeric-separator syntax).
+// The Babel loader in bitcart-admin's Nuxt build pipeline doesn't
+// support ES2021 numeric separators — using them causes a silent
+// `nuxt build` failure inside install-ui-plugins.sh, which then
+// commits a docker layer with no `.nuxt/dist/server` artifacts and
+// the admin container 502s on startup with
+// `No build files found in /src/.nuxt/dist/server`.
+export const SATS_ABBREVIATE_THRESHOLD = 1000000
 
 // Format a sats integer in abbreviated form for amounts above the
 // threshold, or comma-formatted otherwise.
@@ -46,7 +53,7 @@ export const SATS_ABBREVIATE_THRESHOLD = 1_000_000
 function abbreviateSats(sats) {
   const s = Math.round(Number(sats) || 0)
   if (Math.abs(s) >= SATS_ABBREVIATE_THRESHOLD) {
-    return `${formatNumber(s / 1_000_000, 2)}M sats`
+    return `${formatNumber(s / 1000000, 2)}M sats`
   }
   return `${formatNumber(s, 0)} sats`
 }
