@@ -51,43 +51,26 @@ def _reset_registry(monkeypatch):
     yield
 
 
-def test_registry_uses_config_defaults_for_mainnet(monkeypatch):
-    """Out of the box: LOOPD_NETWORK=mainnet, no server override.
-    Same behavior as the hardcoded pre-refactor version."""
-    monkeypatch.setattr(liquidityhelper, "LOOPD_NETWORK", "mainnet")
+@pytest.mark.parametrize("network", ["mainnet", "testnet", "signet"])
+def test_registry_passes_network_through_with_no_server_override(network, monkeypatch):
+    """Default deploy on a public network: LOOPD_NETWORK is forwarded
+    to LoopdManager and the server host stays empty (loopd resolves
+    {test,signet}.swap.lightning.today:11010 internally). Pins the
+    config-passthrough for all three production-public networks in
+    one shot.
+
+    Regtest needs an explicit server override (see the dedicated
+    test below) so it's not included here."""
+    monkeypatch.setattr(liquidityhelper, "LOOPD_NETWORK", network)
     monkeypatch.setattr(liquidityhelper, "LOOPD_SERVER_HOST", "")
     monkeypatch.setattr(liquidityhelper, "LOOPD_SERVER_NOTLS", False)
 
     providers = liquidityhelper._swap_provider_registry()
     assert len(providers) == 1
     mgr = providers[0].manager
-    assert mgr.network == "mainnet"
+    assert mgr.network == network
     assert mgr.server_host is None    # empty string → None (loopd auto-picks)
     assert mgr.server_notls is False
-
-
-def test_registry_passes_testnet_through(monkeypatch):
-    """Operator on testnet: LOOPD_NETWORK=testnet, no server override.
-    loopd will pick test.swap.lightning.today:11010 itself."""
-    monkeypatch.setattr(liquidityhelper, "LOOPD_NETWORK", "testnet")
-    monkeypatch.setattr(liquidityhelper, "LOOPD_SERVER_HOST", "")
-    monkeypatch.setattr(liquidityhelper, "LOOPD_SERVER_NOTLS", False)
-
-    providers = liquidityhelper._swap_provider_registry()
-    mgr = providers[0].manager
-    assert mgr.network == "testnet"
-    assert mgr.server_host is None
-
-
-def test_registry_passes_signet_through(monkeypatch):
-    """Operator on signet: same shape as testnet — loopd resolves
-    signet.swap.lightning.today:11010 internally."""
-    monkeypatch.setattr(liquidityhelper, "LOOPD_NETWORK", "signet")
-    monkeypatch.setattr(liquidityhelper, "LOOPD_SERVER_HOST", "")
-    monkeypatch.setattr(liquidityhelper, "LOOPD_SERVER_NOTLS", False)
-
-    providers = liquidityhelper._swap_provider_registry()
-    assert providers[0].manager.network == "signet"
 
 
 def test_registry_passes_regtest_with_server_override(monkeypatch):
@@ -193,16 +176,21 @@ def test_mismatch_raises_with_clear_message(tmp_path, monkeypatch, event_loop):
     )
 
 
-def test_match_proceeds(tmp_path, monkeypatch, event_loop):
-    """Configured mainnet, LND on mainnet → no exception, instance
-    is registered. (No real subprocess fires because start() is
-    stubbed.)"""
+@pytest.mark.parametrize("reported_network", ["mainnet", "MAINNET", "Mainnet"])
+def test_match_proceeds(reported_network, tmp_path, monkeypatch, event_loop):
+    """Configured mainnet, LND reports mainnet in any case-form →
+    no exception, instance is registered. Case-insensitive matching
+    is a deliberate footgun-avoidance: real LND builds across
+    versions have varied between lowercase and titlecase. Lowercase
+    is the only case that should ever appear in production today;
+    the upper/title variants are pinned here so a future tightening
+    that breaks them is loud."""
     _patch_loopd_subprocess(monkeypatch)
     mgr = _make_manager("mainnet", tmp_path)
     api = _FakeApi({
         "tls_cert": "AA==", "macaroon": "AA==",
         "host": "127.0.0.1", "grpc_port": 10009,
-        "network": "mainnet",
+        "network": reported_network,
     })
 
     inst = event_loop.run_until_complete(
@@ -212,34 +200,29 @@ def test_match_proceeds(tmp_path, monkeypatch, event_loop):
     assert "w1" in mgr._instances
 
 
-def test_case_insensitive_match(tmp_path, monkeypatch, event_loop):
-    """LND might report 'MAINNET', 'Mainnet', or 'mainnet'. All three
-    should pass the check — case sensitivity here would be a footgun."""
-    _patch_loopd_subprocess(monkeypatch)
-    mgr = _make_manager("mainnet", tmp_path)
-    api = _FakeApi({
-        "tls_cert": "AA==", "macaroon": "AA==",
-        "host": "127.0.0.1", "grpc_port": 10009,
-        "network": "MAINNET",
-    })
-
-    inst = event_loop.run_until_complete(
-        mgr.get_loopd_for_wallet({"id": "w1"}, api)
-    )
-    assert inst.wallet_id == "w1"
-
-
-def test_missing_network_field_does_not_raise(tmp_path, monkeypatch, event_loop, caplog):
-    """Older bitcart-fork builds may not include `network` in /lndinfo.
-    Don't fail in that case — log a warning and proceed. The
-    chain-hash check at swap time will still catch a real mismatch."""
+@pytest.mark.parametrize(
+    "lndinfo_extra,case_id",
+    [
+        ({}, "missing-field"),
+        ({"network": ""}, "empty-string"),
+    ],
+    ids=lambda v: v if isinstance(v, str) else None,
+)
+def test_missing_or_empty_network_does_not_raise(
+    lndinfo_extra, case_id, tmp_path, monkeypatch, event_loop, caplog,
+):
+    """Older or oddly-shaped bitcart-fork /lndinfo responses may
+    omit the `network` field entirely OR return it as empty string.
+    Both must be tolerated (warn + proceed); the chain-hash check at
+    swap time catches a real mismatch later. Covers both shapes in
+    one test — the rejection path was identical between them."""
     import logging
     _patch_loopd_subprocess(monkeypatch)
     mgr = _make_manager("mainnet", tmp_path)
     api = _FakeApi({
         "tls_cert": "AA==", "macaroon": "AA==",
         "host": "127.0.0.1", "grpc_port": 10009,
-        # network field intentionally absent
+        **lndinfo_extra,
     })
 
     with caplog.at_level(logging.WARNING, logger="swap_providers"):
@@ -247,30 +230,12 @@ def test_missing_network_field_does_not_raise(tmp_path, monkeypatch, event_loop,
             mgr.get_loopd_for_wallet({"id": "w1"}, api)
         )
     assert inst.wallet_id == "w1"
-    # Warning text should mention we can't pre-flight, so operators
+    # Warning text should mention we can't pre-flight so operators
     # debugging a later chain-hash error can find this entry.
     assert any(
         "did not report a network field" in r.getMessage()
         for r in caplog.records
-    )
-
-
-def test_empty_string_network_treated_as_missing(tmp_path, monkeypatch, event_loop):
-    """Some bitcart builds may return network as "" rather than
-    omitting the key. Treat empty-string the same as missing — warn,
-    don't raise."""
-    _patch_loopd_subprocess(monkeypatch)
-    mgr = _make_manager("mainnet", tmp_path)
-    api = _FakeApi({
-        "tls_cert": "AA==", "macaroon": "AA==",
-        "host": "127.0.0.1", "grpc_port": 10009,
-        "network": "",
-    })
-
-    inst = event_loop.run_until_complete(
-        mgr.get_loopd_for_wallet({"id": "w1"}, api)
-    )
-    assert inst.wallet_id == "w1"
+    ), f"case={case_id}: missing warning"
 
 
 def test_no_info_at_all_still_raises_original_error(tmp_path, monkeypatch, event_loop):

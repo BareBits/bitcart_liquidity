@@ -899,6 +899,37 @@
       <v-tab-item>
         <v-card flat>
           <v-card-text>
+            <!-- Log export buttons. Sit above the stream selector so
+                 they are visible even before the operator picks a
+                 stream. Both buttons go through the warning modal
+                 because the zip's contents are operator-sensitive. -->
+            <v-row align="center" class="mb-3" no-gutters>
+              <v-col cols="12" sm="6" md="4" class="pr-sm-2 mb-2 mb-sm-0">
+                <v-btn
+                  block
+                  outlined
+                  color="primary"
+                  :loading="debugActionInFlight && debugPendingAction && debugPendingAction.kind === 'logs_engine'"
+                  @click="confirmLogExport('engine')"
+                >
+                  <v-icon left>mdi-download-outline</v-icon>
+                  Export liquidityhelper log
+                </v-btn>
+              </v-col>
+              <v-col cols="12" sm="6" md="4">
+                <v-btn
+                  block
+                  outlined
+                  color="primary"
+                  :loading="debugActionInFlight && debugPendingAction && debugPendingAction.kind === 'logs_all'"
+                  @click="confirmLogExport('all')"
+                >
+                  <v-icon left>mdi-download-multiple-outline</v-icon>
+                  Export all logs
+                </v-btn>
+              </v-col>
+            </v-row>
+
             <v-row align="center" class="mb-3">
               <v-col cols="12" sm="4">
                 <v-select
@@ -1495,6 +1526,30 @@ export default {
         this.loadingDebugWallets = false
       }
     },
+    // Open the warning modal for a log-export action. Same modal
+    // surface as confirmDebugAction (CSV / backup) but without a
+    // wallet — the export applies plugin-wide. The warning copy is
+    // unambiguous about the fund-theft risk because logs CAN contain
+    // operationally-sensitive details even after seed scrubbing.
+    confirmLogExport(scope) {
+      const isAll = scope === "all"
+      this.debugPendingAction = { kind: isAll ? "logs_all" : "logs_engine", wallet: null }
+      this.debugDialogConfig = {
+        title: isAll
+          ? "Export all logs?"
+          : "Export liquidityhelper log?",
+        body: isAll
+          ? "This will download a zip containing the liquidityhelper plugin logs AND the Bitcart application logs (/datadir/logs). Other Docker container logs (LND, postgres, etc.) are not reachable from inside the backend container and are not included."
+          : "This will download a zip containing the liquidityhelper plugin's own logs: liquidityhelper.log (plus rotated archives) and decisions.log.",
+        warning:
+          "Logs may contain SENSITIVE INFORMATION that could be used to steal funds from your Bitcart wallets. " +
+          "Wallet seed phrases are scrubbed before download, but channel state, addresses, payment hashes, and error messages may still reveal operational details. " +
+          "Do NOT share this file with anyone you do not fully trust.",
+        confirmLabel: "I understand — download",
+        confirmColor: "error",
+      }
+      this.debugDialogOpen = true
+    },
     // Open the confirmation modal with action-appropriate copy.
     // The modal's Continue button calls executeDebugAction below.
     confirmDebugAction(kind, wallet) {
@@ -1530,9 +1585,23 @@ export default {
       const { kind, wallet } = this.debugPendingAction
       this.debugActionInFlight = true
       try {
-        const path = kind === "csv"
-          ? `/plugins/liquidityhelper/wallet_debug/wallet/${wallet.wallet_id}/csv`
-          : `/plugins/liquidityhelper/wallet_debug/wallet/${wallet.wallet_id}/backup`
+        let path
+        let defaultFilename
+        if (kind === "csv") {
+          path = `/plugins/liquidityhelper/wallet_debug/wallet/${wallet.wallet_id}/csv`
+          defaultFilename = `liquidityhelper-${wallet.wallet_short}-transactions.csv`
+        } else if (kind === "backup") {
+          path = `/plugins/liquidityhelper/wallet_debug/wallet/${wallet.wallet_id}/backup`
+          defaultFilename = `liquidityhelper-${wallet.wallet_short}-backup.zip`
+        } else if (kind === "logs_engine") {
+          path = `/plugins/liquidityhelper/wallet_debug/logs/engine`
+          defaultFilename = `liquidityhelper-logs-engine.zip`
+        } else if (kind === "logs_all") {
+          path = `/plugins/liquidityhelper/wallet_debug/logs/all`
+          defaultFilename = `liquidityhelper-logs-all.zip`
+        } else {
+          throw new Error(`unknown debug action kind: ${kind}`)
+        }
         // Fetch as a Blob so we can pass auth via $axios (a plain
         // <a href> wouldn't include the bearer token), then trigger
         // a download via a synthetic <a> click.
@@ -1540,10 +1609,7 @@ export default {
         const blob = resp.data
         // Filename comes from Content-Disposition when the server set
         // one — otherwise fall back to a sensible default.
-        let filename =
-          kind === "csv"
-            ? `liquidityhelper-${wallet.wallet_short}-transactions.csv`
-            : `liquidityhelper-${wallet.wallet_short}-backup.zip`
+        let filename = defaultFilename
         const cd = resp.headers && (resp.headers["content-disposition"] || resp.headers["Content-Disposition"])
         if (cd) {
           const m = /filename="?([^"]+)"?/.exec(cd)
@@ -1562,7 +1628,8 @@ export default {
         window.URL.revokeObjectURL(url)
         this.debugDialogOpen = false
       } catch (e) {
-        console.error(`failed to ${kind} for wallet ${wallet.wallet_id}`, e)
+        const target = wallet ? `wallet ${wallet.wallet_id}` : "log export"
+        console.error(`failed to ${kind} for ${target}`, e)
         this.debugError = `Failed to ${kind}: ` + (e?.message || e)
         this.debugDialogOpen = false
       } finally {

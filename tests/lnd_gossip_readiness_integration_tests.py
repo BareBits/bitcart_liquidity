@@ -59,61 +59,16 @@ def lnd_pair(lnd_pair_shared):
 
 
 # ---------------------------------------------------------------------------
-# Proto-shape assertion: the fields the readiness gate reads must exist on
-# a REAL LND response. Catches proto staleness as soon as it'd cause a
-# silent regression in evaluate_gossip_readiness.
-# ---------------------------------------------------------------------------
-
-def test_real_lnd_get_info_has_required_fields(lnd_pair, event_loop):
-    """A live `Lightning.GetInfo` against the regtest LND in `lnd_pair`
-    must return a response with the three fields the readiness gate
-    consumes:
-      - synced_to_graph (bool)
-      - chains (list of Chain messages with .network)
-      - chains[0].network (str, lowercase 'regtest' here)
-
-    If LND's proto ever drops or renames these, this test fails
-    immediately rather than the gate silently producing wrong
-    decisions in production."""
-    info = event_loop.run_until_complete(
-        lnd_graph_pull.fetch_get_info(lnd_pair.a._stub)
-    )
-    # synced_to_graph
-    assert hasattr(info, "synced_to_graph"), (
-        "real LND proto must expose synced_to_graph; readiness gate "
-        "depends on it"
-    )
-    assert isinstance(info.synced_to_graph, bool)
-    # chains list
-    assert hasattr(info, "chains")
-    assert len(info.chains) >= 1, "LND must report at least one chain"
-    assert hasattr(info.chains[0], "network")
-    network = info.chains[0].network.lower()
-    assert network == "regtest", (
-        f"lnd_pair fixture is supposed to spin up regtest LND; got "
-        f"network={network!r}"
-    )
-
-
-def test_real_lnd_describe_graph_returns_a_channel_graph(lnd_pair, event_loop):
-    """DescribeGraph must return a ChannelGraph response whose `nodes`
-    field is iterable. This pins the API surface evaluate_gossip_readiness
-    walks (`len(graph.nodes)`)."""
-    graph = event_loop.run_until_complete(
-        lnd_graph_pull.fetch_channel_graph(lnd_pair.a._stub)
-    )
-    # nodes should be iterable / countable. Even on a brand-new regtest
-    # network it might be 0-2 (the two LNDs in the fixture).
-    assert hasattr(graph, "nodes")
-    n = len(graph.nodes)
-    # No upper bound assertion — could be anywhere from 0 (gossip not
-    # propagated yet) to a few dozen (if the test ran for a while).
-    assert n >= 0
-
-
-# ---------------------------------------------------------------------------
 # End-to-end gate evaluation against a real regtest LND
 # ---------------------------------------------------------------------------
+#
+# The proto-shape smoke tests previously here (get_info / describe_graph
+# field assertions) were removed: they only ran to prove that the fields
+# evaluate_gossip_readiness reads exist on a real response, but the
+# end-to-end gate test below necessarily walks the same fields — if any
+# of them disappear or rename, the gate test fails with AttributeError
+# instead of returning the wrong decision. The standalone smokes were
+# pure cost (~60s each of regtest LND boot) with no marginal coverage.
 
 async def _wait_for_synced_to_graph(stub, timeout: float = 30.0) -> lightning_pb2.GetInfoResponse:
     """Poll GetInfo until synced_to_graph flips true OR we time out.
@@ -237,29 +192,9 @@ def test_pull_and_upsert_end_to_end_against_real_lnd(lnd_pair, event_loop):
     assert stats["readiness"]["network"] == "regtest"
 
 
-def test_lnd_uptime_self_tracker_against_real_lnd(lnd_pair, event_loop):
-    """The engine self-tracks uptime (rather than reading
-    GetInfoResponse.uptime, which may not be populated on older
-    bitcart-fork LND builds). Verify the round-trip against a real
-    wallet_id pulled from the regtest LND."""
-    # Use the LND's own identity_pubkey as a stand-in wallet_id for
-    # the per-wallet tracker. In production, wallet_id is the Bitcart
-    # wallet id; here we just need a unique key.
-    info = event_loop.run_until_complete(
-        lnd_graph_pull.fetch_get_info(lnd_pair.a._stub)
-    )
-    wallet_id = f"test-real-lnd-{info.identity_pubkey[-8:]}"
-    # Clean state for this wallet_id.
-    liquidityhelper._lnd_first_seen_at.pop(wallet_id, None)
-
-    # Unobserved → 0
-    assert liquidityhelper._lnd_uptime_seconds(wallet_id) == 0
-
-    # Record and re-check.
-    liquidityhelper._record_lnd_first_seen(wallet_id)
-    uptime = liquidityhelper._lnd_uptime_seconds(wallet_id)
-    assert 0 <= uptime <= 5, (
-        f"uptime should be ~0 right after recording; got {uptime}"
-    )
-    # Cleanup.
-    liquidityhelper._lnd_first_seen_at.pop(wallet_id, None)
+# Note: `test_lnd_uptime_self_tracker_against_real_lnd` previously
+# lived here but was removed — the tracker is a pure in-process
+# dict-mutation, already covered comprehensively by
+# gossip_readiness_tests.py::TestLndUptimeTracker against mocks.
+# Booting a real LND just to mutate a Python dict was ~60s of
+# zero-marginal coverage.

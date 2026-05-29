@@ -159,38 +159,13 @@ def test_persists_quote_to_db(monkeypatch, event_loop):
         assert abs(r.fee_percent - (r.total_fee_sat / r.amount_sat)) < 1e-9
 
 
-# ---------------------------------------------------------------------------
-# 5. End-to-end loop-out through real loopd + real loopserver. Skipped if
-#    podman/docker isn't available.
-# ---------------------------------------------------------------------------
-
-def test_full_loop_out_end_to_end(loop_rig, event_loop):
-    from swap_providers import LoopProvider, SwapDirection
-    provider = LoopProvider(loop_rig.loopd_manager)
-
-    # Quote a 500k sat swap-out — the rig's A->S channel is 0.2 BTC = 20_000_000
-    # sats so 500k is well within capacity.
-    amount = 500_000
-    fake_wallet = {"id": f"test-wallet-{loop_rig.a.name.lower()}", "currency": "btclnd"}
-
-    # `quote_out` will short-circuit via the LoopdInstance pre-registered in
-    # the manager — no Bitcart API needed.
-    quote = event_loop.run_until_complete(
-        provider.quote_out(amount, wallet=fake_wallet, api=None)
-    )
-    assert quote is not None
-    assert quote.direction == SwapDirection.OUT
-    assert quote.amount_sat == amount
-    assert quote.total_fee_sat >= 0
-
-    dest_addr = event_loop.run_until_complete(loop_rig.s.new_address())
-    result = event_loop.run_until_complete(
-        provider.initiate_out(fake_wallet, None, amount, dest_addr)
-    )
-    assert result is not None
-    assert len(result.swap_id) == 64  # 32-byte hash hex
-    assert result.htlc_address  # non-empty
-    assert result.state == "INITIATED"
+# Note: `test_full_loop_out_end_to_end` previously lived here. Deleted
+# because autoloop_tests.py::test_autoloop_rule_engine_produces_real_onchain_swap
+# drives a real loopd LoopOut through the same LoopProvider chain
+# AND verifies the on-chain HTLC tx publishes — the deleted test
+# only sketched the quote→initiate prefix, which is fully covered
+# by the autoloop end-to-end. Same pattern as round-1's deletion
+# of test_autoloop_round_trip_through_real_loopd.
 
 
 # ---------------------------------------------------------------------------

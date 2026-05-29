@@ -28,8 +28,14 @@ from tests._fakes import FakeBitcartAPI
 # ---------------------------------------------------------------------------
 
 def _run(coro):
-    """Drive a coroutine to completion on a fresh event loop."""
-    return asyncio.new_event_loop().run_until_complete(coro)
+    """Drive a coroutine to completion on a fresh one-shot loop.
+    Doesn't touch the thread-current-loop pointer — see
+    lnd_fee_controls_tests._run for why asyncio.run() can't be used."""
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
 
 
 def _setup_engine_dispatch(monkeypatch, api: FakeBitcartAPI):

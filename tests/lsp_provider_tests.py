@@ -95,22 +95,18 @@ def test_picker_zeus_wins_when_zeus_cheaper():
     assert chosen[1].provider == "zeus"
 
 
-def test_picker_zeus_wins_within_10pct_when_pricier():
-    """Zeus is the pricier one, but within 10% of Megalithic.
-    Zeus-preference rule: Zeus wins anyway."""
+@pytest.mark.parametrize(
+    "zeus_price",
+    [109, 110],
+    ids=["interior-9pct", "boundary-10pct"],
+)
+def test_picker_zeus_wins_within_10pct_when_pricier(zeus_price):
+    """Zeus is the pricier one but within the inclusive ±10% band:
+    Zeus-preference rule keeps Zeus the pick. Covers both an
+    interior point and the exact 10% boundary in one test —
+    the underlying branch is the same."""
     quotes = {
-        "zeus": (_StubProvider("zeus"), _make_quote("zeus", 109)),
-        "megalithic": (_StubProvider("megalithic"), _make_quote("megalithic", 100)),
-    }
-    chosen = liquidityhelper._pick_with_zeus_preference(quotes)
-    assert chosen[1].provider == "zeus"
-    # 109/100 = 1.09 -> within 10%, Zeus wins
-
-
-def test_picker_zeus_wins_exactly_at_10pct():
-    """Boundary: Zeus is exactly 10% pricier (the upper edge of the inclusive band). Zeus wins."""
-    quotes = {
-        "zeus": (_StubProvider("zeus"), _make_quote("zeus", 110)),
+        "zeus": (_StubProvider("zeus"), _make_quote("zeus", zeus_price)),
         "megalithic": (_StubProvider("megalithic"), _make_quote("megalithic", 100)),
     }
     chosen = liquidityhelper._pick_with_zeus_preference(quotes)
@@ -127,16 +123,13 @@ def test_picker_megalithic_wins_when_zeus_too_pricey():
     assert chosen[1].provider == "megalithic"
 
 
-def test_picker_only_zeus_available():
-    quotes = {"zeus": (_StubProvider("zeus"), _make_quote("zeus", 500))}
+@pytest.mark.parametrize("provider_name", ["zeus", "megalithic"])
+def test_picker_only_one_provider_available(provider_name):
+    """Single-provider input → that provider wins, regardless of which
+    one it is. Symmetric over zeus / megalithic."""
+    quotes = {provider_name: (_StubProvider(provider_name), _make_quote(provider_name, 500))}
     chosen = liquidityhelper._pick_with_zeus_preference(quotes)
-    assert chosen[1].provider == "zeus"
-
-
-def test_picker_only_megalithic_available():
-    quotes = {"megalithic": (_StubProvider("megalithic"), _make_quote("megalithic", 500))}
-    chosen = liquidityhelper._pick_with_zeus_preference(quotes)
-    assert chosen[1].provider == "megalithic"
+    assert chosen[1].provider == provider_name
 
 
 def test_picker_empty_returns_none():
@@ -366,76 +359,39 @@ def api_with_lnd_info():
     return api
 
 
-def test_lsp_network_for_wallet_electrum_returns_none(api_with_lnd_info, event_loop):
-    """Electrum wallets aren't LND, no LSP path for them."""
-    api_with_lnd_info.add_wallet("w1", currency="btc")
+@pytest.mark.parametrize(
+    "wallet_currency,reported_network,expected",
+    [
+        # Electrum wallets short-circuit before reading network.
+        ("btc",    None,         None),
+        # Public-network mappings.
+        ("btclnd", "mainnet",    "mainnet"),
+        ("btclnd", "testnet3",   "testnet"),    # normalized to LSP convention
+        ("btclnd", "testnet4",   "testnet"),    # normalized (warning side-channel pinned in a separate test)
+        # Networks no LSP serves → None.
+        ("btclnd", "regtest",    None),
+        ("btclnd", "wonderland", None),         # unknown string
+    ],
+    ids=["electrum", "mainnet", "testnet3-norm", "testnet4-norm", "regtest", "unknown"],
+)
+def test_lsp_network_for_wallet(
+    wallet_currency, reported_network, expected, api_with_lnd_info, event_loop,
+):
+    """Per-wallet → LSP-network mapping. Covers all six branches:
+    Electrum short-circuit, mainnet passthrough, both testnet
+    normalizations, regtest no-LSP, unknown-string fallback.
+
+    The testnet4 WARNING side-channel is pinned in the dedicated
+    test below — this test only covers the return value."""
+    api_with_lnd_info.add_wallet("w1", currency=wallet_currency)
+    if reported_network is not None:
+        api_with_lnd_info._set_network("w1", reported_network)
     result = event_loop.run_until_complete(
         liquidityhelper.lsp_network_for_wallet(
             api_with_lnd_info.wallets["w1"], api_with_lnd_info,
         )
     )
-    assert result is None
-
-
-def test_lsp_network_for_wallet_normalizes_testnet3(api_with_lnd_info, event_loop):
-    api_with_lnd_info.add_wallet("w1", currency="btclnd")
-    api_with_lnd_info._set_network("w1", "testnet3")
-    result = event_loop.run_until_complete(
-        liquidityhelper.lsp_network_for_wallet(
-            api_with_lnd_info.wallets["w1"], api_with_lnd_info,
-        )
-    )
-    assert result == "testnet"
-
-
-def test_lsp_network_for_wallet_returns_mainnet(api_with_lnd_info, event_loop):
-    api_with_lnd_info.add_wallet("w1", currency="btclnd")
-    api_with_lnd_info._set_network("w1", "mainnet")
-    result = event_loop.run_until_complete(
-        liquidityhelper.lsp_network_for_wallet(
-            api_with_lnd_info.wallets["w1"], api_with_lnd_info,
-        )
-    )
-    assert result == "mainnet"
-
-
-def test_lsp_network_for_wallet_regtest_returns_none(api_with_lnd_info, event_loop):
-    """Regtest is not served by any public LSP."""
-    api_with_lnd_info.add_wallet("w1", currency="btclnd")
-    api_with_lnd_info._set_network("w1", "regtest")
-    result = event_loop.run_until_complete(
-        liquidityhelper.lsp_network_for_wallet(
-            api_with_lnd_info.wallets["w1"], api_with_lnd_info,
-        )
-    )
-    assert result is None
-
-
-def test_lsp_network_for_wallet_unknown_returns_none(api_with_lnd_info, event_loop):
-    api_with_lnd_info.add_wallet("w1", currency="btclnd")
-    api_with_lnd_info._set_network("w1", "wonderland")
-    result = event_loop.run_until_complete(
-        liquidityhelper.lsp_network_for_wallet(
-            api_with_lnd_info.wallets["w1"], api_with_lnd_info,
-        )
-    )
-    assert result is None
-
-
-def test_lsp_network_for_wallet_normalizes_testnet4(api_with_lnd_info, event_loop):
-    """Modern Bitcoin Core defaults to testnet4. We normalize to
-    'testnet' for internal labeling — Zeus's testnet-lsps1.lnolymp.us
-    is testnet3-specific, but the normalization keeps the routing
-    consistent and a separate WARNING decision log surfaces the
-    chain-flavor caveat."""
-    api_with_lnd_info.add_wallet("w1", currency="btclnd")
-    api_with_lnd_info._set_network("w1", "testnet4")
-    result = event_loop.run_until_complete(
-        liquidityhelper.lsp_network_for_wallet(
-            api_with_lnd_info.wallets["w1"], api_with_lnd_info,
-        )
-    )
-    assert result == "testnet"
+    assert result == expected
 
 
 def test_lsp_network_for_wallet_testnet4_emits_warning_decision(
@@ -1131,58 +1087,28 @@ def test_max_lsp_quote_6mo_handles_zero_balance_quote(monkeypatch):
 # Pay-decision logging — the comparison reasoning lands in decisions.log
 # ---------------------------------------------------------------------------
 
-def test_picker_logs_within_10pct_decision(monkeypatch):
-    """When both providers quote and the prices are within ±10%, the
-    log line should explicitly say 'within ±10%' so an operator can
-    trace WHY Zeus won despite being pricier."""
-    import logging as _logging
-    captured: List[_logging.LogRecord] = []
-
-    class _Capture(_logging.Handler):
-        def emit(self, record): captured.append(record)
-
-    cap = _Capture(level=_logging.DEBUG)
-    liquidityhelper.decisions_logger.addHandler(cap)
-    try:
-        # Zeus 109 vs Megalithic 100 -> within 10%, Zeus wins.
-        quotes = {
-            "zeus": (_StubProvider("zeus"), _make_quote("zeus", 109)),
-            "megalithic": (_StubProvider("megalithic"), _make_quote("megalithic", 100)),
-        }
-        liquidityhelper._pick_with_zeus_preference(quotes)
-    finally:
-        liquidityhelper.decisions_logger.removeHandler(cap)
-
-    msgs = [r.getMessage() for r in captured]
-    assert any("chose zeus" in m and "within ±10%" in m for m in msgs), msgs
-
-
-def test_picker_logs_strictly_cheaper_decision(monkeypatch):
-    """When Zeus is >10% cheaper, the log should say 'strictly cheaper'."""
-    import logging as _logging
-    captured: List[_logging.LogRecord] = []
-
-    class _Capture(_logging.Handler):
-        def emit(self, record): captured.append(record)
-
-    cap = _Capture(level=_logging.DEBUG)
-    liquidityhelper.decisions_logger.addHandler(cap)
-    try:
-        quotes = {
-            "zeus": (_StubProvider("zeus"), _make_quote("zeus", 100)),
-            "megalithic": (_StubProvider("megalithic"), _make_quote("megalithic", 200)),
-        }
-        liquidityhelper._pick_with_zeus_preference(quotes)
-    finally:
-        liquidityhelper.decisions_logger.removeHandler(cap)
-
-    msgs = [r.getMessage() for r in captured]
-    assert any("chose zeus" in m and "strictly cheaper" in m for m in msgs), msgs
-
-
-def test_picker_logs_megalithic_win(monkeypatch):
-    """Megalithic wins (>10% cheaper). Log should record the choice
-    AND the reason."""
+@pytest.mark.parametrize(
+    "quote_prices,expected_choice,expected_reason_fragment",
+    [
+        # Zeus pricier but within ±10% band → Zeus wins, reason cites the band.
+        ({"zeus": 109, "megalithic": 100}, "zeus",       "within ±10%"),
+        # Zeus >10% cheaper → Zeus wins, reason cites cheaper.
+        ({"zeus": 100, "megalithic": 200}, "zeus",       "strictly cheaper"),
+        # Zeus >10% pricier → Megalithic wins, reason cites the >10% threshold.
+        ({"zeus": 200, "megalithic": 100}, "megalithic", ">10%"),
+        # Only Megalithic quoted → Megalithic wins, reason cites sole-provider.
+        ({"megalithic": 500},              "megalithic", "only provider available"),
+    ],
+    ids=["zeus-within-10pct", "zeus-strictly-cheaper", "megalithic-wins-by-10pct", "only-megalithic"],
+)
+def test_picker_logs_decision_reason(
+    quote_prices, expected_choice, expected_reason_fragment, monkeypatch,
+):
+    """Every picker decision branch emits a decisions.log line with
+    BOTH the chosen provider AND the human-readable reason. Pinning
+    the reason fragment prevents a refactor from silently dropping
+    the explanation (the picker reads as deterministic from outside
+    but operators rely on these messages to debug surprises)."""
     import logging as _logging
     captured: List[_logging.LogRecord] = []
 
@@ -1193,39 +1119,18 @@ def test_picker_logs_megalithic_win(monkeypatch):
     liquidityhelper.decisions_logger.addHandler(cap)
     try:
         quotes = {
-            "zeus": (_StubProvider("zeus"), _make_quote("zeus", 200)),
-            "megalithic": (_StubProvider("megalithic"), _make_quote("megalithic", 100)),
+            name: (_StubProvider(name), _make_quote(name, price))
+            for name, price in quote_prices.items()
         }
         liquidityhelper._pick_with_zeus_preference(quotes)
     finally:
         liquidityhelper.decisions_logger.removeHandler(cap)
 
     msgs = [r.getMessage() for r in captured]
-    assert any("chose megalithic" in m and ">10%" in m for m in msgs), msgs
-
-
-def test_picker_logs_only_provider_decision(monkeypatch):
-    """Only one provider returned a quote — log should say 'only
-    provider available'."""
-    import logging as _logging
-    captured: List[_logging.LogRecord] = []
-
-    class _Capture(_logging.Handler):
-        def emit(self, record): captured.append(record)
-
-    cap = _Capture(level=_logging.DEBUG)
-    liquidityhelper.decisions_logger.addHandler(cap)
-    try:
-        quotes = {
-            "megalithic": (_StubProvider("megalithic"), _make_quote("megalithic", 500)),
-        }
-        liquidityhelper._pick_with_zeus_preference(quotes)
-    finally:
-        liquidityhelper.decisions_logger.removeHandler(cap)
-
-    msgs = [r.getMessage() for r in captured]
-    assert any("chose megalithic" in m and "only provider available" in m
-               for m in msgs), msgs
+    assert any(
+        f"chose {expected_choice}" in m and expected_reason_fragment in m
+        for m in msgs
+    ), msgs
 
 
 # ---------------------------------------------------------------------------

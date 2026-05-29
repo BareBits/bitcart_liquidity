@@ -441,10 +441,13 @@ def test_list_onchain_history_normalizes_electrum_bc_value(monkeypatch):
 
     Before the dispatcher-level normalization fix, this test would
     have failed: tx.get("amount_sat") returned None → consumers
-    silently got 0. Uses asyncio.run for compatibility with this
-    repo's no-pytest-asyncio convention (other async tests in the
-    suite drive via asyncio.get_event_loop().run_until_complete or
-    asyncio.run; this matches that pattern)."""
+    silently got 0.
+
+    Drives the coroutine via a one-shot new_event_loop, NOT
+    asyncio.run(). asyncio.run() calls set_event_loop(None) on exit,
+    which unsets the session event_loop fixture's loop and breaks
+    every downstream regtest test that does asyncio.get_event_loop()
+    later in the same pytest process."""
     import asyncio
 
     raw_electrum_response = {
@@ -497,7 +500,11 @@ def test_list_onchain_history_normalizes_electrum_bc_value(monkeypatch):
         )
         return rows
 
-    rows = asyncio.run(run())
+    loop = asyncio.new_event_loop()
+    try:
+        rows = loop.run_until_complete(run())
+    finally:
+        loop.close()
     assert len(rows) == 2
 
     # First row: outgoing LSP order.

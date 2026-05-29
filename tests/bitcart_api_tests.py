@@ -26,8 +26,13 @@ from tests._fakes import FakeBitcartAPI
 
 
 def _run(coro):
-    """Helper — these tests are single-shot async; no need for pytest-asyncio."""
-    return asyncio.new_event_loop().run_until_complete(coro)
+    """Helper — these tests are single-shot async; no need for pytest-asyncio.
+    See lnd_fee_controls_tests._run for why asyncio.run() isn't used here."""
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
 
 
 # ---------------------------------------------------------------------------

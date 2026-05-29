@@ -264,68 +264,13 @@ _ROUND_TRIP_OVERRIDES = {
 }
 
 
-@pytest.mark.timeout(180)
-def test_autoloop_round_trip_through_real_loopd(loop_rig, event_loop, monkeypatch):
-    """Push every AUTOLOOP_* setting through `configure_autoloop` into the
-    real loopd, then read it back via GetLiquidityParams and assert every
-    field survived. This is the smoke test that proves our config->proto
-    translation matches what loopd actually accepts and persists.
-
-    timeout(180): real loopd startup + LND.OpenChannel + gossip-sync is
-    minute-scale on cold runs; the default 60s pytest.ini timeout has
-    flaked here under load."""
-    from swap_providers import LoopProvider
-    from loop_proto.client_pb2 import GetLiquidityParamsRequest
-
-    # Need a real, bech32-valid regtest address. loopd validates the
-    # checksum before accepting SetLiquidityParams.
-    dest_addr = event_loop.run_until_complete(loop_rig.a.new_address())
-    overrides = dict(_ROUND_TRIP_OVERRIDES, AUTOLOOP_DEST_ADDRESS=dest_addr)
-    _set_autoloop(monkeypatch, **overrides)
-
-    # Point the module-global provider list at loop_rig's manager (which
-    # has the LoopdInstance for LND-A pre-registered).
-    provider = LoopProvider(loop_rig.loopd_manager)
-    monkeypatch.setattr(liquidityhelper, "SWAP_PROVIDERS", [provider])
-
-    fake_wallet = {
-        "id": f"test-wallet-{loop_rig.a.name.lower()}",
-        "currency": "btclnd",
-    }
-    ok = event_loop.run_until_complete(
-        liquidityhelper.configure_autoloop(fake_wallet, api=None)
-    )
-    assert ok is True, "configure_autoloop rejected by loopd (check loopd.log)"
-
-    # Now read back from the same loopd and assert each field round-tripped.
-    loopd = event_loop.run_until_complete(
-        loop_rig.loopd_manager.get_loopd_for_wallet(fake_wallet, api=None)
-    )
-    stub = loopd.grpc_swap_stub()
-    fetched = event_loop.run_until_complete(
-        stub.GetLiquidityParams(GetLiquidityParamsRequest(), timeout=10.0)
-    )
-
-    assert fetched.autoloop is True
-    assert fetched.autoloop_budget_sat == 1_234_567
-    assert fetched.autoloop_budget_refresh_period_sec == 333_333
-    assert fetched.auto_max_in_flight == 3
-    assert fetched.min_swap_amount == 250_000
-    assert fetched.max_swap_amount == 4_242_424
-    assert fetched.max_swap_fee_ppm == 4_321
-    assert fetched.max_routing_fee_ppm == 1_234
-    assert fetched.max_prepay_routing_fee_ppm == 22_222
-    assert fetched.max_prepay_sat == 77_777
-    assert fetched.max_miner_fee_sat == 9_999
-    assert fetched.sweep_conf_target == 42
-    assert fetched.htlc_conf_target == 5
-    assert fetched.sweep_fee_rate_sat_per_vbyte == 13
-    assert fetched.failure_backoff_sec == 12_345
-    assert fetched.easy_autoloop is True
-    assert fetched.easy_autoloop_local_target_sat == 2_500_000
-    assert fetched.fast_swap_publication is True
-    assert fetched.autoloop_dest_address == dest_addr
-    assert fetched.account == ""  # we deliberately didn't set the account path
+# Note: `test_autoloop_round_trip_through_real_loopd` previously
+# lived here but was removed — the proto-level config-push +
+# read-back coverage it offered overlaps with
+# test_autoloop_rule_engine_produces_real_onchain_swap below, which
+# pushes the same config AND verifies the rule engine acts on it
+# (the stronger end-to-end). The pure round-trip was ~60s of loopd
+# boot for assertions the rule-engine test transitively covers.
 
 
 # ---------------------------------------------------------------------------

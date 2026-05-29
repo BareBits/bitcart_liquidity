@@ -557,14 +557,23 @@ LND_CHANNEL_CLOSE_MAX_FEE_SAT_PER_VBYTE: int = 50
 # force-close. Trade-off: lower CSV = less protection against a
 # revoked-state attack (an attacker who steals our state during the
 # CSV window could publish it). With anchor channels + a watchtower
-# this risk is mitigated, so 144 blocks (~1 day) is a reasonable
-# default vs LND's stock 2016 (~14 days).
+# this risk is mitigated.
+#
+# 0 = don't override (let LND's daemon-level --max-local-csv-delay
+# decide, default 2016 ~ 14 days). Setting this lower than 2016
+# REQUIRES the remote peer to also configure a low CSV auto-pick;
+# otherwise their auto-pick (typically 600 for typical channel sizes)
+# will be > our cap and the OpenChannel fails. The plugin cannot
+# coordinate this on its own — operators of OWN_LIGHTNING_NODES who
+# want a sub-2016 cap must also set --max-local-csv-delay on the
+# OWN node, and LSP channels inherit the LSP's CSV policy regardless.
+# Default 0 to avoid breaking opens when the peer ships LND defaults.
 #
 # Only applies to channels OPENED BY US — peer-funded channels and
 # LSP-funded inbound channels are negotiated by the other side and
 # inherit their CSV policy. See move_onchain_to_ln and
 # _attempt_direct_channel_cashout_to_own_node for the wire-through.
-LND_MAX_LOCAL_CSV_BLOCKS: int = 144
+LND_MAX_LOCAL_CSV_BLOCKS: int = 0
 
 # CSV delay (in blocks) WE impose on the REMOTE peer's `to_local`
 # output. If THEY force-close, their funds are CSV-locked by this

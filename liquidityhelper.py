@@ -2976,8 +2976,9 @@ async def move_onchain_to_ln(
                 # specifically for building routing capacity).
                 "private": False,
                 "target_conf": int(LND_CHANNEL_OPEN_TARGET_CONF),
-                "max_local_csv": int(LND_MAX_LOCAL_CSV_BLOCKS),
             }
+            if LND_MAX_LOCAL_CSV_BLOCKS > 0:
+                open_kwargs["max_local_csv"] = int(LND_MAX_LOCAL_CSV_BLOCKS)
             if LND_REMOTE_CSV_DELAY_BLOCKS > 0:
                 open_kwargs["remote_csv_delay"] = int(LND_REMOTE_CSV_DELAY_BLOCKS)
             try:
@@ -5642,15 +5643,17 @@ async def _attempt_direct_channel_cashout_to_own_node(
             # channel "fast" buys nothing customer-facing — channel
             # opens are not customer-facing urgent.
             "target_conf": int(LND_CHANNEL_OPEN_TARGET_CONF),
-            # Cap on the CSV delay the peer can impose on our
-            # `to_local` output. Lower = faster recovery if we
-            # force-close. See config.py LND_MAX_LOCAL_CSV_BLOCKS
-            # for the trade-off discussion.
-            "max_local_csv": int(LND_MAX_LOCAL_CSV_BLOCKS),
         }
+        if LND_MAX_LOCAL_CSV_BLOCKS > 0:
+            # Cap on the CSV the peer can impose on OUR `to_local` if
+            # WE force-close. 0 = let LND's daemon-level
+            # --max-local-csv-delay (default 2016) apply. Setting
+            # this below 2016 only works if the peer's CSV auto-pick
+            # also stays below the cap — see config.py for details.
+            open_kwargs["max_local_csv"] = int(LND_MAX_LOCAL_CSV_BLOCKS)
         if LND_REMOTE_CSV_DELAY_BLOCKS > 0:
-            # 0 = let LND auto-scale by channel size (the default).
-            # Operators usually leave this on auto.
+            # CSV we ask the peer to wait on THEIR `to_local` if THEY
+            # force-close. 0 = let LND auto-scale by channel size.
             open_kwargs["remote_csv_delay"] = int(LND_REMOTE_CSV_DELAY_BLOCKS)
         try:
             open_resp = await lnd_rpc(api, wallet_id, "OpenChannelSync", open_kwargs, "Lightning")

@@ -123,6 +123,15 @@
                 <MoneyDisplay :money="savingsAtSelectedPct" :unit="displayUnit" />
               </span>
             </div>
+            <!-- Sub-line: the would-be CC fee at the selected baseline.
+                 Helps the operator sanity-check the savings number — if
+                 the expected fee is small, big savings would look
+                 suspicious. Same MoneyDisplay so sats/btc/usd track the
+                 unit toggle at the top of the page. -->
+            <div class="savings-meta">
+              (expected credit-card fee:
+              <MoneyDisplay :money="expectedCcFeeAtSelectedPct" :unit="displayUnit" />)
+            </div>
           </div>
 
           <!-- Inbound liquidity moved out of per-store cards into the
@@ -258,6 +267,22 @@ export default {
         sats: savedSats,
         btc: savedSats / 100000000,
         usd: rate !== null ? savedSats * rate : null,
+      }
+    },
+    // Sibling of savingsAtSelectedPct: the would-be credit-card fee at
+    // the selected baseline (revenue × cc_pct, NO net-fees subtraction
+    // or clamping). Surfaced under the savings line as context — the
+    // operator wants to see what the card processor would have skimmed,
+    // not just the net savings. Same {sats, btc, usd} shape as the
+    // other money values so MoneyDisplay renders it identically.
+    expectedCcFeeAtSelectedPct() {
+      const revenueSats = Number(this.store?.revenue?.sats || 0)
+      const ccBaselineSats = Math.round(revenueSats * this.ccPctSelected)
+      const rate = this.usdPerSat
+      return {
+        sats: ccBaselineSats,
+        btc: ccBaselineSats / 100000000,
+        usd: rate !== null ? ccBaselineSats * rate : null,
       }
     },
     feeRows() {
@@ -404,6 +429,19 @@ export default {
 }
 .savings-label { white-space: nowrap; }
 .savings-value { margin-left: 6px; }
+/* Sub-line under .savings-line showing the would-be CC fee at the
+   selected baseline. Smaller and muted — informational context, not
+   the headline. Sits inline with the embedded MoneyDisplay span. */
+.savings-meta {
+  font-size: 0.85em;
+  font-weight: 400;
+  color: rgba(0, 0, 0, 0.6);
+  margin-top: 2px;
+  line-height: 1.3;
+}
+.theme--dark .savings-meta {
+  color: rgba(255, 255, 255, 0.6);
+}
 /* Make the inline v-select compact so it doesn't dwarf the row. */
 .cc-pct-select :deep(.v-input__control) {
   min-height: 28px;
@@ -445,4 +483,111 @@ export default {
   vertical-align: baseline;
 }
 .fee-info-icon:hover { opacity: 1; }
+
+/* ---------------------------------------------------------------
+   Key/value row styling — label on the left, value on the right,
+   with an optional muted "meta" inline annotation. These styles
+   used to live in pages/index.vue, but that file's <style scoped>
+   block scopes selectors to its own template — the elements they
+   target are rendered HERE in StoreCard, so the index.vue rules
+   never actually applied. Result: in dark mode, the indented
+   fee-breakdown rows fell back to whatever Vuetify defaulted to,
+   which blended against the card background. Moving the rules
+   into this file (where the elements actually live) makes them
+   take effect, and the .theme--dark variants below give each
+   element a dark-mode-appropriate color.
+   ---------------------------------------------------------------*/
+.kv-row {
+  display: flex;
+  justify-content: space-between;
+  padding: 4px 0;
+  border-bottom: 1px solid #eee;
+  font-size: 14px;
+}
+.kv-row:last-child { border-bottom: none; }
+.kv-row.indented {
+  padding-left: 24px;
+  font-size: 13px;
+  color: #555;
+}
+.kv-row.total {
+  font-weight: bold;
+  border-top: 1px solid #ccc;
+  margin-top: 4px;
+  padding-top: 8px;
+}
+.kv-label { color: #555; }
+.kv-value { text-align: right; }
+.kv-meta {
+  color: #999;
+  font-weight: normal;
+  font-size: 12px;
+  margin-left: 8px;
+}
+
+.fee-breakdown {
+  background-color: #f5f5f5;
+  border-radius: 4px;
+  padding: 4px 8px;
+  margin: 4px 0;
+}
+
+/* Card backgrounds. Light-mode defaults; .theme--dark overrides
+   below give Vuetify-aligned dark surfaces. */
+.store-card {
+  background-color: #fafafa;
+}
+.summary-card {
+  border: 2px solid #1976D2;
+  background-color: #f5f9fc;
+}
+
+/* ---------------------------------------------------------------
+   Dark-mode overrides. Bitcart toggles Vuetify's $vuetify.theme.dark
+   which puts `.theme--dark` on the v-application root + every v-card
+   etc. We piggyback on that class to swap our hardcoded light
+   values for dark-surface-appropriate ones. Kept here (not in a
+   global stylesheet) so the rules are co-located with their
+   light-mode siblings and scoped to this component's elements.
+   ---------------------------------------------------------------*/
+.theme--dark .store-card {
+  /* Slightly lighter than the page surface so the card still
+     reads as a distinct panel on a dark page background. */
+  background-color: #1e1e1e;
+}
+.theme--dark .summary-card {
+  background-color: #1a2632;
+  border-color: #1976D2; /* keep the brand-blue outline */
+}
+
+/* Row separators: subtle white on dark, instead of #eee/#ccc. */
+.theme--dark .kv-row {
+  border-bottom-color: rgba(255, 255, 255, 0.08);
+}
+.theme--dark .kv-row.total {
+  border-top-color: rgba(255, 255, 255, 0.16);
+}
+
+/* Text contrast. Vuetify's dark-mode default body text is
+   rgba(255,255,255,0.87) — but our explicit color: #555 / #999
+   from above would override that to a near-invisible dark grey
+   on a dark card. Restore high-contrast variants. */
+.theme--dark .kv-label {
+  color: rgba(255, 255, 255, 0.87);
+}
+.theme--dark .kv-row.indented {
+  color: rgba(255, 255, 255, 0.87);
+}
+.theme--dark .kv-meta {
+  /* Meta stays subordinate to the primary value — slightly muted
+     but still clearly readable against the dark card. */
+  color: rgba(255, 255, 255, 0.6);
+}
+
+/* The fee breakdown's light-grey background panel becomes a
+   subtle lighter shade on dark mode so it still reads as a
+   distinct subsection (rather than the same color as the card). */
+.theme--dark .fee-breakdown {
+  background-color: rgba(255, 255, 255, 0.04);
+}
 </style>

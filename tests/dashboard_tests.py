@@ -98,8 +98,13 @@ def _setup_engine_dispatch(monkeypatch, api: FakeBitcartAPI):
 def _run(coro):
     """Drive a coroutine to completion on a fresh event loop. Cleaner
     than depending on pytest-asyncio's auto-mode for these isolated
-    tests."""
-    return asyncio.new_event_loop().run_until_complete(coro)
+    tests. See lnd_fee_controls_tests._run for why asyncio.run() isn't
+    used (it unsets the session loop)."""
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
 
 
 def test_dashboard_empty_no_crash(monkeypatch):
@@ -855,64 +860,40 @@ def test_dashboard_lnd_ready_trivially_true_for_electrum_only(monkeypatch):
     assert payload.lnd_not_ready_wallets == []
 
 
-def test_dashboard_bitcoin_network_from_lnd_info(monkeypatch):
+@pytest.mark.parametrize(
+    "wallet_currency,reported_network,expected",
+    [
+        # btclnd + GetInfo returns each network spelling.
+        ("btclnd", "regtest",  "regtest"),    # passes through
+        ("btclnd", "testnet3", "testnet"),    # normalized to LSP convention
+        ("btclnd", "testnet4", "testnet4"),   # preserved (distinct mempool subdomain)
+        # btc (Electrum) wallets don't expose network via this path;
+        # fall back to '' so the UI renders txids as plain text.
+        ("btc",    None,       ""),
+    ],
+    ids=["btclnd-regtest", "btclnd-testnet3-norm", "btclnd-testnet4-preserved", "btc-electrum-empty"],
+)
+def test_dashboard_bitcoin_network_from_lnd_info(
+    wallet_currency, reported_network, expected, monkeypatch,
+):
     """bitcoin_network is populated from the first btclnd liquidityhelper
     wallet's GetInfo. Used by the UI to construct mempool.space URLs
-    with the right network prefix."""
+    with the right network prefix.
+
+    Covers the three real-network-string variants the dashboard
+    distinguishes (regtest passthrough, testnet3 normalization, testnet4
+    preservation) plus the Electrum fallback to empty string."""
     api = FakeBitcartAPI()
-    api.add_wallet("w1", name="liquidityhelper", currency="btclnd")
+    api.add_wallet("w1", name="liquidityhelper", currency=wallet_currency)
     api.add_store("s1", wallets=["w1"], created="2025-01-01")
-    async def fake_get_lnd_info(wallet_id):
-        return {"network": "regtest"}
-    api.get_lnd_info = fake_get_lnd_info
+    if reported_network is not None:
+        async def fake_get_lnd_info(wallet_id):
+            return {"network": reported_network}
+        api.get_lnd_info = fake_get_lnd_info
     _setup_engine_dispatch(monkeypatch, api)
 
     payload = _run(dashboard_mod.compute_dashboard(api, "all"))
-    assert payload.bitcoin_network == "regtest"
-
-
-def test_dashboard_bitcoin_network_normalizes_testnet3(monkeypatch):
-    """LND reports 'testnet3' but the UI/LSP convention is just
-    'testnet'. The dashboard normalizes so the UI doesn't need to
-    know about both spellings."""
-    api = FakeBitcartAPI()
-    api.add_wallet("w1", name="liquidityhelper", currency="btclnd")
-    api.add_store("s1", wallets=["w1"], created="2025-01-01")
-    async def fake_get_lnd_info(wallet_id):
-        return {"network": "testnet3"}
-    api.get_lnd_info = fake_get_lnd_info
-    _setup_engine_dispatch(monkeypatch, api)
-
-    payload = _run(dashboard_mod.compute_dashboard(api, "all"))
-    assert payload.bitcoin_network == "testnet"
-
-
-def test_dashboard_bitcoin_network_preserves_testnet4(monkeypatch):
-    """testnet4 stays as 'testnet4' (it gets its own mempool subdomain;
-    the UI needs to distinguish it from testnet3)."""
-    api = FakeBitcartAPI()
-    api.add_wallet("w1", name="liquidityhelper", currency="btclnd")
-    api.add_store("s1", wallets=["w1"], created="2025-01-01")
-    async def fake_get_lnd_info(wallet_id):
-        return {"network": "testnet4"}
-    api.get_lnd_info = fake_get_lnd_info
-    _setup_engine_dispatch(monkeypatch, api)
-
-    payload = _run(dashboard_mod.compute_dashboard(api, "all"))
-    assert payload.bitcoin_network == "testnet4"
-
-
-def test_dashboard_bitcoin_network_empty_for_electrum_only(monkeypatch):
-    """Electrum (btc) wallets don't expose network via the same path —
-    we fall back to '' so the UI renders txids/addresses as plain text
-    (no mempool link)."""
-    api = FakeBitcartAPI()
-    api.add_wallet("w1", name="liquidityhelper", currency="btc")
-    api.add_store("s1", wallets=["w1"], created="2025-01-01")
-    _setup_engine_dispatch(monkeypatch, api)
-
-    payload = _run(dashboard_mod.compute_dashboard(api, "all"))
-    assert payload.bitcoin_network == ""
+    assert payload.bitcoin_network == expected
 
 
 def test_recent_network_fees_external_label_surfaces_as_external_send(monkeypatch):

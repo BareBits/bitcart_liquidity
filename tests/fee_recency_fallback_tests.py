@@ -140,34 +140,14 @@ def test_referral_rail_threshold_disabled(monkeypatch):
 # Independence: per-destination staleness doesn't bleed across destinations
 # ---------------------------------------------------------------------------
 
-def test_cashout_staleness_does_not_force_fee_onchain(monkeypatch):
-    """The exact concern you flagged: 'A failure for cashouts to work
-    via lightning should not trigger fees to be paid via on-chain
-    transaction.'"""
-    _set(monkeypatch)
-    _record_ln_event("LAST_SUCCESSFUL_LN_CASHOUT_PAYMENT", days_ago=200)
-    # No fee timestamp at all -> fee path stays LN even though cashout is stale.
-    assert liquidityhelper.should_prefer_onchain_fee_payment() is False
-    # And conversely, cashout DOES go on-chain.
-    assert liquidityhelper.should_prefer_onchain_cashout() is True
-
-
-def test_fee_staleness_does_not_force_cashout_onchain(monkeypatch):
-    _set(monkeypatch)
-    _record_ln_event("LAST_SUCCESSFUL_LN_FEE_PAYMENT", days_ago=200)
-    assert liquidityhelper.should_prefer_onchain_cashout() is False
-
-
-def test_referral_staleness_does_not_force_fee_onchain(monkeypatch):
-    _set(monkeypatch)
-    _record_ln_event("LAST_SUCCESSFUL_LN_REFERRAL_PAYMENT", days_ago=200)
-    assert liquidityhelper.should_prefer_onchain_fee_payment() is False
-
-
-def test_fee_staleness_does_not_force_referral_onchain(monkeypatch):
-    _set(monkeypatch)
-    _record_ln_event("LAST_SUCCESSFUL_LN_FEE_PAYMENT", days_ago=200)
-    assert liquidityhelper.should_prefer_onchain_referral_payment() is False
+# Per-destination staleness independence: the four explicit pairwise
+# tests (cashout-stale-doesn't-force-fee-onchain,
+# fee-stale-doesn't-force-cashout-onchain, etc.) are subsumed by
+# test_all_three_can_be_on_different_rails below, which exercises a
+# realistic scenario where each rail has independent staleness and
+# asserts that each rail's decision uses ITS OWN timestamp. If the
+# independence invariant ever breaks, that combined test fails
+# regardless of which rail's signal is leaking into which other.
 
 
 def test_all_three_can_be_on_different_rails(monkeypatch):

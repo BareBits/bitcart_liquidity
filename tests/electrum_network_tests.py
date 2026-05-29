@@ -36,6 +36,14 @@ ELECTRUM_WALLET: Dict[str, Any] = {"currency": "btc", "xpub": ""}
 
 
 def _run(coro):
+    # Drive the coroutine on the SESSION event loop (set up by the
+    # event_loop fixture in conftest.py). Tests in this file use the
+    # regtest `lnd_electrum_pair` fixture, whose gRPC channels are
+    # bound to the session loop — we can't use asyncio.run() here
+    # because it would create a fresh loop and the channels would
+    # error. asyncio.get_event_loop() returns the session loop with
+    # a DeprecationWarning on 3.12; that's tolerable here since
+    # set_event_loop() was already called by the session fixture.
     return asyncio.get_event_loop().run_until_complete(coro)
 
 
@@ -50,25 +58,10 @@ def _mine_and_wait(lnd_electrum_pair, blocks: int = 1, sleep_s: float = 1.0):
 pytestmark = pytest.mark.usefixtures("reset_engine_db_state")
 
 
-# ---------------------------------------------------------------------------
-# Sanity smoke test (sets up + tears down the full fixture, no business logic).
-# ---------------------------------------------------------------------------
-
-
-def test_lnd_electrum_pair_fixture_smoke(lnd_electrum_pair_shared):
-    lnd_electrum_pair = lnd_electrum_pair_shared
-    async def run():
-        chans = await lnd_electrum_pair.lnd.list_channels()
-        electrum_pk = lnd_electrum_pair.electrum.identity_pubkey
-        to_electrum = [
-            c for c in chans
-            if c.get("remote_pubkey") == electrum_pk and c.get("active")
-        ]
-        assert len(to_electrum) >= 2, (
-            f"expected 2 active channels LND<->Electrum, got: {chans}"
-        )
-
-    _run(run())
+# Note: a fixture-only smoke test (`test_lnd_electrum_pair_fixture_smoke`)
+# previously lived here. Every other test in this file de-facto verifies
+# the same invariant (both channels active) when reading channel state
+# at the start of its own logic, so the standalone smoke was pure noise.
 
 
 # ---------------------------------------------------------------------------
@@ -219,7 +212,14 @@ def test_find_channel_closings_electrum_always_empty(lnd_electrum_pair_shared):
 def test_electrum_pay_ln_invoice_electrum(lnd_electrum_pair):
     """LND generates a 2000-sat invoice; Electrum pays it via the
     electrum_pay_ln_invoice Electrum path. Verifies True returned + LND
-    sees the invoice settled."""
+    sees the invoice settled.
+
+    Uses the FUNCTION-scoped fixture intentionally: switching to the
+    shared rig caused intermittent payment failures (`success: False,
+    log: []` from Electrum). LN payments on a long-lived shared
+    channel appear sensitive to whatever cumulative state builds up
+    across tests — gossip aging, route cache, htlc settlement timing.
+    The function-scoped rig adds ~30s but is reliable."""
     ep = lnd_electrum_pair
 
     async def run():
@@ -254,10 +254,13 @@ def test_electrum_pay_ln_invoice_electrum(lnd_electrum_pair):
 # ---------------------------------------------------------------------------
 
 
-def test_electrum_pay_onchain_electrum(lnd_electrum_pair):
+def test_electrum_pay_onchain_electrum(lnd_electrum_pair_shared):
     """Electrum sends 50_000 sat on-chain to an LND-controlled address with a
-    custom label; verifies True + LND sees the new UTXO after a block."""
-    ep = lnd_electrum_pair
+    custom label; verifies True + LND sees the new UTXO after a block.
+
+    Uses shared rig — 50k sat is well within the funded wallet and
+    doesn't alter channel state."""
+    ep = lnd_electrum_pair_shared
 
     async def run():
         dest_addr = await ep.lnd.new_address()
@@ -289,9 +292,12 @@ def test_electrum_pay_onchain_electrum(lnd_electrum_pair):
 
 
 def test_list_onchain_history_electrum(lnd_electrum_pair_shared):
-    """Electrum's on-chain history surfaces the channel funding tx with the
-    'OPEN CHANNEL' label (Electrum auto-labels these), which is what
-    is_ln_open_transaction in liquidityhelper looks for to attribute fees.
+    """End-to-end coverage of Electrum's on-chain history: BOTH the
+    OPEN-CHANNEL label round-trip (needed by is_ln_open_transaction
+    for fee attribution) AND the canonical-shape normalization (the
+    dispatcher must turn Electrum's `bc_value`-as-BTC-string into the
+    engine's `amount_sat`-as-int — without this, every consumer that
+    reads `amount_sat` silently sees 0).
 
     Read-only against the rig — uses shared module fixture."""
     ep = lnd_electrum_pair_shared
@@ -301,46 +307,9 @@ def test_list_onchain_history_electrum(lnd_electrum_pair_shared):
         rows = await liquidityhelper.list_onchain_history(wallet=ELECTRUM_WALLET)
         assert isinstance(rows, list) and rows, "no on-chain history returned"
 
-        opens = [r for r in rows
-                 if (r.get("label") or "").upper().startswith("OPEN CHANNEL")]
-        # Find our funding tx in the on-chain history (Electrum's txid field
-        # may be 'txid' or 'tx_hash' depending on version — accept either).
-        found = any(
-            (r.get("txid") or r.get("tx_hash") or "").lower() == funding_txid
-            for r in opens
-        )
-        assert found, (
-            f"funding tx {funding_txid} not flagged OPEN CHANNEL in history: "
-            f"sample row keys = {list(rows[0].keys()) if rows else 'N/A'}"
-        )
-
-    _run(run())
-
-
-def test_list_onchain_history_electrum_returns_canonical_shape(lnd_electrum_pair_shared):
-    """End-to-end shape pin: real Electrum daemon → list_onchain_history
-    → engine canonical shape with the right types.
-
-    Why this exists: Electrum's daemon returns `bc_value` as a BTC-decimal
-    STRING ("0.00500000", "2.") and has no `amount_sat` key. The engine's
-    canonical shape uses `amount_sat` as an int. Without normalization,
-    consumers like new_calc_invoice_stats and the dashboard's Recent
-    Cashouts table silently read 0 for every Electrum row. Every prior
-    test used pre-normalized synthetic fixtures and therefore couldn't
-    have caught this drift. This test starts from REAL Electrum output
-    and asserts each row has every canonical field with the right type.
-
-    Read-only against the rig — uses shared module fixture."""
-    ep = lnd_electrum_pair_shared
-
-    async def run():
-        funding_txid = ep.electrum_to_lnd_channel_point.split(":")[0].lower()
-        rows = await liquidityhelper.list_onchain_history(wallet=ELECTRUM_WALLET)
-        assert isinstance(rows, list) and rows, "no on-chain history returned"
-
-        # Every canonical key, every canonical type — for every row. If
-        # this fails, the dispatcher's Electrum branch is no longer
-        # producing the canonical shape consumers depend on.
+        # ----- Canonical-shape pin (every row, every field) -----
+        # If this fails, the dispatcher's Electrum branch is no longer
+        # producing the canonical shape downstream consumers depend on.
         for r in rows:
             assert isinstance(r.get("txid"), str), f"txid not str: {r!r}"
             assert isinstance(r.get("incoming"), bool), f"incoming not bool: {r!r}"
@@ -359,28 +328,34 @@ def test_list_onchain_history_electrum_returns_canonical_shape(lnd_electrum_pair
             assert "bc_value" not in r, f"raw bc_value leaked through: {r!r}"
             assert "height" not in r, f"raw electrum 'height' leaked through: {r!r}"
 
-        # Find the channel-funding tx and assert amount_sat is plausible
-        # for a 0.2 BTC channel open. Electrum's bc_value will be slightly
-        # below 20_000_000 sats outgoing (channel-size + miner fee +
-        # any change handling). What matters is: it's a NEGATIVE INT
-        # of meaningful magnitude — not 0 (which is what bc_value-as-string
-        # would silently degrade to before this fix).
+        # ----- OPEN-CHANNEL label round-trip -----
+        # Electrum auto-labels the channel funding tx with 'OPEN CHANNEL';
+        # is_ln_open_transaction reads this to attribute on-chain fees.
+        opens = [
+            r for r in rows
+            if (r.get("label") or "").upper().startswith("OPEN CHANNEL")
+        ]
+        assert any(r.get("txid", "").lower() == funding_txid for r in opens), (
+            f"funding tx {funding_txid} not flagged OPEN CHANNEL in history: "
+            f"sample row keys = {list(rows[0].keys()) if rows else 'N/A'}"
+        )
+
+        # ----- Funding-tx amount plausibility -----
+        # 0.2 BTC channel ≈ -20_000_000 sat amount_sat (slightly below,
+        # for miner fees and change). MUST be a meaningful negative int —
+        # NOT 0 (which is what bc_value-as-string silently degraded to
+        # before the normalization fix).
         funding_rows = [
             r for r in rows
             if (r.get("txid") or "").lower() == funding_txid
         ]
-        assert funding_rows, (
-            f"funding tx {funding_txid} not in history at all"
-        )
+        assert funding_rows, f"funding tx {funding_txid} not in history at all"
         funding = funding_rows[0]
-        # 0.2 BTC channel ≈ -20_000_000 sat amount_sat. Use a generous
-        # tolerance for miner fees and channel-reserve dust.
         assert funding["amount_sat"] < -10_000_000, (
             f"funding amount_sat looks wrong for a 0.2 BTC channel open: "
             f"{funding['amount_sat']} (would be 0 without normalization)"
         )
-        # Sanity: incoming flag agrees with sign of amount_sat.
-        assert funding["incoming"] is False
+        assert funding["incoming"] is False  # sign of amount_sat agrees
         assert funding["amount_sat"] < 0
 
     _run(run())
@@ -394,7 +369,10 @@ def test_list_onchain_history_electrum_returns_canonical_shape(lnd_electrum_pair
 def test_list_ln_payments_with_labels_electrum(lnd_electrum_pair):
     """After Electrum pays a labeled invoice from LND,
     list_ln_payments_with_labels should return a row for that payment with
-    the label preserved (Electrum stores labels natively for LN payments)."""
+    the label preserved (Electrum stores labels natively for LN payments).
+
+    Function-scoped fixture — see test_electrum_pay_ln_invoice_electrum
+    for why LN-payment tests can't share a rig across tests."""
     ep = lnd_electrum_pair
     custom_label = "electrum-cashout-label-xyz"
 

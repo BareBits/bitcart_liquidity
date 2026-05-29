@@ -29,6 +29,7 @@ necessary binaries / fixtures aren't available.
 from __future__ import annotations
 
 import asyncio
+import time
 import hashlib
 import os
 import secrets
@@ -94,8 +95,8 @@ async def _wait_for_channel_active(
     lnd_node, channel_point: str, timeout_s: float = 30.0,
 ) -> Dict[str, Any]:
     """Poll until `channel_point` shows up active on `lnd_node`, OR raise."""
-    deadline = asyncio.get_event_loop().time() + timeout_s
-    while asyncio.get_event_loop().time() < deadline:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
         chans = await lnd_node.list_channels()
         for ch in chans:
             if ch.get("channel_point") == channel_point and ch.get("active"):
@@ -196,8 +197,8 @@ def test_own_lightning_nodes_full_roundtrip(
     async def _find_a_to_b_channel():
         """Poll bitcart_lnd.list_channels() until we see the channel to
         clientnode appear and become active. Returns the channel dict."""
-        deadline = asyncio.get_event_loop().time() + 30.0
-        while asyncio.get_event_loop().time() < deadline:
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline:
             for ch in await bitcart_lnd.list_channels():
                 if ch.get("remote_pubkey", "").lower() == clientnode.identity_pubkey.lower():
                     if ch.get("active"):
@@ -253,8 +254,8 @@ def test_own_lightning_nodes_full_roundtrip(
     # only polled A's view; we need B's view to be settled too so the
     # invoice's route_hint resolves on the sender's side.
     async def _wait_for_clientnode_channel():
-        deadline = asyncio.get_event_loop().time() + 30.0
-        while asyncio.get_event_loop().time() < deadline:
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline:
             for ch in await clientnode.list_channels():
                 if (ch.get("remote_pubkey", "").lower() == bitcart_lnd.identity_pubkey.lower()
                         and ch.get("active")
@@ -324,8 +325,8 @@ def test_own_lightning_nodes_full_roundtrip(
     # should have grown by ~push_back_sat (minus a small forward fee
     # which for a single-hop private channel is typically zero).
     async def _wait_for_local_balance(min_local: int, timeout_s: float = 15.0):
-        deadline = asyncio.get_event_loop().time() + timeout_s
-        while asyncio.get_event_loop().time() < deadline:
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
             for ch in await bitcart_lnd.list_channels():
                 if ch.get("remote_pubkey", "").lower() == clientnode.identity_pubkey.lower():
                     if int(ch.get("local_balance") or 0) >= min_local:
@@ -377,8 +378,8 @@ def test_own_lightning_nodes_full_roundtrip(
     # ~50k reserve + ~3k commit/anchor overhead = ~55k. Cap a bit above
     # to allow for small per-tick variations.
     async def _wait_for_local_drained(max_local: int, timeout_s: float = 15.0):
-        deadline = asyncio.get_event_loop().time() + timeout_s
-        while asyncio.get_event_loop().time() < deadline:
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
             for ch in await bitcart_lnd.list_channels():
                 if ch.get("remote_pubkey", "").lower() == clientnode.identity_pubkey.lower():
                     if int(ch.get("local_balance") or 0) <= max_local:
@@ -453,8 +454,8 @@ def test_own_lightning_nodes_amp_fallback_when_keysend_rejected(
     pair.bitcoind.mine_to_self(10)
 
     async def _find_a_to_b_channel():
-        deadline = asyncio.get_event_loop().time() + 30.0
-        while asyncio.get_event_loop().time() < deadline:
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline:
             for ch in await bitcart_lnd.list_channels():
                 if ch.get("remote_pubkey", "").lower() == clientnode.identity_pubkey.lower():
                     if ch.get("active"):
@@ -466,8 +467,8 @@ def test_own_lightning_nodes_amp_fallback_when_keysend_rejected(
     chan_id_str = channel.get("chan_id") or ""
 
     async def _wait_for_clientnode_channel():
-        deadline = asyncio.get_event_loop().time() + 30.0
-        while asyncio.get_event_loop().time() < deadline:
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline:
             for ch in await clientnode.list_channels():
                 if (ch.get("remote_pubkey", "").lower() == bitcart_lnd.identity_pubkey.lower()
                         and ch.get("active")
@@ -512,8 +513,8 @@ def test_own_lightning_nodes_amp_fallback_when_keysend_rejected(
     # Without this, phase 3 sees A's pre-top-up balance and only
     # cashes out ~40k instead of the full ~240k.
     async def _wait_for_local_growth(min_local: int, timeout_s: float = 15.0):
-        deadline = asyncio.get_event_loop().time() + timeout_s
-        while asyncio.get_event_loop().time() < deadline:
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
             for ch in await bitcart_lnd.list_channels():
                 if ch.get("remote_pubkey", "").lower() == clientnode.identity_pubkey.lower():
                     if int(ch.get("local_balance") or 0) >= min_local:
@@ -546,8 +547,8 @@ def test_own_lightning_nodes_amp_fallback_when_keysend_rejected(
 
     # Balance drained on A's side (regardless of which rail carried it).
     async def _wait_for_local_drained(max_local: int, timeout_s: float = 15.0):
-        deadline = asyncio.get_event_loop().time() + timeout_s
-        while asyncio.get_event_loop().time() < deadline:
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
             for ch in await bitcart_lnd.list_channels():
                 if ch.get("remote_pubkey", "").lower() == clientnode.identity_pubkey.lower():
                     if int(ch.get("local_balance") or 0) <= max_local:

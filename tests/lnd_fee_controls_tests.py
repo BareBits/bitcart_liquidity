@@ -34,7 +34,18 @@ from lnd_proto import lightning_pb2
 # ---------------------------------------------------------------------------
 
 def _run(coro):
-    return asyncio.new_event_loop().run_until_complete(coro)
+    # Use new_event_loop().run_until_complete() — creates a one-shot
+    # loop and never touches the thread-current-loop pointer. We
+    # cannot use asyncio.run() here because it calls
+    # set_event_loop(None) on exit, which unsets the session
+    # event_loop fixture loop for every downstream test in the same
+    # process — breaking electrum_network_tests / onchain_cashout /
+    # own_lightning_nodes when they call asyncio.get_event_loop().
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
 
 
 class _CapturedCall:
