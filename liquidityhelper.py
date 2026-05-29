@@ -614,6 +614,87 @@ async def _lnd_channel_tx_hashes(api: "BitcartAPI", wallet_id: str) -> Tuple[set
     return funding, closing
 
 
+def _vsize_from_raw_tx(raw_hex: str) -> Optional[int]:
+    """Compute the virtual size (in vbytes) of a Bitcoin transaction
+    from its serialized hex. Returns None if the hex doesn't parse.
+
+    Implements BIP141:
+        weight = 3 * base_size + total_size
+        vsize  = ceil(weight / 4)
+
+    Where `base_size` is the serialized size WITHOUT marker, flag, and
+    witness data, and `total_size` is the full serialization length.
+    For legacy (non-SegWit) txs this collapses to vsize = total_size.
+
+    sat/vbyte fee rates divide by exactly this number — it's what
+    mempool.space and `bitcoin-cli getrawmempool true` report. Used by
+    `_lnd_list_onchain_history` to expose `fee_rate_sat_per_vbyte` for
+    the dashboard's Recent Network Fees table so operators can audit
+    whether the fees they're paying are reasonable for the current
+    mempool conditions.
+
+    The parser is intentionally minimal — just enough to find where
+    witness data lives. We don't validate signatures or anything else;
+    even an otherwise-malformed tx will give a numerically-correct
+    vsize as long as the structural varints + lengths line up.
+    """
+    if not raw_hex:
+        return None
+    try:
+        raw = bytes.fromhex(raw_hex)
+    except ValueError:
+        return None
+    if len(raw) < 10:
+        return None  # too short for a valid tx (version+ins+outs+locktime)
+
+    total_size = len(raw)
+
+    def _read_varint(p: int) -> Tuple[int, int]:
+        n = raw[p]
+        if n < 0xfd:
+            return n, p + 1
+        if n == 0xfd:
+            return int.from_bytes(raw[p+1:p+3], "little"), p + 3
+        if n == 0xfe:
+            return int.from_bytes(raw[p+1:p+5], "little"), p + 5
+        return int.from_bytes(raw[p+1:p+9], "little"), p + 9
+
+    try:
+        pos = 4  # skip version
+        # SegWit marker (0x00) + flag (0x01) per BIP141. A legacy tx
+        # has a non-zero input-count varint here instead.
+        has_witness = raw[pos] == 0x00 and raw[pos + 1] == 0x01
+        if has_witness:
+            pos += 2
+        if not has_witness:
+            return total_size  # vsize == total_size for legacy
+
+        # Walk inputs to find where outputs end and witness data begins.
+        input_count, pos = _read_varint(pos)
+        for _ in range(input_count):
+            pos += 32 + 4   # prev_tx_hash (32) + prev_vout (4)
+            sig_len, pos = _read_varint(pos)
+            pos += sig_len + 4  # scriptSig + sequence
+
+        output_count, pos = _read_varint(pos)
+        for _ in range(output_count):
+            pos += 8        # value
+            spk_len, pos = _read_varint(pos)
+            pos += spk_len  # scriptPubKey
+
+        # pos now points to the start of witness data. The final 4 bytes
+        # are the locktime; everything between is witness bytes.
+        witness_size = total_size - pos - 4
+        if witness_size < 0:
+            return None  # malformed; bail rather than report a wrong vsize
+        # base_size = full size minus marker+flag minus witness bytes.
+        base_size = total_size - witness_size - 2
+        weight = 3 * base_size + total_size
+        return (weight + 3) // 4
+    except (IndexError, ValueError):
+        return None
+
+
 async def _lnd_list_onchain_history(api: "BitcartAPI", wallet_id: str) -> List[Dict[str, Any]]:
     """Normalize Lightning.GetTransactions into the engine's canonical
     on-chain history shape.
@@ -687,16 +768,30 @@ async def _lnd_list_onchain_history(api: "BitcartAPI", wallet_id: str) -> List[D
         # `dest_addresses` is LND's list of output addresses, useful
         # for surfacing where a payment went; we pass the first one.
         dest_addresses = t.get("dest_addresses") or []
+        # sat/vbyte fee rate. LND's GetTransactions returns raw_tx_hex
+        # for every tx — vsize is computable locally without an extra
+        # RPC. Channel-close + cashout txs benefit most from this:
+        # operators glance at the rate to spot a tx that paid 100 sat/
+        # vbyte during a fee-spike vs the expected 5-10. None when we
+        # can't compute (no fee, raw_tx unparseable) so downstream
+        # consumers can leave the cell blank.
+        fee_sat = int(t.get("total_fees") or 0)
+        fee_rate_sat_per_vbyte: Optional[float] = None
+        if fee_sat > 0:
+            vsize = _vsize_from_raw_tx(t.get("raw_tx_hex") or "")
+            if vsize and vsize > 0:
+                fee_rate_sat_per_vbyte = fee_sat / vsize
         out.append({
             "txid": tx_hash,
             "incoming": amount_sat > 0,
-            "fee_sat": int(t.get("total_fees") or 0),
+            "fee_sat": fee_sat,
             "label": label,
             "amount_sat": amount_sat,
             "block_height": int(t.get("block_height") or 0),
             "num_confirmations": int(t.get("num_confirmations") or 0),
             "timestamp": int(t.get("time_stamp") or 0),
             "dest_address": (dest_addresses[0] if dest_addresses else ""),
+            "fee_rate_sat_per_vbyte": fee_rate_sat_per_vbyte,
         })
     return out
 
@@ -753,6 +848,14 @@ def _normalize_electrum_onchain_row(row: Dict[str, Any]) -> Dict[str, Any]:
         # bucketing doesn't read it for Electrum rows anyway. Empty
         # string matches the LND branch's "no dest known" fallback.
         "dest_address": "",
+        # Electrum's onchain_history endpoint doesn't return raw_tx_hex
+        # so we can't compute vsize without a follow-up RPC. Leave the
+        # field None — the dashboard's sat/vbyte column will render
+        # as a blank cell for Electrum-source rows. Adding a per-tx
+        # gettransaction call to populate this is possible but adds
+        # one RPC per row, which is significant when Electrum's history
+        # has hundreds of entries; skip for now.
+        "fee_rate_sat_per_vbyte": None,
     }
 
 

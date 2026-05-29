@@ -717,6 +717,13 @@
                     <template #item.fee_sats="{ item }">
                       <MoneyDisplay :sats="item.fee_sats" :usd="item.fee_usd" :unit="displayUnit" />
                     </template>
+                    <template #item.fee_rate_sat_per_vbyte="{ item }">
+                      <span
+                        v-if="item.fee_rate_sat_per_vbyte != null"
+                        class="text-caption"
+                      >{{ item.fee_rate_sat_per_vbyte.toFixed(2) }}</span>
+                      <span v-else class="text-caption grey--text">—</span>
+                    </template>
                     <template #item.amount_sats="{ item }">
                       <MoneyDisplay :sats="item.amount_sats" :usd="item.amount_usd" :unit="displayUnit" />
                     </template>
@@ -1332,6 +1339,11 @@ export default {
         { text: "Date", value: "iso_date", width: 160 },
         { text: "Category", value: "category", width: 130 },
         { text: "Fee paid", value: "fee_sats" },
+        // sat/vbyte — populated server-side for on-chain LND-source
+        // rows via the BIP141 vsize of raw_tx_hex. Blank for LN
+        // (no concept) and Electrum-source on-chain rows (raw_tx_hex
+        // isn't returned by Electrum's onchain_history endpoint).
+        { text: "Sat/vbyte", value: "fee_rate_sat_per_vbyte", width: 110, align: "end" },
         { text: "Method", value: "method", width: 110 },
         { text: "Destination", value: "destination" },
         { text: "Tx / hash", value: "txid" },

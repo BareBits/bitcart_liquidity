@@ -236,6 +236,13 @@ class NetworkFeeRow(BaseModel):
     txid: str                  # empty for LN
     payment_hash: str          # empty for on-chain
     destination: str           # peer / address from the tx label or current config
+    # On-chain only: sat/vbyte fee rate, computed locally from LND's
+    # raw_tx_hex via the BIP141 weight formula. Lets operators audit
+    # at-a-glance whether a tx paid a reasonable rate for the mempool
+    # conditions at the time. None for LN rows (no concept) and for
+    # Electrum-source rows (raw_tx_hex isn't exposed by their
+    # onchain_history endpoint).
+    fee_rate_sat_per_vbyte: Optional[float] = None
 
 
 class ChannelClosureRow(BaseModel):
@@ -965,6 +972,16 @@ async def list_recent_network_fees(
                 or ""
             )
             ts = int(tx.get("timestamp") or 0)
+            # fee_rate_sat_per_vbyte is populated by
+            # _lnd_list_onchain_history; absent (None) for Electrum-
+            # source rows. Round to 2 decimals — operators read this
+            # like sat/vB on mempool.space, no point in more precision.
+            raw_rate = tx.get("fee_rate_sat_per_vbyte")
+            fee_rate_for_row: Optional[float] = (
+                round(float(raw_rate), 2)
+                if raw_rate is not None
+                else None
+            )
             rows.append(NetworkFeeRow(
                 timestamp=ts,
                 iso_date=_iso(ts),
@@ -977,6 +994,7 @@ async def list_recent_network_fees(
                 txid=tx.get("txid") or "",
                 payment_hash="",
                 destination=destination,
+                fee_rate_sat_per_vbyte=fee_rate_for_row,
             ))
         # LN side. Only outgoing payments incur routing fees from our
         # side; incoming forwards/receives don't cost us anything.
