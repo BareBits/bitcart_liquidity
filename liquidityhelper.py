@@ -8847,25 +8847,38 @@ async def configure_autoloop(wallet: Dict[str, Any], api: "BitcartAPI") -> bool:
 def _resolve_internal_api_url() -> str:
     """Pick the right URL for calling Bitcart's own API back.
 
-    - In plugin mode the engine runs inside the backend container.
-      There is no nginx on 127.0.0.1 there (nginx is in a separate
-      compose service), so http://127.0.0.1/api is connection-refused.
-      Gunicorn itself listens on :8000 *without* the /api prefix
-      (root_path=/api strips it on incoming requests from nginx).
-    - In standalone mode the engine runs on a laptop hitting the VPS
-      through an SSH-forwarded port 80 → nginx → backend. The /api
-      prefix is required there because nginx routes /api/* to the
-      backend.
+    Plugin mode (engine runs inside one of bitcart's containers):
+      - Backend container: gunicorn listens on :8000 (root_path=/api
+        strips the prefix on incoming requests from nginx, so calls
+        from inside the backend container must NOT include /api).
+      - Worker container: no local gunicorn — must reach the backend
+        container across the compose network. The docker-compose
+        service name `backend` resolves to backend's IP via the
+        network's DNS, so http://backend:8000 works.
+      - One URL covers both: http://backend:8000 also works from
+        inside the backend container itself (DNS resolves locally;
+        socket-connect tests at deploy time confirmed all three
+        backend→backend, worker→backend, backend→localhost reach
+        the same gunicorn).
 
-    Heuristic for "we're inside the backend container": the bitcart
-    Docker image sets BITCART_BACKEND_ROOTPATH for its own internals.
-    Operators can override either side with LIQUIDITYHELPER_API_URL.
+    Standalone mode (engine runs on a laptop, e.g. PyCharm Run config
+    against the VPS via SSH-forwarded ports):
+      - nginx is on 127.0.0.1:80 (the forward), routes /api/* to the
+        backend. Use http://127.0.0.1/api.
+
+    Heuristic for "we're inside any bitcart container":
+      - BITCART_ENV is set on every container in the compose stack
+        (backend, worker, admin, store, btclnd, etc.). Pre-existing
+        BITCART_BACKEND_ROOTPATH check was backend-only — worker fell
+        through to the standalone branch and hit a connection-refused
+        on 127.0.0.1/api where nothing listened.
+      - Operators can override either side with LIQUIDITYHELPER_API_URL.
     """
     override = _os.environ.get("LIQUIDITYHELPER_API_URL")
     if override:
         return override
-    if _os.environ.get("BITCART_BACKEND_ROOTPATH"):
-        return "http://localhost:8000"
+    if _os.environ.get("BITCART_ENV") or _os.environ.get("BITCART_BACKEND_ROOTPATH"):
+        return "http://backend:8000"
     return "http://127.0.0.1/api"
 
 
