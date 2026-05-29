@@ -96,6 +96,31 @@ async def refresh_settings_from_bitcart() -> bool:
         )
         return False
     stored_dict = stored.model_dump() if stored is not None else {}
+
+    # PRESERVE AUTH_TOKEN. It's in the schema for completeness but
+    # operators never set it via the UI — it's managed by the
+    # plugin's startup hook, which generates / retrieves a per-plugin
+    # token and writes it into the engine's module globals before
+    # the engine starts serving. Bitcart's stored value for
+    # AUTH_TOKEN is therefore typically null. Without this guard,
+    # apply_settings below would blank `liquidityhelper.AUTH_TOKEN`
+    # on the first refresh; every subsequent BitcartAPI call
+    # (get_stores / get_wallets / get_payouts) then fails auth and
+    # returns None, and the dashboard endpoint 500s with
+    # `TypeError: 'NoneType' object is not iterable` deep inside
+    # new_calc_invoice_stats. Mirror what plugin.py:_load_settings
+    # does at startup — re-merge the live token in.
+    try:
+        import liquidityhelper as _engine
+        live_token = getattr(_engine, "AUTH_TOKEN", None)
+        if live_token:
+            stored_dict["AUTH_TOKEN"] = live_token
+    except Exception as e:
+        logger.warning(
+            f"refresh_settings_from_bitcart: could not read live "
+            f"AUTH_TOKEN; downstream apply may blank it: {e}"
+        )
+
     merged = merge_with_config(stored_dict)
     apply_settings(merged)
     return True
