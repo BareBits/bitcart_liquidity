@@ -149,27 +149,44 @@ def _resolve_engine_log_dir() -> str:
 
 _ENGINE_LOG_DIR = _resolve_engine_log_dir()
 
-# Operational file: DEBUG and above so post-mortems have full detail.
-# Filter out decisions records — they have their own file sink.
-file_handler = RotatingFileHandler(
-    os.path.join(_ENGINE_LOG_DIR, "liquidityhelper.log"),
-    maxBytes=10_000_000, backupCount=5,
-)
-file_handler.setLevel(logging.DEBUG)
-file_handler.setFormatter(main_formatter)
-file_handler.addFilter(_NotDecisionsFilter())
+# Plugin mode detection. When BITCART_ENV is set we're running inside
+# one of bitcart's containers (backend or worker), and the plugin's
+# `install_plugin_log_sinks()` will attach its own rotating file
+# handlers at the same `/datadir/plugin_data/liquidityhelper/` path
+# that `_resolve_engine_log_dir()` already returned. Attaching the
+# engine's file handlers below would mean two handlers writing
+# identical records to the same file — every log line appears twice
+# (or more, across multiple worker processes). Skip them in plugin
+# mode; install_plugin_log_sinks owns the file-handler layer there.
+_PLUGIN_MODE = bool(os.environ.get("BITCART_ENV"))
 
-# Decisions file: INFO and above; accepts only decisions records.
-_decisions_file_handler = RotatingFileHandler(
-    os.path.join(_ENGINE_LOG_DIR, "decisions.log"),
-    maxBytes=10_000_000, backupCount=10,
-)
-_decisions_file_handler.setLevel(logging.INFO)
-_decisions_file_handler.setFormatter(main_formatter)
-_decisions_file_handler.addFilter(_DecisionsOnlyFilter())
+# Operational file + decisions file handlers. Standalone-only: in
+# plugin mode the plugin's install_plugin_log_sinks() attaches the
+# equivalents. Keeping these as module-level names so add_async_log_handler
+# users can still reference them; they'll just be None in plugin mode.
+file_handler: Optional[RotatingFileHandler] = None
+_decisions_file_handler: Optional[RotatingFileHandler] = None
+if not _PLUGIN_MODE:
+    file_handler = RotatingFileHandler(
+        os.path.join(_ENGINE_LOG_DIR, "liquidityhelper.log"),
+        maxBytes=10_000_000, backupCount=5,
+    )
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(main_formatter)
+    file_handler.addFilter(_NotDecisionsFilter())
+
+    _decisions_file_handler = RotatingFileHandler(
+        os.path.join(_ENGINE_LOG_DIR, "decisions.log"),
+        maxBytes=10_000_000, backupCount=10,
+    )
+    _decisions_file_handler.setLevel(logging.INFO)
+    _decisions_file_handler.setFormatter(main_formatter)
+    _decisions_file_handler.addFilter(_DecisionsOnlyFilter())
 
 # Console (stdout): INFO and above only. Never DEBUG — debug detail is
-# captured in the log file.
+# captured in the log file. Kept in both standalone and plugin modes —
+# stdout in plugin mode goes to docker logs, which is the operator's
+# usual diagnostic when bitcart-side issues show up.
 console_handler = logging.StreamHandler(stream=sys.stdout)
 console_handler.setLevel(logging.INFO)
 console_handler.setFormatter(main_formatter)
@@ -178,11 +195,10 @@ console_handler.setFormatter(main_formatter)
 # attached handlers on a background thread. respect_handler_level=True
 # so each handler still applies its own level filter at dispatch time.
 log_queue: "queue.Queue[Any]" = queue.Queue(2000)
+_listener_handlers = [h for h in (file_handler, _decisions_file_handler, console_handler) if h is not None]
 listener = logging.handlers.QueueListener(
     log_queue,
-    file_handler,
-    _decisions_file_handler,
-    console_handler,
+    *_listener_handlers,
     respect_handler_level=True,
 )
 listener.start()
