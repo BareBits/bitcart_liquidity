@@ -8005,7 +8005,11 @@ _HEALTH_WARNING_IDS = (
     "prefer-ln-setup-mismatch",               # H4
     "all-cashout-paths-off",                  # H5
     "both-prefer-flags-set",                  # M6
-    "staleness-fallback-unreachable",         # M7
+    # M7 ("staleness-fallback-unreachable") intentionally absent:
+    # the CASHOUT_SWITCH_TO_ONCHAIN_AFTER_X_DAYS + !ENABLE_CASHOUT_ONCHAIN
+    # combo is a benign no-op (the fallback simply never fires) and
+    # the warning created noise for operators who deliberately left
+    # the timeout set as a safety net while running LN-only.
     "min-channel-size-below-daemon",          # H14
     "min-channel-count-below-one",            # H15
     "inbound-target-below-per-channel",       # M16
@@ -8120,19 +8124,14 @@ def _check_cashout_config() -> List[Dict[str, str]]:
             "one to remove this warning.",
             settings=["PREFER_LN_CASHOUT", "PREFER_CASHOUT_ONCHAIN"],
         ))
-    if (CASHOUT_SWITCH_TO_ONCHAIN_AFTER_X_DAYS is not None
-            and not ENABLE_CASHOUT_ONCHAIN):
-        out.append(_warn(
-            "staleness-fallback-unreachable", "MEDIUM", "cashout",
-            "Cashout staleness fallback cannot activate",
-            f"CASHOUT_SWITCH_TO_ONCHAIN_AFTER_X_DAYS is set to "
-            f"{CASHOUT_SWITCH_TO_ONCHAIN_AFTER_X_DAYS} but "
-            f"ENABLE_CASHOUT_ONCHAIN=False, so when LN cashouts go "
-            f"stale there's no on-chain rail to switch to. Either "
-            f"enable on-chain cashouts or set the staleness window to "
-            f"None.",
-            settings=["CASHOUT_SWITCH_TO_ONCHAIN_AFTER_X_DAYS", "ENABLE_CASHOUT_ONCHAIN"],
-        ))
+    # Note: the prior M7 warning fired when
+    # CASHOUT_SWITCH_TO_ONCHAIN_AFTER_X_DAYS was set together with
+    # ENABLE_CASHOUT_ONCHAIN=False. Operators running LN-only often
+    # leave the timeout set as a safety net so that *if* they later
+    # enable the on-chain rail the fallback is already configured —
+    # and meanwhile the combination is a no-op (the fallback simply
+    # never fires). The warning surfaced as noise rather than a
+    # footgun, so it's intentionally removed.
     return out
 
 
