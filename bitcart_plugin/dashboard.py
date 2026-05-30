@@ -293,6 +293,67 @@ class LspOrderRow(BaseModel):
     age_hours: int
 
 
+class CashoutDestination(BaseModel):
+    """One rail's cashout method and destination. `method` is
+    "lightning" or "onchain"; `destination` is the configured address
+    (Lightning Address for LN, bech32/legacy/taproot for on-chain).
+    The frontend truncates on-chain addresses for display; LN addresses
+    are short enough to show verbatim."""
+    method: str             # "lightning" | "onchain"
+    destination: str        # full address; "" if unset
+
+
+class CashoutSummary(BaseModel):
+    """Resolved preferred + fallback cashout configuration.
+
+    `primary` is the rail the engine will use first this tick;
+    `fallback` is the other enabled rail (or None if only one is
+    enabled). Selection rules (mirrors the engine's tick gates):
+      - PREFER_LN_CASHOUT=True   → primary=LN (wins over PREFER_ONCHAIN)
+      - PREFER_CASHOUT_ONCHAIN=True → primary=on-chain
+      - Otherwise: whichever ENABLE_* is true; LN wins ties (the
+        engine's default cashout-attempt order is LN-first).
+    `fallback` is populated only when the *other* rail is also enabled
+    AND has a destination configured. Otherwise it's None and the UI
+    omits the parenthetical.
+    """
+    primary: Optional[CashoutDestination]   # None if no rail enabled
+    fallback: Optional[CashoutDestination]  # None if only one enabled
+
+
+class TopupDeficitRow(BaseModel):
+    """One store-with-deficit entry shown in the top-up warning.
+
+    `own_address` / `barebits_address` are the unlimited TOPUP_NAME and
+    TOPUP_BAREBITS invoice addresses created by the worker's
+    calculate_topups path. The barebits address is included only when
+    DEBUG_MODE is enabled (the operator-pays path is the normal flow;
+    the BareBits-pays path is debug-only). Empty string when not
+    applicable so the frontend doesn't have to deal with undefined.
+    """
+    store_id: str
+    store_name: str
+    wallet_id: str
+    wallet_name: str
+    amount_sats: int        # deficit + 1000-sat engine buffer (matches calculate_topups)
+    own_address: str
+    barebits_address: str   # always "" unless debug_mode=True
+
+
+class TopupWarning(BaseModel):
+    """Dashboard top-up warning. Renders only when `rows` is non-empty.
+
+    The warning is suppressed entirely when the worker hasn't yet
+    created the corresponding unlimited top-up invoice for a deficit
+    store — the dashboard endpoint is read-only and won't create
+    invoices itself. In steady state the worker creates the invoice
+    on its first tick after a deficit appears, so the worst-case
+    staleness window is one tick interval (operator still gets the
+    log warning + email in the meantime).
+    """
+    rows: List[TopupDeficitRow]
+
+
 class HealthWarning(BaseModel):
     """One config-sanity or runtime-health warning shown on the
     dashboard. Each warning has a stable `id` that doubles as the
@@ -339,6 +400,17 @@ class DashboardResponse(BaseModel):
     # populated when lnd_ready is False. Lets the UI tell the operator
     # which wallets are still spinning up rather than a generic message.
     lnd_not_ready_wallets: List[str] = []
+    # Engine-side debug-mode flag (config.DEBUG_MODE). Frontend uses
+    # this to gate debug-only UI affordances — e.g. showing the
+    # BareBits-pays top-up address alongside the operator-pays one.
+    debug_mode: bool = False
+    # Resolved preferred+fallback cashout method/destination, shown in
+    # the dashboard header. None if config couldn't be read (rare —
+    # _preferred_cashout_summary defaults to LN-mode on import errors).
+    cashout_summary: Optional[CashoutSummary] = None
+    # Per-store top-up deficits with paste-target addresses. Empty
+    # rows list = no warning shown.
+    topup_warning: Optional[TopupWarning] = None
     stores: List[StoreDashboard]
     summary: Optional[SummaryDashboard]    # None when only one store
     shared_wallet_warning: bool            # True if ≥2 stores share a wallet
@@ -823,6 +895,167 @@ def _liquidity_mode_label() -> str:
         return "LSP-managed liquidity"
 
 
+def _preferred_cashout_summary() -> Optional[CashoutSummary]:
+    """Resolve which rail the engine prefers right now and what the
+    other enabled rail (if any) is.
+
+    Selection mirrors the engine's gates at the tick layer:
+      - PREFER_LN_CASHOUT wins over PREFER_CASHOUT_ONCHAIN when both
+        are True (see PREFER_CASHOUT_ONCHAIN docstring in config.py).
+      - With no PREFER_* flag set, the first available ENABLE_* rail
+        is primary; LN wins ties because that's the engine's
+        default cashout-attempt order. The "other enabled+addressed"
+        rail (if any) becomes the fallback.
+      - A rail with ENABLE_*=True but its destination unset is
+        treated as not configured (health warnings H1/H2 catch this
+        separately); we don't surface a useless primary/fallback that
+        would never actually fire.
+
+    Returns None only if config can't be imported at all (extremely
+    rare — every other dashboard helper would already be failing).
+    """
+    try:
+        import config as _cfg
+    except Exception as e:
+        logger.warning(f"_preferred_cashout_summary: config import failed: {e} {traceback.format_exc()}")
+        return None
+
+    ln_enabled = bool(getattr(_cfg, "ENABLE_CASHOUT_LN", False))
+    onchain_enabled = bool(getattr(_cfg, "ENABLE_CASHOUT_ONCHAIN", False))
+    prefer_ln = bool(getattr(_cfg, "PREFER_LN_CASHOUT", False))
+    prefer_onchain = bool(getattr(_cfg, "PREFER_CASHOUT_ONCHAIN", False))
+    ln_addr = getattr(_cfg, "CASHOUT_LIGHTNING_ADDRESS", None) or ""
+    onchain_addr = getattr(_cfg, "CASHOUT_ONCHAIN", None) or ""
+
+    ln_rail = CashoutDestination(method="lightning", destination=ln_addr) if ln_enabled and ln_addr else None
+    onchain_rail = CashoutDestination(method="onchain", destination=onchain_addr) if onchain_enabled and onchain_addr else None
+
+    # Pick primary based on PREFER_* with the documented tiebreaker;
+    # fallback is whichever of the remaining rails is also usable.
+    if prefer_ln and ln_rail:
+        return CashoutSummary(primary=ln_rail, fallback=onchain_rail)
+    if prefer_onchain and onchain_rail:
+        return CashoutSummary(primary=onchain_rail, fallback=ln_rail)
+    # No PREFER_* override (or the preferred rail isn't usable): LN
+    # wins ties; whichever is missing becomes the fallback slot.
+    if ln_rail and onchain_rail:
+        return CashoutSummary(primary=ln_rail, fallback=onchain_rail)
+    if ln_rail:
+        return CashoutSummary(primary=ln_rail, fallback=None)
+    if onchain_rail:
+        return CashoutSummary(primary=onchain_rail, fallback=None)
+    # No rail is both enabled AND addressed. Health warnings already
+    # flag this; return an empty summary so the header simply omits
+    # the "preferred cashout" line.
+    return CashoutSummary(primary=None, fallback=None)
+
+
+def _engine_debug_mode() -> bool:
+    """Whether the engine has DEBUG_MODE=True right now. Read via the
+    engine module (where the live, refresh_settings_from_bitcart-
+    updated globals live) — config.DEBUG_MODE is the import-time
+    default and wouldn't reflect settings changes."""
+    try:
+        import liquidityhelper as _engine
+        return bool(getattr(_engine, "DEBUG_MODE", False))
+    except Exception as e:
+        logger.warning(f"_engine_debug_mode: import failed: {e} {traceback.format_exc()}")
+        return False
+
+
+async def _compute_topup_warning(api: Any) -> TopupWarning:
+    """Build the per-store top-up deficit list shown above
+    liquidity_stats on the dashboard.
+
+    For each store the engine considers, check whether its best LN
+    wallet's on-chain balance is below the reserve floor returned by
+    topup_goal_amount(). When it is AND the worker has already
+    created the corresponding unlimited TOPUP_NAME invoice, surface a
+    row with the paste-target address(es) and the deficit amount
+    (plus the same 1000-sat buffer calculate_topups adds, so the
+    operator pays exactly what the worker would otherwise solicit).
+
+    Suppression rules:
+      - Deficit <= MANUAL_RESERVE_SAFETY_SAT: hysteresis zone — same
+        threshold the worker uses to suppress the email warning;
+        keeps the dashboard from flapping when the wallet drifts
+        within fee-rounding distance of the floor.
+      - No TOPUP_NAME invoice yet: the worker hasn't ticked since
+        the deficit appeared. Skip the row entirely so the operator
+        is never shown an "address: ???" entry. Comes back on the
+        next tick.
+
+    The TOPUP_BAREBITS address is included only when DEBUG_MODE is
+    on (debug-only UI per operator preference).
+    """
+    rows: List[TopupDeficitRow] = []
+    try:
+        from liquidityhelper import (
+            store_needs_topup, MANUAL_RESERVE_SAFETY_SAT,
+            TOPUP_NAME, TOPUP_BAREBITS,
+            btc_address_from_invoice,
+        )
+    except Exception as e:
+        logger.warning(f"_compute_topup_warning: engine imports failed: {e} {traceback.format_exc()}")
+        return TopupWarning(rows=[])
+
+    debug_on = _engine_debug_mode()
+    try:
+        stores = await api.get_stores() or []
+    except Exception as e:
+        logger.warning(f"_compute_topup_warning: get_stores failed: {e} {traceback.format_exc()}")
+        return TopupWarning(rows=[])
+
+    for store in stores:
+        try:
+            deficit = await store_needs_topup(api, store["id"])
+            if not deficit:
+                continue
+            if deficit <= MANUAL_RESERVE_SAFETY_SAT:
+                # Same hysteresis the engine applies to its own warning
+                # path — keeps small fee-rounding deficits silent.
+                continue
+            own_invoice = await api.get_invoice_by_note(
+                note=TOPUP_NAME, require_unlimited=True,
+            )
+            if not own_invoice:
+                # Worker hasn't created the invoice yet; suppress this
+                # store until it does. The engine's logger.warning /
+                # email path still fires regardless.
+                continue
+            own_addr = btc_address_from_invoice(own_invoice) or ""
+            if not own_addr:
+                continue
+            bb_addr = ""
+            if debug_on:
+                bb_invoice = await api.get_invoice_by_note(
+                    note=TOPUP_BAREBITS, require_unlimited=True,
+                )
+                if bb_invoice:
+                    bb_addr = btc_address_from_invoice(bb_invoice) or ""
+            try:
+                wallet = await api.get_best_ln_wallet_for_store(store)
+            except Exception as e:
+                logger.warning(f"_compute_topup_warning: wallet lookup failed for store {store.get('id')}: {e} {traceback.format_exc()}")
+                wallet = {}
+            rows.append(TopupDeficitRow(
+                store_id=store.get("id") or "",
+                store_name=store.get("name") or "",
+                wallet_id=(wallet or {}).get("id") or "",
+                wallet_name=(wallet or {}).get("name") or "",
+                # Matches the +1000 sat buffer in calculate_topups so
+                # the address the operator pastes accepts the exact
+                # amount the worker would otherwise ask for.
+                amount_sats=int(deficit) + 1000,
+                own_address=own_addr,
+                barebits_address=bb_addr,
+            ))
+        except Exception as e:
+            logger.warning(f"_compute_topup_warning: store {store.get('id')} failed: {e} {traceback.format_exc()}")
+            continue
+    return TopupWarning(rows=rows)
+
+
 async def build_liquidity_stats(
     api: Any, btc_usd_rate: Optional[float],
 ) -> LiquidityStats:
@@ -1304,6 +1537,15 @@ async def compute_dashboard(api: Any, range_key: str) -> DashboardResponse:
             bitcoin_network="",
             lnd_ready=False,
             lnd_not_ready_wallets=lnd_not_ready_wallets,
+            # The cashout summary is config-only and the engine module
+            # is already loaded by now (we got here from the bitcart
+            # plugin loader), so it's safe to populate even when LND
+            # is still warming up. Lets the dashboard header render
+            # the operator's configured mode/cashout immediately
+            # instead of jumping in once LND comes up.
+            debug_mode=_engine_debug_mode(),
+            cashout_summary=_preferred_cashout_summary(),
+            topup_warning=TopupWarning(rows=[]),
             stores=[],
             summary=None,
             shared_wallet_warning=False,
@@ -1545,6 +1787,14 @@ async def compute_dashboard(api: Any, range_key: str) -> DashboardResponse:
         health_warnings_raw = []
     health_warnings = [HealthWarning(**w) for w in health_warnings_raw]
 
+    cashout_summary = _preferred_cashout_summary()
+    debug_mode = _engine_debug_mode()
+    try:
+        topup_warning = await _compute_topup_warning(api)
+    except Exception as e:
+        logger.warning(f"_compute_topup_warning raised: {e} {traceback.format_exc()}")
+        topup_warning = TopupWarning(rows=[])
+
     return DashboardResponse(
         range=range_key,
         btc_usd_rate=btc_usd_rate,
@@ -1552,6 +1802,9 @@ async def compute_dashboard(api: Any, range_key: str) -> DashboardResponse:
         bitcoin_network=bitcoin_network,
         lnd_ready=True,
         lnd_not_ready_wallets=[],
+        debug_mode=debug_mode,
+        cashout_summary=cashout_summary,
+        topup_warning=topup_warning,
         stores=stores_out,
         summary=summary,
         shared_wallet_warning=shared_wallet_warning,

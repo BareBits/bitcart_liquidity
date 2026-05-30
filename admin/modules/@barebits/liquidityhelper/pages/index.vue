@@ -63,6 +63,99 @@
       <v-tab-item>
         <v-card flat>
           <v-card-text>
+            <!-- Mode + preferred-cashout header. Two-line summary
+                 showing the operator at a glance what management mode
+                 the plugin is in (LSP vs manual channel mgmt) and
+                 which cashout rail the engine will try first (with
+                 the other enabled rail as fallback in parens). The
+                 on-chain destination address is shown truncated
+                 (first4…last4) with the full value on hover and a
+                 click-through to mempool.space when the network is
+                 known. Backed by dashboard.cashout_summary; when
+                 neither rail is configured the whole line is omitted. -->
+            <div v-if="dashboard" class="dashboard-header mb-4">
+              <div class="text-h6 dashboard-mode-title">
+                {{ dashboard.liquidity_stats && dashboard.liquidity_stats.mode || "Liquidity helper" }}
+              </div>
+              <div
+                v-if="dashboard.cashout_summary && dashboard.cashout_summary.primary"
+                class="text-body-2 mt-1"
+              >
+                Preferred cashout:
+                <v-icon small class="mr-1">{{ dashboard.cashout_summary.primary.method === 'lightning' ? 'mdi-flash' : 'mdi-link' }}</v-icon>
+                {{ dashboard.cashout_summary.primary.method === 'lightning' ? 'Lightning' : 'On-chain' }}
+                to
+                <component
+                  :is="cashoutDestComponent(dashboard.cashout_summary.primary)"
+                  v-bind="cashoutDestProps(dashboard.cashout_summary.primary)"
+                >{{ cashoutDestDisplay(dashboard.cashout_summary.primary) }}</component>
+                <span v-if="dashboard.cashout_summary.fallback">
+                  (fallback:
+                  <v-icon small class="mr-1">{{ dashboard.cashout_summary.fallback.method === 'lightning' ? 'mdi-flash' : 'mdi-link' }}</v-icon>
+                  {{ dashboard.cashout_summary.fallback.method === 'lightning' ? 'Lightning' : 'on-chain' }}
+                  to
+                  <component
+                    :is="cashoutDestComponent(dashboard.cashout_summary.fallback)"
+                    v-bind="cashoutDestProps(dashboard.cashout_summary.fallback)"
+                  >{{ cashoutDestDisplay(dashboard.cashout_summary.fallback) }}</component>)
+                </span>
+              </div>
+            </div>
+
+            <!-- Top-up warning. Renders ONLY when the backend
+                 returns a non-empty topup_warning.rows list. Each
+                 row names the store + wallet that's below its
+                 reserve floor along with the unlimited TOPUP_NAME
+                 invoice address the operator can pay to refill the
+                 wallet on demand. The BareBits-pays address is
+                 surfaced only when debug_mode is on. -->
+            <v-alert
+              v-if="dashboard && dashboard.topup_warning && dashboard.topup_warning.rows.length"
+              color="amber lighten-4"
+              icon="mdi-cash-refund"
+              class="mb-4 topup-warning"
+            >
+              <strong>
+                Wallets {{ topupWalletNames }} for stores
+                {{ topupStoreNames }} need a top-up so they can
+                continue managing your liquidity.
+              </strong>
+              <div class="text-body-2 mt-2">
+                You can top-up manually or wait for your next on-chain
+                payment to come in.
+              </div>
+              <ul class="topup-address-list mt-2 mb-2">
+                <li
+                  v-for="row in dashboard.topup_warning.rows"
+                  :key="row.store_id"
+                  class="text-body-2"
+                >
+                  <strong>{{ row.store_name || row.store_id }}</strong>
+                  ({{ row.wallet_name || row.wallet_id || "wallet" }}):
+                  send
+                  <strong><MoneyDisplay :sats="row.amount_sats" :usd="null" :unit="displayUnit" /></strong>
+                  to
+                  <component
+                    :is="topupAddrComponent(row.own_address)"
+                    v-bind="topupAddrProps(row.own_address)"
+                  >{{ shortAddr(row.own_address) }}</component>
+                  <span v-if="row.barebits_address">
+                    &nbsp;· debug BareBits address:
+                    <component
+                      :is="topupAddrComponent(row.barebits_address)"
+                      v-bind="topupAddrProps(row.barebits_address)"
+                    >{{ shortAddr(row.barebits_address) }}</component>
+                  </span>
+                </li>
+              </ul>
+              <div class="text-body-2">
+                Check below for liquidity stats — your wallets can
+                continue to receive Lightning payments so long as
+                each wallet has some inbound liquidity (at least one
+                channel open).
+              </div>
+            </v-alert>
+
             <!-- Yellow shared-wallet warning. Renders ONLY when the
                  backend flips shared_wallet_warning=true. The
                  spec calls for a yellow background + ⚠️ emoji. -->
@@ -380,13 +473,18 @@
                       <a
                         v-if="isBitcoinAddress(item.destination) && mempoolAddrUrl(item.destination)"
                         :href="mempoolAddrUrl(item.destination)"
+                        :title="item.destination"
                         target="_blank" rel="noopener noreferrer"
                         class="text-caption"
                       >{{ shortAddr(item.destination) }}</a>
-                      <span v-else-if="isBitcoinAddress(item.destination)" class="text-caption">
+                      <span
+                        v-else-if="isBitcoinAddress(item.destination)"
+                        :title="item.destination"
+                        class="text-caption"
+                      >
                         {{ shortAddr(item.destination) }}
                       </span>
-                      <span v-else class="text-caption">{{ item.destination }}</span>
+                      <span v-else class="text-caption" :title="item.destination">{{ item.destination }}</span>
                     </template>
                     <template #item.txid="{ item }">
                       <a
@@ -468,13 +566,18 @@
                       <a
                         v-if="isBitcoinAddress(item.destination) && mempoolAddrUrl(item.destination)"
                         :href="mempoolAddrUrl(item.destination)"
+                        :title="item.destination"
                         target="_blank" rel="noopener noreferrer"
                         class="text-caption"
                       >{{ shortAddr(item.destination) }}</a>
-                      <span v-else-if="isBitcoinAddress(item.destination)" class="text-caption">
+                      <span
+                        v-else-if="isBitcoinAddress(item.destination)"
+                        :title="item.destination"
+                        class="text-caption"
+                      >
                         {{ shortAddr(item.destination) }}
                       </span>
-                      <span v-else class="text-caption">{{ item.destination }}</span>
+                      <span v-else class="text-caption" :title="item.destination">{{ item.destination }}</span>
                     </template>
                     <template #item.txid="{ item }">
                       <a
@@ -740,13 +843,18 @@
                       <a
                         v-if="isBitcoinAddress(item.destination) && mempoolAddrUrl(item.destination)"
                         :href="mempoolAddrUrl(item.destination)"
+                        :title="item.destination"
                         target="_blank" rel="noopener noreferrer"
                         class="text-caption"
                       >{{ shortAddr(item.destination) }}</a>
-                      <span v-else-if="isBitcoinAddress(item.destination)" class="text-caption">
+                      <span
+                        v-else-if="isBitcoinAddress(item.destination)"
+                        :title="item.destination"
+                        class="text-caption"
+                      >
                         {{ shortAddr(item.destination) }}
                       </span>
-                      <span v-else class="text-caption">{{ item.destination }}</span>
+                      <span v-else class="text-caption" :title="item.destination">{{ item.destination }}</span>
                     </template>
                     <template #item.txid="{ item }">
                       <a
@@ -1442,6 +1550,17 @@ export default {
     networkFeesTotal() {
       return this._sumRowsField(this.dashboard?.recent_network_fees || [], "fee")
     },
+    // Comma-joined store / wallet names for the top-up warning's
+    // headline sentence. Empty when there are no rows (the v-alert is
+    // already hidden in that case via v-if).
+    topupWalletNames() {
+      const rows = (this.dashboard && this.dashboard.topup_warning && this.dashboard.topup_warning.rows) || []
+      return rows.map(r => r.wallet_name || r.wallet_id || "wallet").join(", ")
+    },
+    topupStoreNames() {
+      const rows = (this.dashboard && this.dashboard.topup_warning && this.dashboard.topup_warning.rows) || []
+      return rows.map(r => r.store_name || r.store_id || "store").join(", ")
+    },
     streamItems() {
       // Vuetify select items: [{ text, value }]. The text shows the
       // friendly name plus a hint about empty state so the operator
@@ -1771,6 +1890,45 @@ export default {
       if (!addr) return ""
       if (addr.length <= 12) return addr
       return `${addr.slice(0, 4)}…${addr.slice(-4)}`
+    },
+    // Render-decision helpers for the dashboard header's cashout
+    // destination block. The header treats LN addresses (which
+    // contain "@") as opaque strings (no truncation, no mempool
+    // link) and on-chain addresses as Bitcoin-style values with
+    // hover-tooltip + mempool click-through when the network is
+    // recognized. Returned as <component :is="..." v-bind="..."/>
+    // triples to keep the template free of duplicated v-if branches.
+    cashoutDestComponent(dest) {
+      if (!dest || !dest.destination) return "span"
+      if (dest.method !== "onchain") return "span"
+      return this.mempoolAddrUrl(dest.destination) ? "a" : "span"
+    },
+    cashoutDestProps(dest) {
+      if (!dest || !dest.destination) return { class: "text-body-2" }
+      if (dest.method !== "onchain") {
+        return { class: "text-body-2 font-weight-medium" }
+      }
+      const url = this.mempoolAddrUrl(dest.destination)
+      const base = { class: "text-body-2 font-weight-medium", title: dest.destination }
+      return url ? { ...base, href: url, target: "_blank", rel: "noopener noreferrer" } : base
+    },
+    cashoutDestDisplay(dest) {
+      if (!dest || !dest.destination) return "(not configured)"
+      if (dest.method === "onchain") return this.shortAddr(dest.destination)
+      return dest.destination
+    },
+    // Same idea as cashoutDestComponent/Props but for the top-up
+    // warning's addresses — always on-chain, so the LN-vs-on-chain
+    // branch is dropped.
+    topupAddrComponent(addr) {
+      if (!addr) return "span"
+      return this.mempoolAddrUrl(addr) ? "a" : "span"
+    },
+    topupAddrProps(addr) {
+      if (!addr) return { class: "text-body-2" }
+      const url = this.mempoolAddrUrl(addr)
+      const base = { class: "text-body-2 font-weight-medium topup-address", title: addr }
+      return url ? { ...base, href: url, target: "_blank", rel: "noopener noreferrer" } : base
     },
     // mempool.space subdomain selector for the current network.
     // mainnet uses the root domain; every other network uses a path
