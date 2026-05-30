@@ -639,6 +639,26 @@
                     <template #item.iso_date="{ item }">
                       <span class="text-caption">{{ item.iso_date }}</span>
                     </template>
+                    <template #item.peer="{ item }">
+                      <!-- Peer column: human-readable alias (if LND's
+                           gossip still knows the node) followed by the
+                           truncated pubkey in parens. Hover reveals the
+                           full pubkey; click links to the mempool.space
+                           Lightning node page for the current network.
+                           Closed-channel peers can vanish from gossip,
+                           in which case alias is null and we render
+                           "no name". -->
+                      <span v-if="!item.peer_pubkey" class="text-caption grey--text">—</span>
+                      <template v-else>
+                        <span class="text-caption">
+                          {{ item.peer_alias || "no name" }}
+                          (<component
+                            :is="lnNodeComponent(item.peer_pubkey)"
+                            v-bind="lnNodeProps(item.peer_pubkey)"
+                          >{{ shortAddr(item.peer_pubkey) }}</component>)
+                        </span>
+                      </template>
+                    </template>
                     <template #item.channel_point="{ item }">
                       <span class="text-caption">{{ shortTxid(item.channel_point) }}</span>
                     </template>
@@ -1427,6 +1447,7 @@ export default {
       ],
       closureHeaders: [
         { text: "Date", value: "iso_date", width: 160 },
+        { text: "Peer", value: "peer", sortable: false },
         { text: "Channel point", value: "channel_point" },
         { text: "Outcome", value: "force_close_initiated", width: 130 },
         { text: "Attempts", value: "cooperative_close_attempts", width: 90 },
@@ -1959,6 +1980,29 @@ export default {
       const base = this.mempoolBase()
       if (!base || !addr) return null
       return `${base}/address/${addr}`
+    },
+    // mempool.space's Lightning explorer URL for a node pubkey. Same
+    // network-prefix rules as mempoolBase() apply, so regtest (and any
+    // unknown network) returns null and the UI falls back to a plain
+    // truncated pubkey with no link.
+    mempoolNodeUrl(pubkey) {
+      const base = this.mempoolBase()
+      if (!base || !pubkey) return null
+      return `${base}/lightning/node/${pubkey}`
+    },
+    // Render-decision helpers for LN node pubkey columns (currently
+    // the Recent channel closures peer column). Same component/props
+    // pattern as cashoutDest* — keeps the template free of duplicated
+    // v-if branches.
+    lnNodeComponent(pubkey) {
+      if (!pubkey) return "span"
+      return this.mempoolNodeUrl(pubkey) ? "a" : "span"
+    },
+    lnNodeProps(pubkey) {
+      if (!pubkey) return { class: "text-caption" }
+      const url = this.mempoolNodeUrl(pubkey)
+      const base = { class: "text-caption", title: pubkey }
+      return url ? { ...base, href: url, target: "_blank", rel: "noopener noreferrer" } : base
     },
     // Heuristic: is `s` a Bitcoin address (vs an LN address / pubkey /
     // empty)? LN addresses contain '@' (user@domain), LN pubkeys are

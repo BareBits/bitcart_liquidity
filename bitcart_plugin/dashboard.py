@@ -253,6 +253,15 @@ class ChannelClosureRow(BaseModel):
     close_reason: str
     cooperative_close_attempts: int
     force_close_initiated: bool      # True if force_close_initiated_at is set
+    # Peer pubkey + alias, looked up from LND's ClosedChannels +
+    # GetNodeInfo at dashboard-build time. Best-effort: aliases are
+    # populated when the peer is still in the gossip graph; closed-
+    # channel peers can disappear from gossip, in which case alias is
+    # None and the frontend renders "no name". peer_pubkey is None
+    # only when the wallet backend can't return ClosedChannels (e.g.
+    # Electrum wallets; the channel_point lookup yields nothing).
+    peer_pubkey: Optional[str] = None
+    peer_alias: Optional[str] = None
 
 
 class LspOrderRow(BaseModel):
@@ -1272,7 +1281,116 @@ async def list_recent_network_fees(
     return rows[:_RECENT_ROW_CAP]
 
 
-def list_recent_channel_closures() -> List[ChannelClosureRow]:
+async def _resolve_closed_channel_peers(
+    api: Any,
+) -> Dict[str, Tuple[Optional[str], Optional[str]]]:
+    """Build {channel_point → (peer_pubkey, peer_alias)} for every
+    closed channel the connected btclnd wallets know about.
+
+    Strategy:
+      - Walk every wallet; for each btclnd one, call ClosedChannels
+        and harvest `channel_point → remote_pubkey`. Dedupe pubkeys
+        across wallets.
+      - For each unique pubkey, call GetNodeInfo and capture
+        `node.alias`. Closed-channel peers commonly disappear from
+        the gossip graph (both sides drop the announcement), so
+        GetNodeInfo legitimately returns NotFound; we record alias
+        as None in that case and the UI renders "no name".
+
+    Best-effort throughout: any RPC failure is logged at WARNING
+    and the affected entries are simply missing from the returned
+    map. The closures table then renders peer_pubkey=None /
+    peer_alias=None for those rows, which the UI shows as "—".
+    """
+    point_to_pubkey: Dict[str, str] = {}
+    try:
+        wallets = await api.get_wallets() or []
+    except Exception as e:
+        logger.warning(f"_resolve_closed_channel_peers: get_wallets failed: {e} {traceback.format_exc()}")
+        return {}
+
+    # Lazy import — same pattern other dashboard helpers use to avoid
+    # a hard module-load dependency on the engine.
+    try:
+        from liquidityhelper import lnd_rpc
+    except Exception as e:
+        logger.warning(f"_resolve_closed_channel_peers: lnd_rpc import failed: {e} {traceback.format_exc()}")
+        return {}
+
+    for w in wallets:
+        if (w.get("currency") or "").lower() != "btclnd":
+            # Electrum wallets don't expose a ClosedChannels-equivalent
+            # surface — UI will fall back to "—" for their closures.
+            continue
+        wid = w.get("id") or ""
+        if not wid:
+            continue
+        try:
+            resp = await lnd_rpc(api, wid, "ClosedChannels", {}, "Lightning") or {}
+        except Exception as e:
+            logger.warning(f"_resolve_closed_channel_peers: ClosedChannels failed for wallet {wid}: {e} {traceback.format_exc()}")
+            continue
+        for c in (resp.get("channels") or []):
+            cp = (c.get("channel_point") or "").lower()
+            pk = (c.get("remote_pubkey") or "").lower()
+            if cp and pk:
+                # Don't overwrite a prior entry — same channel_point
+                # showing up on two wallets would be very unusual but
+                # if it does we keep the first reading.
+                point_to_pubkey.setdefault(cp, pk)
+
+    if not point_to_pubkey:
+        return {}
+
+    # Dedupe pubkeys → one GetNodeInfo each; run in parallel.
+    import asyncio
+    unique_pubkeys = sorted(set(point_to_pubkey.values()))
+    btclnd_wid: Optional[str] = None
+    for w in wallets:
+        if (w.get("currency") or "").lower() == "btclnd":
+            btclnd_wid = w.get("id")
+            if btclnd_wid:
+                break
+    if btclnd_wid is None:
+        # We had ClosedChannels rows but no usable btclnd wallet to
+        # query GetNodeInfo against; return what we have without aliases.
+        return {cp: (pk, None) for cp, pk in point_to_pubkey.items()}
+
+    async def _alias_for(pk: str) -> Tuple[str, Optional[str]]:
+        try:
+            info = await lnd_rpc(
+                api, btclnd_wid, "GetNodeInfo",
+                {"pub_key": pk}, "Lightning",
+            ) or {}
+        except Exception as e:
+            logger.debug(f"_resolve_closed_channel_peers: GetNodeInfo({pk[-8:]}) failed: {e}")
+            return pk, None
+        # LND's GetNodeInfo returns {"node": {"alias": "...", ...}}
+        # for known nodes. For unknown (closed-channel-only) peers it
+        # returns an error, which lnd_rpc surfaces as either an
+        # exception (caught above) or an empty/error dict.
+        node = info.get("node") if isinstance(info, dict) else None
+        alias = None
+        if isinstance(node, dict):
+            raw_alias = node.get("alias")
+            if isinstance(raw_alias, str) and raw_alias.strip():
+                # Strip control chars and cap length consistently with
+                # what lnd_graph_pull.parse_alias does for stored
+                # aliases (LN spec caps the alias at 32 bytes).
+                alias = "".join(ch for ch in raw_alias if ord(ch) >= 0x20)[:32].strip() or None
+        return pk, alias
+
+    alias_pairs = await asyncio.gather(
+        *(_alias_for(pk) for pk in unique_pubkeys),
+        return_exceptions=False,
+    )
+    pubkey_to_alias: Dict[str, Optional[str]] = dict(alias_pairs)
+    return {cp: (pk, pubkey_to_alias.get(pk)) for cp, pk in point_to_pubkey.items()}
+
+
+def list_recent_channel_closures(
+    peer_map: Optional[Dict[str, Tuple[Optional[str], Optional[str]]]] = None,
+) -> List[ChannelClosureRow]:
     """Recent channel closures the script initiated.
 
     Reads from LightningChannel rows with a non-null `close_reason`
@@ -1280,12 +1398,19 @@ def list_recent_channel_closures() -> List[ChannelClosureRow]:
     `closed_at` if set, otherwise `last_close_attempt_at`. Returns
     up to 100 rows. Pure DB query — no network calls.
 
+    `peer_map`: optional {channel_point_lowercase → (pubkey, alias)}
+    mapping built by `_resolve_closed_channel_peers`. Passed in by
+    the orchestrator so this function stays sync-friendly and so a
+    single ClosedChannels/GetNodeInfo pass per dashboard request
+    serves every closure row.
+
     Channels closed PEER-initiated where the script never decided to
     close them won't appear here because we don't have a row for them.
     A future iteration could backfill from LND's ClosedChannels.
     """
     # Lazy import so the module is importable without the engine.
     from node_database import LightningChannel
+    pm = peer_map or {}
     rows: List[ChannelClosureRow] = []
     try:
         # peewee's Optional[datetime] columns: filter via != None (peewee
@@ -1299,6 +1424,8 @@ def list_recent_channel_closures() -> List[ChannelClosureRow]:
             # Pick the most recent timestamp we have for this row.
             when = r.closed_at or r.last_close_attempt_at
             ts = int(when.timestamp()) if when is not None else 0
+            cp_key = (r.channel_point or "").lower()
+            peer_pubkey, peer_alias = pm.get(cp_key, (None, None))
             rows.append(ChannelClosureRow(
                 timestamp=ts,
                 iso_date=_iso(ts),
@@ -1306,6 +1433,8 @@ def list_recent_channel_closures() -> List[ChannelClosureRow]:
                 close_reason=r.close_reason or "(no reason recorded)",
                 cooperative_close_attempts=int(r.cooperative_close_attempts or 0),
                 force_close_initiated=(r.force_close_initiated_at is not None),
+                peer_pubkey=peer_pubkey,
+                peer_alias=peer_alias,
             ))
     except Exception as e:
         logger.warning(f"list_recent_channel_closures query failed: {e} {traceback.format_exc()}")
@@ -1762,7 +1891,12 @@ async def compute_dashboard(api: Any, range_key: str) -> DashboardResponse:
     # equivalently inside _gather_payment_rows.
     recent_fee_payments = await list_recent_fee_payments(api, btc_usd_rate)
     recent_cashouts = await list_recent_cashouts(api, btc_usd_rate)
-    recent_channel_closures = list_recent_channel_closures()
+    try:
+        closure_peer_map = await _resolve_closed_channel_peers(api)
+    except Exception as e:
+        logger.warning(f"_resolve_closed_channel_peers raised: {e} {traceback.format_exc()}")
+        closure_peer_map = {}
+    recent_channel_closures = list_recent_channel_closures(closure_peer_map)
     recent_lsp_orders = list_recent_lsp_orders(btc_usd_rate)
     recent_network_fees = await list_recent_network_fees(api, btc_usd_rate)
     liquidity_stats = await build_liquidity_stats(api, btc_usd_rate)
