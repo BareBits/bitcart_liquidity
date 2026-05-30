@@ -370,57 +370,170 @@
                     Per-wallet inbound and outbound liquidity (active
                     channels only). Only wallets named
                     <code>liquidityhelper</code> are counted — these are
-                    the wallets the engine manages.
+                    the wallets the engine manages. The split bar shows
+                    outbound (left, primary) vs inbound (right, success)
+                    proportions; hover any segment for exact sats.
                   </p>
-                  <v-simple-table dense class="elevation-0">
-                    <template #default>
-                      <thead>
-                        <tr>
-                          <th>Wallet</th>
-                          <th class="text-right">Inbound</th>
-                          <th class="text-right">Outbound</th>
-                          <th class="text-right" style="width: 110px;">Channels</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        <tr
-                          v-for="w in dashboard.liquidity_stats.wallets"
-                          :key="w.wallet_id"
-                        >
-                          <td>
-                            {{ w.wallet_name }}
-                            <span class="text-caption grey--text">({{ w.wallet_short }})</span>
-                          </td>
-                          <td class="text-right">
-                            <MoneyDisplay :money="w.inbound" :unit="displayUnit" />
-                          </td>
-                          <td class="text-right">
-                            <MoneyDisplay :money="w.outbound" :unit="displayUnit" />
-                          </td>
-                          <td class="text-right">{{ w.active_channel_count }}</td>
-                        </tr>
-                        <tr v-if="!dashboard.liquidity_stats.wallets.length">
-                          <td colspan="4" class="text-center grey--text">
-                            No <code>liquidityhelper</code> wallets configured.
-                          </td>
-                        </tr>
-                      </tbody>
-                      <tfoot v-if="dashboard.liquidity_stats.wallets.length">
-                        <tr class="totals-row">
-                          <th>Total</th>
-                          <th class="text-right">
-                            <MoneyDisplay :money="dashboard.liquidity_stats.total_inbound" :unit="displayUnit" />
-                          </th>
-                          <th class="text-right">
-                            <MoneyDisplay :money="dashboard.liquidity_stats.total_outbound" :unit="displayUnit" />
-                          </th>
-                          <th class="text-right">
-                            {{ dashboard.liquidity_stats.total_channel_count }}
-                          </th>
-                        </tr>
-                      </tfoot>
-                    </template>
-                  </v-simple-table>
+
+                  <!-- Empty-state -->
+                  <p
+                    v-if="!dashboard.liquidity_stats.wallets.length"
+                    class="text-caption grey--text mb-0"
+                  >
+                    No <code>liquidityhelper</code> wallets configured.
+                  </p>
+
+                  <!-- One sub-card per wallet. Within each: stores
+                       label, aggregate split bar, then the indented
+                       list of channels with their own per-channel bars
+                       and peer labels. -->
+                  <div
+                    v-for="w in dashboard.liquidity_stats.wallets"
+                    :key="w.wallet_id"
+                    class="wallet-block mb-3"
+                  >
+                    <div class="d-flex align-center flex-wrap mb-1">
+                      <strong>{{ w.wallet_name }}</strong>
+                      <span class="text-caption grey--text ml-1">({{ w.wallet_short }})</span>
+                      <span class="text-caption ml-3">
+                        <span class="grey--text">Stores:</span>
+                        <span v-if="w.store_names && w.store_names.length">
+                          {{ w.store_names.join(", ") }}
+                        </span>
+                        <span v-else class="grey--text">— (no store currently uses this wallet)</span>
+                      </span>
+                      <v-spacer />
+                      <span class="text-caption">
+                        {{ w.active_channel_count }} active
+                        channel{{ w.active_channel_count === 1 ? "" : "s" }}
+                      </span>
+                    </div>
+
+                    <!-- Wallet aggregate split bar.
+                         Two background segments side-by-side: the left
+                         segment represents outbound (operator can send),
+                         the right represents inbound (operator can
+                         receive). Widths are proportional to the
+                         outbound:inbound sat ratio. Native title
+                         attributes give precise hover readouts.
+                         A zero-balance wallet renders an empty grey bar. -->
+                    <div
+                      class="balance-bar"
+                      :title="balanceBarTitle(w.outbound.sats, w.inbound.sats)"
+                    >
+                      <div
+                        class="balance-bar-outbound"
+                        :style="{ width: balanceBarPct(w.outbound.sats, w.inbound.sats) + '%' }"
+                      ></div>
+                      <div
+                        class="balance-bar-inbound"
+                        :style="{ width: (100 - balanceBarPct(w.outbound.sats, w.inbound.sats)) + '%' }"
+                      ></div>
+                    </div>
+                    <div class="d-flex text-caption mt-1">
+                      <span>
+                        <v-icon x-small color="primary">mdi-arrow-up</v-icon>
+                        Outbound:
+                        <MoneyDisplay :money="w.outbound" :unit="displayUnit" />
+                      </span>
+                      <v-spacer />
+                      <span>
+                        <v-icon x-small color="success">mdi-arrow-down</v-icon>
+                        Inbound:
+                        <MoneyDisplay :money="w.inbound" :unit="displayUnit" />
+                      </span>
+                    </div>
+
+                    <!-- Indented per-channel list. One v-simple-table
+                         row per channel: peer (alias + truncated pubkey
+                         + mempool LN-node link), then the split bar
+                         column, then the channel point. Reuses the same
+                         alias/pubkey UX as the closures table. -->
+                    <div v-if="w.channels && w.channels.length" class="channel-list">
+                      <v-simple-table dense class="elevation-0 channel-table">
+                        <template #default>
+                          <thead>
+                            <tr>
+                              <th>Peer</th>
+                              <th>Balance</th>
+                              <th class="text-right">Capacity</th>
+                              <th>Channel point</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            <tr v-for="ch in w.channels" :key="ch.channel_point">
+                              <td>
+                                <span v-if="!ch.peer_pubkey" class="grey--text">—</span>
+                                <template v-else>
+                                  {{ ch.peer_alias || "no name" }}
+                                  (<component
+                                    :is="lnNodeComponent(ch.peer_pubkey)"
+                                    v-bind="lnNodeProps(ch.peer_pubkey)"
+                                  >{{ shortAddr(ch.peer_pubkey) }}</component>)
+                                </template>
+                              </td>
+                              <td style="min-width: 220px;">
+                                <div
+                                  class="balance-bar balance-bar-sm"
+                                  :title="balanceBarTitle(ch.local_balance, ch.remote_balance)"
+                                >
+                                  <div
+                                    class="balance-bar-outbound"
+                                    :style="{ width: balanceBarPct(ch.local_balance, ch.remote_balance) + '%' }"
+                                  ></div>
+                                  <div
+                                    class="balance-bar-inbound"
+                                    :style="{ width: (100 - balanceBarPct(ch.local_balance, ch.remote_balance)) + '%' }"
+                                  ></div>
+                                </div>
+                                <div class="text-caption d-flex">
+                                  <span><MoneyDisplay :sats="ch.local_balance" :usd="null" :unit="displayUnit" /></span>
+                                  <v-spacer />
+                                  <span><MoneyDisplay :sats="ch.remote_balance" :usd="null" :unit="displayUnit" /></span>
+                                </div>
+                              </td>
+                              <td class="text-right text-caption">
+                                <MoneyDisplay :sats="ch.capacity" :usd="null" :unit="displayUnit" />
+                              </td>
+                              <td class="text-caption">
+                                {{ shortTxid(ch.channel_point) }}
+                              </td>
+                            </tr>
+                          </tbody>
+                        </template>
+                      </v-simple-table>
+                    </div>
+                    <p
+                      v-else
+                      class="text-caption grey--text mt-1 mb-0 channel-list"
+                    >
+                      No active channels.
+                    </p>
+                  </div>
+
+                  <!-- Aggregate totals across every wallet. Kept
+                       simple — just the totals line; the per-wallet
+                       bars above already cover the visual story. -->
+                  <div
+                    v-if="dashboard.liquidity_stats.wallets.length"
+                    class="totals-row pt-2 mt-2 d-flex flex-wrap text-body-2"
+                  >
+                    <strong>Total across wallets:</strong>
+                    <v-spacer />
+                    <span class="ml-3">
+                      <v-icon x-small color="primary">mdi-arrow-up</v-icon>
+                      Outbound:
+                      <strong><MoneyDisplay :money="dashboard.liquidity_stats.total_outbound" :unit="displayUnit" /></strong>
+                    </span>
+                    <span class="ml-3">
+                      <v-icon x-small color="success">mdi-arrow-down</v-icon>
+                      Inbound:
+                      <strong><MoneyDisplay :money="dashboard.liquidity_stats.total_inbound" :unit="displayUnit" /></strong>
+                    </span>
+                    <span class="ml-3">
+                      Channels: <strong>{{ dashboard.liquidity_stats.total_channel_count }}</strong>
+                    </span>
+                  </div>
                 </v-card-text>
                 </v-expand-transition>
               </v-card>
@@ -2004,6 +2117,22 @@ export default {
       const base = { class: "text-caption", title: pubkey }
       return url ? { ...base, href: url, target: "_blank", rel: "noopener noreferrer" } : base
     },
+    // Outbound/inbound split-bar helpers used by the Liquidity stats
+    // panel (per-wallet aggregate AND per-channel). Returns the
+    // outbound segment's width as a 0-100 percentage; the inbound
+    // segment uses the complement. A zero-capacity channel (rare —
+    // would mean both sides empty) returns 50/50 so the bar still
+    // renders as a recognizable shape rather than collapsing.
+    balanceBarPct(localSats, remoteSats) {
+      const total = (Number(localSats) || 0) + (Number(remoteSats) || 0)
+      if (total <= 0) return 50
+      return Math.max(0, Math.min(100, (Number(localSats) / total) * 100))
+    },
+    balanceBarTitle(localSats, remoteSats) {
+      const total = (Number(localSats) || 0) + (Number(remoteSats) || 0)
+      const pct = total > 0 ? ((Number(localSats) / total) * 100).toFixed(1) : "—"
+      return `Outbound ${this.formatNumber(localSats, 0)} sat / Inbound ${this.formatNumber(remoteSats, 0)} sat (outbound ${pct}%)`
+    },
     // Heuristic: is `s` a Bitcoin address (vs an LN address / pubkey /
     // empty)? LN addresses contain '@' (user@domain), LN pubkeys are
     // 66-char hex, on-chain addresses start with one of the standard
@@ -2389,5 +2518,53 @@ export default {
 .totals-line {
   border-top: 1px solid rgba(255, 255, 255, 0.08);
   padding-top: 6px;
+}
+
+/* Outbound/inbound split bar shown per-wallet and per-channel in the
+   Liquidity stats panel. Two segments flex side-by-side; their widths
+   come from inline styles (computed in balanceBarPct). The container
+   gets a thin border so even a zero-balance bar renders as a visible
+   shape rather than collapsing. */
+.balance-bar {
+  display: flex;
+  width: 100%;
+  height: 14px;
+  border: 1px solid rgba(0, 0, 0, 0.18);
+  border-radius: 3px;
+  overflow: hidden;
+  background: rgba(0, 0, 0, 0.04);
+}
+.theme--dark .balance-bar {
+  border-color: rgba(255, 255, 255, 0.18);
+  background: rgba(255, 255, 255, 0.04);
+}
+.balance-bar-sm {
+  height: 10px;
+}
+.balance-bar-outbound {
+  background: var(--v-primary-base, #1976d2);
+  height: 100%;
+}
+.balance-bar-inbound {
+  background: var(--v-success-base, #4caf50);
+  height: 100%;
+}
+
+/* Indented channel list under each wallet block. Uses left padding to
+   visually establish the parent-child relationship without nesting a
+   second v-card inside. */
+.wallet-block {
+  border-left: 2px solid rgba(0, 0, 0, 0.08);
+  padding-left: 10px;
+}
+.theme--dark .wallet-block {
+  border-left-color: rgba(255, 255, 255, 0.12);
+}
+.channel-list {
+  margin-left: 16px;
+  margin-top: 6px;
+}
+.channel-table th, .channel-table td {
+  font-size: 0.78rem;
 }
 </style>

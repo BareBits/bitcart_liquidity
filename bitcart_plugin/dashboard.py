@@ -177,6 +177,28 @@ class PaymentRow(BaseModel):
     payment_hash: str          # empty for on-chain
 
 
+class ChannelDetailRow(BaseModel):
+    """One channel under a wallet in the Liquidity stats panel.
+
+    `local_balance` is the wallet's spendable outbound, `remote_balance`
+    is the wallet's available inbound. `capacity` is the LN protocol's
+    notion (local + remote at open time); the live sum can drift by
+    fee-rounding sats so we report local+remote directly, which is what
+    the operator actually has to work with.
+
+    `is_active` reflects peer reachability: True when the peer is
+    currently connected. UI uses this to grey out channels whose
+    inbound capacity isn't actually routable right now.
+    """
+    channel_point: str
+    peer_pubkey: Optional[str] = None
+    peer_alias: Optional[str] = None
+    local_balance: int
+    remote_balance: int
+    capacity: int
+    is_active: bool
+
+
 class WalletLiquidityRow(BaseModel):
     """One row in the Liquidity stats table — one per liquidityhelper-
     named wallet. Inbound = sum of remote_balance on active channels;
@@ -187,6 +209,15 @@ class WalletLiquidityRow(BaseModel):
     inbound: _Money              # remote_balance sum, in BTC + sats + USD
     outbound: _Money             # local_balance sum, in BTC + sats + USD
     active_channel_count: int
+    # Per-channel breakdown shown indented under each wallet row.
+    # Ordered by capacity descending so the biggest channels lead.
+    channels: List[ChannelDetailRow] = []
+    # Names of stores whose best LN wallet resolves to this wallet.
+    # Sourced from the wallet_to_stores map built in compute_dashboard
+    # — empty list when no store currently points to this wallet
+    # (would happen if e.g. an old liquidityhelper wallet is still on
+    # the bitcart instance but no store uses it anymore).
+    store_names: List[str] = []
 
 
 class LiquidityStats(BaseModel):
@@ -498,8 +529,9 @@ def _safe_pct(numerator: int, denominator: int) -> Optional[float]:
 
 async def _get_wallet_liquidity_stats(
     wallet: Dict[str, Any], api: Any,
-) -> Tuple[int, int, int]:
-    """Return (inbound_sats, outbound_sats, active_channel_count) for `wallet`.
+) -> Tuple[int, int, int, List[ChannelDetailRow]]:
+    """Return (inbound_sats, outbound_sats, active_channel_count,
+    channel_details) for `wallet`.
 
     For btclnd wallets we go straight to LND's `Lightning.ListChannels`
     via `lnd_rpc` — Bitcart's btclnd channel proxy doesn't always pass
@@ -507,9 +539,16 @@ async def _get_wallet_liquidity_stats(
     For Electrum wallets we have no alternative and use Bitcart's
     `get_wallet_ln_channels`.
 
-    Failure is silent: returns (0, 0, 0) on any error. The UI shows
-    zeros rather than an error banner — the dashboard should still
-    render if one wallet's LND is briefly unreachable.
+    The returned channel_details list contains one row per active
+    channel with peer pubkey (alias left unresolved here — filled
+    in by build_liquidity_stats in a single batched pass) and
+    balance/capacity fields. Inactive channels are excluded from the
+    totals AND the detail list so the operator's mental model
+    (inbound = what can route right now) matches the rows below.
+
+    Failure is silent: returns (0, 0, 0, []) on any error. The UI
+    shows zeros rather than an error banner — the dashboard should
+    still render if one wallet's LND is briefly unreachable.
     """
     wallet_id = wallet.get("id")
     currency = wallet.get("currency")
@@ -518,44 +557,81 @@ async def _get_wallet_liquidity_stats(
             from liquidityhelper import lnd_rpc
             resp = await lnd_rpc(api, wallet_id, "ListChannels", {}, "Lightning")
             if not isinstance(resp, dict):
-                return (0, 0, 0)
+                return (0, 0, 0, [])
             inbound = 0
             outbound = 0
             count = 0
+            details: List[ChannelDetailRow] = []
             for c in (resp.get("channels") or []):
                 # `active` is a bool from LND. Treat missing as inactive
                 # (defensive — older LND builds may have omitted it).
                 if not c.get("active"):
                     continue
-                inbound += int(c.get("remote_balance") or 0)
-                outbound += int(c.get("local_balance") or 0)
+                local = int(c.get("local_balance") or 0)
+                remote = int(c.get("remote_balance") or 0)
+                inbound += remote
+                outbound += local
                 count += 1
-            return (inbound, outbound, count)
+                details.append(ChannelDetailRow(
+                    channel_point=(c.get("channel_point") or ""),
+                    peer_pubkey=(c.get("remote_pubkey") or "").lower() or None,
+                    peer_alias=None,
+                    local_balance=local,
+                    remote_balance=remote,
+                    capacity=local + remote,
+                    is_active=True,
+                ))
+            details.sort(key=lambda d: d.capacity, reverse=True)
+            return (inbound, outbound, count, details)
         # Electrum / btc path — Bitcart's API is the only source.
         channels = await api.get_wallet_ln_channels(
             wallet_id, active_only=True, online_only=False,
         )
         if not channels:
-            return (0, 0, 0)
+            return (0, 0, 0, [])
         inbound = 0
         outbound = 0
+        details = []
         for c in channels:
-            inbound += int(float(c.get("remote_balance") or 0))
-            outbound += int(float(c.get("local_balance") or 0))
-        return (inbound, outbound, len(channels))
+            local = int(float(c.get("local_balance") or 0))
+            remote = int(float(c.get("remote_balance") or 0))
+            inbound += remote
+            outbound += local
+            # Electrum exposes remote pubkey under several names across
+            # versions; try the common ones in order.
+            pk = (
+                c.get("remote_pubkey")
+                or c.get("node_id")
+                or c.get("remote_node_id")
+                or ""
+            )
+            pk = pk.lower() if isinstance(pk, str) else ""
+            details.append(ChannelDetailRow(
+                channel_point=(c.get("channel_point") or c.get("funding_outpoint") or ""),
+                peer_pubkey=pk or None,
+                peer_alias=None,
+                local_balance=local,
+                remote_balance=remote,
+                capacity=local + remote,
+                # active_only=True above means every row here is
+                # already gated to an OPEN state. Treat as active.
+                is_active=True,
+            ))
+        details.sort(key=lambda d: d.capacity, reverse=True)
+        return (inbound, outbound, len(channels), details)
     except Exception as e:
         logger.warning(
             f"liquidity-stats fetch failed for wallet {wallet_id} "
             f"(currency={currency}): {e} {traceback.format_exc()}"
         )
-        return (0, 0, 0)
+        return (0, 0, 0, [])
 
 
 # Back-compat alias so existing call sites (StoreCard inbound row,
 # tests) keep working without churn. New code should use the
 # liquidity-stats helper above.
 async def _get_inbound_liquidity(wallet: Dict[str, Any], api: Any) -> Tuple[int, int]:
-    inbound, _outbound, count = await _get_wallet_liquidity_stats(wallet, api)
+    inbound, _outbound, count, _details = await _get_wallet_liquidity_stats(wallet, api)
     return (inbound, count)
 
 
@@ -1065,21 +1141,86 @@ async def _compute_topup_warning(api: Any) -> TopupWarning:
     return TopupWarning(rows=rows)
 
 
+async def _resolve_aliases_for_pubkeys(
+    api: Any, pubkeys: List[str],
+) -> Dict[str, Optional[str]]:
+    """Batched GetNodeInfo for a list of peer pubkeys.
+
+    Dedupes the input, parallelizes the RPC calls, and returns
+    {pubkey → alias_or_None}. Best-effort: peers not in the gossip
+    graph get None (UI then renders "no name") instead of raising
+    or omitting the entry.
+
+    Requires at least one btclnd wallet to route GetNodeInfo
+    through. If no btclnd wallet is configured, returns an empty
+    dict — every alias falls back to None and the UI renders the
+    pubkey-only form (which is still the right thing for an
+    Electrum-only operator who can't query LND gossip anyway).
+    """
+    unique = sorted(set(pk for pk in pubkeys if pk))
+    if not unique:
+        return {}
+    try:
+        from liquidityhelper import lnd_rpc
+    except Exception as e:
+        logger.warning(f"_resolve_aliases_for_pubkeys: lnd_rpc import failed: {e} {traceback.format_exc()}")
+        return {}
+    try:
+        wallets = await api.get_wallets() or []
+    except Exception as e:
+        logger.warning(f"_resolve_aliases_for_pubkeys: get_wallets failed: {e} {traceback.format_exc()}")
+        return {}
+    btclnd_wid: Optional[str] = None
+    for w in wallets:
+        if (w.get("currency") or "").lower() == "btclnd":
+            btclnd_wid = w.get("id")
+            if btclnd_wid:
+                break
+    if btclnd_wid is None:
+        return {pk: None for pk in unique}
+
+    import asyncio
+    async def _one(pk: str) -> Tuple[str, Optional[str]]:
+        try:
+            info = await lnd_rpc(api, btclnd_wid, "GetNodeInfo", {"pub_key": pk}, "Lightning") or {}
+        except Exception as e:
+            logger.debug(f"_resolve_aliases_for_pubkeys: GetNodeInfo({pk[-8:]}) failed: {e}")
+            return pk, None
+        node = info.get("node") if isinstance(info, dict) else None
+        alias = None
+        if isinstance(node, dict):
+            raw = node.get("alias")
+            if isinstance(raw, str) and raw.strip():
+                alias = "".join(ch for ch in raw if ord(ch) >= 0x20)[:32].strip() or None
+        return pk, alias
+
+    pairs = await asyncio.gather(*(_one(pk) for pk in unique), return_exceptions=False)
+    return dict(pairs)
+
+
 async def build_liquidity_stats(
     api: Any, btc_usd_rate: Optional[float],
+    wallet_to_store_names: Optional[Dict[str, List[str]]] = None,
 ) -> LiquidityStats:
     """Walk every liquidityhelper-named wallet, collect per-wallet
-    inbound/outbound/channel-count stats, and sum into the totals row.
+    inbound/outbound/channel-count stats + per-channel breakdown,
+    and sum into the totals row.
 
     Wallet uniqueness: keys on wallet_id. Sorting: by wallet_id so the
     order is stable across renders (operators dislike rows reshuffling
     between refreshes).
+
+    `wallet_to_store_names` maps wallet_id → [store_name, ...] for
+    every store whose best LN wallet currently resolves to that
+    wallet. Built upstream in compute_dashboard so we don't have to
+    re-walk every store here. Missing wallet ids resolve to [].
     """
     mode = _liquidity_mode_label()
     rows: List[WalletLiquidityRow] = []
     total_inbound = 0
     total_outbound = 0
     total_channels = 0
+    name_map = wallet_to_store_names or {}
 
     try:
         wallets = await api.get_wallets() or []
@@ -1095,23 +1236,55 @@ async def build_liquidity_stats(
     # Dedupe by id (defensive — get_wallets shouldn't return dupes but
     # we don't enforce it).
     seen: set = set()
+    pending: List[Tuple[str, str, int, int, int, List[ChannelDetailRow]]] = []
     for w in sorted(lh_wallets, key=lambda x: x.get("id") or ""):
         wid = w.get("id") or ""
         if not wid or wid in seen:
             continue
         seen.add(wid)
-        inbound, outbound, count = await _get_wallet_liquidity_stats(w, api)
-        rows.append(WalletLiquidityRow(
-            wallet_id=wid,
-            wallet_short=wid[:8],
-            wallet_name=w.get("name") or "",
-            inbound=_money(inbound, btc_usd_rate),
-            outbound=_money(outbound, btc_usd_rate),
-            active_channel_count=count,
-        ))
+        inbound, outbound, count, details = await _get_wallet_liquidity_stats(w, api)
+        pending.append((wid, w.get("name") or "", inbound, outbound, count, details))
         total_inbound += inbound
         total_outbound += outbound
         total_channels += count
+
+    # One batched alias lookup for every unique peer across every
+    # wallet's active channels. Saves N round-trips when the same
+    # peer shows up on multiple channels (typical when an LSP funds
+    # several channels to the same peer over time).
+    all_pubkeys = [
+        d.peer_pubkey
+        for _wid, _wname, _i, _o, _c, ds in pending
+        for d in ds
+        if d.peer_pubkey
+    ]
+    alias_map = await _resolve_aliases_for_pubkeys(api, all_pubkeys)
+
+    for wid, wname, inbound, outbound, count, details in pending:
+        # Attach aliases. Pubkeys not in alias_map (or mapped to None)
+        # stay alias=None and render as "no name" in the UI.
+        enriched = [
+            ChannelDetailRow(
+                channel_point=d.channel_point,
+                peer_pubkey=d.peer_pubkey,
+                peer_alias=alias_map.get(d.peer_pubkey) if d.peer_pubkey else None,
+                local_balance=d.local_balance,
+                remote_balance=d.remote_balance,
+                capacity=d.capacity,
+                is_active=d.is_active,
+            )
+            for d in details
+        ]
+        rows.append(WalletLiquidityRow(
+            wallet_id=wid,
+            wallet_short=wid[:8],
+            wallet_name=wname,
+            inbound=_money(inbound, btc_usd_rate),
+            outbound=_money(outbound, btc_usd_rate),
+            active_channel_count=count,
+            channels=enriched,
+            store_names=sorted(name_map.get(wid, [])),
+        ))
 
     return LiquidityStats(
         mode=mode,
@@ -1720,6 +1893,19 @@ async def compute_dashboard(api: Any, range_key: str) -> DashboardResponse:
 
     shared_wallet_warning = any(len(ss) > 1 for ss in wallet_to_stores.values())
 
+    # Same map but valued as store NAMES, used by build_liquidity_stats
+    # to label which stores each wallet is associated with. Stores that
+    # have no name (defensive — Bitcart allows empty names through the
+    # API) fall back to their id-prefix.
+    store_id_to_name: Dict[str, str] = {
+        (s.get("id") or ""): (s.get("name") or (s.get("id") or "")[:8])
+        for s in store_list
+    }
+    wallet_to_store_names: Dict[str, List[str]] = {
+        wid: [store_id_to_name.get(sid, sid[:8]) for sid in sids]
+        for wid, sids in wallet_to_stores.items()
+    }
+
     # Build per-store payloads — only for stores using a wallet named
     # "liquidityhelper". This is the SAME wallet-name attribution
     # new_calc_invoice_stats uses to mark non-`liquidityhelper`
@@ -1899,7 +2085,9 @@ async def compute_dashboard(api: Any, range_key: str) -> DashboardResponse:
     recent_channel_closures = list_recent_channel_closures(closure_peer_map)
     recent_lsp_orders = list_recent_lsp_orders(btc_usd_rate)
     recent_network_fees = await list_recent_network_fees(api, btc_usd_rate)
-    liquidity_stats = await build_liquidity_stats(api, btc_usd_rate)
+    liquidity_stats = await build_liquidity_stats(
+        api, btc_usd_rate, wallet_to_store_names=wallet_to_store_names,
+    )
     bitcoin_network = await _detect_bitcoin_network(api)
 
     # Health audit: pure-config checks (cashout/channel/reserve/loop
